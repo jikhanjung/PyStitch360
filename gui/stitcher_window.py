@@ -28,8 +28,8 @@ class StitcherWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.logger = logging.getLogger(__name__)
-        self.front_files = []
-        self.back_files = []
+        self.left_files = []
+        self.right_files = []
         self.output_path = None
         
         # 스레드 및 모듈 초기화
@@ -193,32 +193,47 @@ class StitcherWindow(QMainWindow):
         
         # 파일 선택 영역
         file_group = QGroupBox("GoPro 파일 선택")
-        file_layout = QGridLayout(file_group)
+        file_layout = QHBoxLayout(file_group)
         
-        # 좌측 카메라 파일
-        file_layout.addWidget(QLabel("좌측 카메라:"), 0, 0)
-        self.front_list = QListWidget()
-        self.front_list.setMaximumHeight(100)
-        file_layout.addWidget(self.front_list, 0, 1)
+        # 좌측 카메라 영역
+        left_group = QGroupBox("좌측 카메라")
+        left_layout = QVBoxLayout(left_group)
         
-        front_btn = QPushButton("전면 파일 선택")
-        front_btn.clicked.connect(lambda: self.select_files("front"))
-        file_layout.addWidget(front_btn, 0, 2)
+        self.left_list = QListWidget()
+        self.left_list.setMaximumHeight(150)
+        left_layout.addWidget(self.left_list)
         
-        # 우측 카메라 파일
-        file_layout.addWidget(QLabel("우측 카메라:"), 1, 0)
-        self.back_list = QListWidget()
-        self.back_list.setMaximumHeight(100)
-        file_layout.addWidget(self.back_list, 1, 1)
+        left_btn = QPushButton("좌측 파일 선택")
+        left_btn.clicked.connect(lambda: self.select_files("left"))
+        left_layout.addWidget(left_btn)
         
-        back_btn = QPushButton("후면 파일 선택")
-        back_btn.clicked.connect(lambda: self.select_files("back"))
-        file_layout.addWidget(back_btn, 1, 2)
+        file_layout.addWidget(left_group)
         
-        # 자동 감지 버튼
-        auto_detect_btn = QPushButton("폴더에서 자동 감지")
+        # 중앙 영역 (자동 감지 버튼)
+        center_layout = QVBoxLayout()
+        center_layout.addStretch()
+        
+        auto_detect_btn = QPushButton("폴더에서\n자동 감지")
+        auto_detect_btn.setMinimumHeight(60)
         auto_detect_btn.clicked.connect(self.auto_detect_files)
-        file_layout.addWidget(auto_detect_btn, 2, 1, 1, 2)
+        center_layout.addWidget(auto_detect_btn)
+        
+        center_layout.addStretch()
+        file_layout.addLayout(center_layout)
+        
+        # 우측 카메라 영역
+        right_group = QGroupBox("우측 카메라")
+        right_layout = QVBoxLayout(right_group)
+        
+        self.right_list = QListWidget()
+        self.right_list.setMaximumHeight(150)
+        right_layout.addWidget(self.right_list)
+        
+        right_btn = QPushButton("우측 파일 선택")
+        right_btn.clicked.connect(lambda: self.select_files("right"))
+        right_layout.addWidget(right_btn)
+        
+        file_layout.addWidget(right_group)
         
         layout.addWidget(file_group)
         
@@ -583,14 +598,14 @@ class StitcherWindow(QMainWindow):
         )
         
         if files:
-            if camera_type == "front":
-                self.front_files = [Path(f) for f in files]
-                self.front_list.clear()
-                self.front_list.addItems([f.name for f in self.front_files])
+            if camera_type == "left":
+                self.left_files = [Path(f) for f in files]
+                self.left_list.clear()
+                self.left_list.addItems([f.name for f in self.left_files])
             else:
-                self.back_files = [Path(f) for f in files]
-                self.back_list.clear()
-                self.back_list.addItems([f.name for f in self.back_files])
+                self.right_files = [Path(f) for f in files]
+                self.right_list.clear()
+                self.right_list.addItems([f.name for f in self.right_files])
             
             self.log_text.append(f"{camera_type} 카메라 파일 {len(files)}개 선택됨")
     
@@ -603,20 +618,20 @@ class StitcherWindow(QMainWindow):
             folder_path = Path(folder)
             
             # preprocessor의 detect_gopro_files 호출
-            front_files, back_files = self.preprocessor.detect_gopro_files(folder_path)
+            left_files, right_files = self.preprocessor.detect_gopro_files(folder_path)
             
-            if front_files or back_files:
-                self.front_files = front_files
-                self.back_files = back_files
+            if left_files or right_files:
+                self.left_files = left_files
+                self.right_files = right_files
                 
                 # 리스트 위젯 업데이트
-                self.front_list.clear()
-                self.front_list.addItems([f.name for f in self.front_files])
+                self.left_list.clear()
+                self.left_list.addItems([f.name for f in self.left_files])
                 
-                self.back_list.clear()
-                self.back_list.addItems([f.name for f in self.back_files])
+                self.right_list.clear()
+                self.right_list.addItems([f.name for f in self.right_files])
                 
-                self.log_text.append(f"자동 감지 완료: 전면 {len(front_files)}개, 후면 {len(back_files)}개")
+                self.log_text.append(f"자동 감지 완루: 좌측 {len(left_files)}개, 우측 {len(right_files)}개")
             else:
                 self.log_text.append("GoPro 파일을 찾을 수 없습니다.")
     
@@ -650,7 +665,7 @@ class StitcherWindow(QMainWindow):
     
     def start_stitching(self):
         """스티칭 시작"""
-        if not self.front_files or not self.back_files:
+        if not self.left_files or not self.right_files:
             QMessageBox.warning(self, "경고", "전면과 우측 카메라 파일을 모두 선택해주세요.")
             return
         
@@ -668,7 +683,7 @@ class StitcherWindow(QMainWindow):
         # 스티칭 스레드 생성
         self.stitching_thread = StitchingThread()
         self.stitching_thread.set_parameters(
-            self.front_files, self.back_files,
+            self.left_files, self.right_files,
             self.output_path, settings
         )
         
@@ -1004,7 +1019,7 @@ class StitcherWindow(QMainWindow):
     # 미리보기 및 방향 조정 메서드
     def generate_preview(self):
         """미리보기 생성"""
-        if not self.front_files or not self.back_files:
+        if not self.left_files or not self.right_files:
             QMessageBox.warning(self, "경고", "전면과 우측 카메라 파일을 먼저 선택해주세요.")
             return
         
@@ -1015,14 +1030,14 @@ class StitcherWindow(QMainWindow):
             from core.stitcher import Stitcher
             
             # 첫 번째 파일의 첫 프레임 읽기
-            front_cap = cv2.VideoCapture(str(self.front_files[0]))
-            back_cap = cv2.VideoCapture(str(self.back_files[0]))
+            left_cap = cv2.VideoCapture(str(self.left_files[0]))
+            right_cap = cv2.VideoCapture(str(self.right_files[0]))
             
-            ret1, front_frame = front_cap.read()
-            ret2, back_frame = back_cap.read()
+            ret1, left_frame = left_cap.read()
+            ret2, right_frame = right_cap.read()
             
-            front_cap.release()
-            back_cap.release()
+            left_cap.release()
+            right_cap.release()
             
             if not ret1 or not ret2:
                 QMessageBox.warning(self, "오류", "영상 프레임을 읽을 수 없습니다.")
@@ -1034,7 +1049,7 @@ class StitcherWindow(QMainWindow):
             stitcher.load_calibration(calib_path)
             
             # 파노라마 생성
-            panorama = stitcher.create_panorama(front_frame, back_frame)
+            panorama = stitcher.create_panorama(left_frame, right_frame)
             
             if panorama is not None:
                 # Equirectangular 투영
@@ -1128,8 +1143,8 @@ class StitcherWindow(QMainWindow):
                 "version": "1.0.0"
             },
             "input_files": {
-                "left_camera": [str(f) for f in self.front_files],
-                "right_camera": [str(f) for f in self.back_files]
+                "left_camera": [str(f) for f in self.left_files],
+                "right_camera": [str(f) for f in self.right_files]
             },
             "preprocessing": {
                 "sync_offset_frames": settings["sync_offset"],
@@ -1172,13 +1187,13 @@ class StitcherWindow(QMainWindow):
         try:
             # 입력 파일
             if "input_files" in project_data:
-                self.front_files = [Path(f) for f in project_data["input_files"].get("left_camera", [])]
-                self.back_files = [Path(f) for f in project_data["input_files"].get("right_camera", [])]
+                self.left_files = [Path(f) for f in project_data["input_files"].get("left_camera", [])]
+                self.right_files = [Path(f) for f in project_data["input_files"].get("right_camera", [])]
                 
-                self.front_list.clear()
-                self.front_list.addItems([f.name for f in self.front_files])
-                self.back_list.clear()
-                self.back_list.addItems([f.name for f in self.back_files])
+                self.left_list.clear()
+                self.left_list.addItems([f.name for f in self.left_files])
+                self.right_list.clear()
+                self.right_list.addItems([f.name for f in self.right_files])
             
             # 전처리 설정
             if "preprocessing" in project_data:
@@ -1265,11 +1280,11 @@ class StitcherWindow(QMainWindow):
     def reset_gui_to_defaults(self):
         """GUI를 기본값으로 리셋"""
         # 파일 목록 초기화
-        self.front_files = []
-        self.back_files = []
+        self.left_files = []
+        self.right_files = []
         self.output_path = None
-        self.front_list.clear()
-        self.back_list.clear()
+        self.left_list.clear()
+        self.right_list.clear()
         self.output_label.setText("선택되지 않음")
         
         # 설정 초기화
