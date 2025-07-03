@@ -25,7 +25,7 @@ class Preprocessor:
             directory: 검색할 디렉터리
             
         Returns:
-            Tuple[front_files, back_files]: 전면/후면 카메라 파일 리스트
+            Tuple[left_files, right_files]: 좌측/우측 카메라 파일 리스트
         """
         self.logger.info(f"GoPro 파일 검색: {directory}")
         
@@ -33,8 +33,8 @@ class Preprocessor:
             self.logger.error(f"디렉터리가 존재하지 않음: {directory}")
             return [], []
         
-        front_files = []
-        back_files = []
+        left_files = []
+        right_files = []
         
         # GoPro 파일 패턴: GOPR[숫자].MP4, GP[숫자][숫자].MP4
         for file_path in directory.glob("*.MP4"):
@@ -44,26 +44,26 @@ class Preprocessor:
             if re.match(r'GOPR\d+\.MP4', file_name):
                 # 파일명에서 숫자 추출하여 분류
                 number = re.search(r'GOPR(\d+)\.MP4', file_name).group(1)
-                if int(number) % 2 == 0:  # 짝수는 전면
-                    front_files.append(file_path)
-                else:  # 홀수는 후면
-                    back_files.append(file_path)
+                if int(number) % 2 == 0:  # 짝수는 좌측
+                    left_files.append(file_path)
+                else:  # 홀수는 우측
+                    right_files.append(file_path)
             
             # GP로 시작하는 연속 파일들
             elif re.match(r'GP\d+\d+\.MP4', file_name):
                 # 첫 번째 숫자로 분류
                 first_digit = file_name[2]
                 if int(first_digit) % 2 == 0:
-                    front_files.append(file_path)
+                    left_files.append(file_path)
                 else:
-                    back_files.append(file_path)
+                    right_files.append(file_path)
         
         # 파일명 순으로 정렬
-        front_files.sort()
-        back_files.sort()
+        left_files.sort()
+        right_files.sort()
         
-        self.logger.info(f"감지된 파일: 전면 {len(front_files)}개, 후면 {len(back_files)}개")
-        return front_files, back_files
+        self.logger.info(f"감지된 파일: 좌측 {len(left_files)}개, 우측 {len(right_files)}개")
+        return left_files, right_files
     
     def concat_videos(self, file_list: List[Path], output_path: Path) -> bool:
         """

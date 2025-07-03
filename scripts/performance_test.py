@@ -82,11 +82,11 @@ def test_preprocessor_performance():
         
         # 파일 감지 성능 테스트
         monitor.start()
-        front_files, back_files = preprocessor.detect_gopro_files(test_dir)
+        left_files, right_files = preprocessor.detect_gopro_files(test_dir)
         result = monitor.stop()
         
         print(f"파일 감지 완료:")
-        print(f"  - 감지된 파일: 전면 {len(front_files)}개, 후면 {len(back_files)}개")
+        print(f"  - 감지된 파일: 좌측 {len(left_files)}개, 우측 {len(right_files)}개")
         print(f"  - 소요 시간: {result['elapsed_time']:.3f}초")
         print(f"  - 메모리 사용량: {result['memory_usage']:.2f}MB")
         

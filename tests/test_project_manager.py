@@ -68,8 +68,8 @@ class TestProjectManager(unittest.TestCase):
         """템플릿 저장 테스트"""
         # 프로젝트 생성 및 입력 파일 설정
         project_data = self.project_manager.create_new_project("원본 프로젝트")
-        project_data["input_files"]["front_camera"] = ["/path/to/front.mp4"]
-        project_data["input_files"]["back_camera"] = ["/path/to/back.mp4"]
+        project_data["input_files"]["left_camera"] = ["/path/to/front.mp4"]
+        project_data["input_files"]["right_camera"] = ["/path/to/back.mp4"]
         project_data["output"]["path"] = "/path/to/output.mp4"
         
         self.project_manager.project_data = project_data
@@ -86,8 +86,8 @@ class TestProjectManager(unittest.TestCase):
             template_data = json.load(f)
         
         # 템플릿에는 입력 파일과 출력 경로가 비어있어야 함
-        self.assertEqual(template_data["input_files"]["front_camera"], [])
-        self.assertEqual(template_data["input_files"]["back_camera"], [])
+        self.assertEqual(template_data["input_files"]["left_camera"], [])
+        self.assertEqual(template_data["input_files"]["right_camera"], [])
         self.assertEqual(template_data["output"]["path"], "")
         self.assertTrue(template_data["project_info"]["template"])
         self.assertEqual(template_data["project_info"]["name"], "테스트 템플릿")
@@ -109,8 +109,8 @@ class TestProjectManager(unittest.TestCase):
         # 테스트 데이터
         data = {
             "input_files": {
-                "front_camera": ["/home/user/projects/videos/front.mp4"],
-                "back_camera": ["/home/user/projects/videos/back.mp4"]
+                "left_camera": ["/home/user/projects/videos/front.mp4"],
+                "right_camera": ["/home/user/projects/videos/back.mp4"]
             },
             "output": {
                 "path": "/home/user/projects/output/result.mp4"
@@ -120,15 +120,15 @@ class TestProjectManager(unittest.TestCase):
         # 상대 경로로 변환
         relative_data = self.project_manager._convert_to_relative_paths(data, base_path)
         
-        self.assertEqual(relative_data["input_files"]["front_camera"][0], "videos/front.mp4")
-        self.assertEqual(relative_data["input_files"]["back_camera"][0], "videos/back.mp4")
+        self.assertEqual(relative_data["input_files"]["left_camera"][0], "videos/front.mp4")
+        self.assertEqual(relative_data["input_files"]["right_camera"][0], "videos/back.mp4")
         self.assertEqual(relative_data["output"]["path"], "output/result.mp4")
         
         # 다시 절대 경로로 변환
         absolute_data = self.project_manager._convert_to_absolute_paths(relative_data, base_path)
         
-        self.assertTrue(absolute_data["input_files"]["front_camera"][0].endswith("videos/front.mp4"))
-        self.assertTrue(absolute_data["input_files"]["back_camera"][0].endswith("videos/back.mp4"))
+        self.assertTrue(absolute_data["input_files"]["left_camera"][0].endswith("videos/front.mp4"))
+        self.assertTrue(absolute_data["input_files"]["right_camera"][0].endswith("videos/back.mp4"))
         self.assertTrue(absolute_data["output"]["path"].endswith("output/result.mp4"))
     
     def test_load_nonexistent_project(self):

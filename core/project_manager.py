@@ -28,8 +28,8 @@ class ProjectManager:
                 "version": "1.0.0"
             },
             "input_files": {
-                "front_camera": [],
-                "back_camera": []
+                "left_camera": [],
+                "right_camera": []
             },
             "preprocessing": {
                 "sync_offset_frames": 0,
@@ -124,7 +124,7 @@ class ProjectManager:
             template_data = self.project_data.copy()
             template_data["project_info"]["name"] = template_name
             template_data["project_info"]["template"] = True
-            template_data["input_files"] = {"front_camera": [], "back_camera": []}
+            template_data["input_files"] = {"left_camera": [], "right_camera": []}
             template_data["output"]["path"] = ""
             
             with open(file_path, 'w', encoding='utf-8') as f:
@@ -201,7 +201,7 @@ class ProjectManager:
         
         # 입력 파일 경로 변환
         if "input_files" in data_copy:
-            for camera_type in ["front_camera", "back_camera"]:
+            for camera_type in ["left_camera", "right_camera"]:
                 if camera_type in data_copy["input_files"]:
                     relative_paths = []
                     for file_path in data_copy["input_files"][camera_type]:
@@ -230,7 +230,7 @@ class ProjectManager:
         """상대 경로를 절대 경로로 변환"""
         # 입력 파일 경로 변환
         if "input_files" in data:
-            for camera_type in ["front_camera", "back_camera"]:
+            for camera_type in ["left_camera", "right_camera"]:
                 if camera_type in data["input_files"]:
                     absolute_paths = []
                     for file_path in data["input_files"][camera_type]:

@@ -44,11 +44,11 @@ class StitchingThread(QThread):
         self.output_path = None
         self.settings = {}
     
-    def set_parameters(self, front_files: List[Path], back_files: List[Path], 
+    def set_parameters(self, left_files: List[Path], right_files: List[Path], 
                       output_path: Path, settings: dict):
         """작업 파라미터 설정"""
-        self.front_files = front_files
-        self.back_files = back_files
+        self.left_files = left_files
+        self.right_files = right_files
         self.output_path = output_path
         self.settings = settings
     
@@ -114,15 +114,15 @@ class StitchingThread(QThread):
                 return
             
             # 2. 전면 카메라 영상 연결
-            self.step_update.emit("전면 카메라 영상 연결 중...")
-            self.log_message.emit(f"전면 카메라 파일 {len(self.front_files)}개 연결")
+            self.step_update.emit("좌측 카메라 영상 연결 중...")
+            self.log_message.emit(f"좌측 카메라 파일 {len(self.left_files)}개 연결")
             
             temp_dir = self.output_path.parent / "temp"
             temp_dir.mkdir(exist_ok=True)
             
-            front_concat = temp_dir / "front_concat.mp4"
-            if not self.preprocessor.concat_videos(self.front_files, front_concat):
-                self.error_occurred.emit("전면 카메라 영상 연결 실패")
+            left_concat = temp_dir / "left_concat.mp4"
+            if not self.preprocessor.concat_videos(self.left_files, left_concat):
+                self.error_occurred.emit("좌측 카메라 영상 연결 실패")
                 self.finished.emit(False)
                 return
             
@@ -132,13 +132,13 @@ class StitchingThread(QThread):
             if self.check_cancelled():
                 return
             
-            # 3. 후면 카메라 영상 연결
-            self.step_update.emit("후면 카메라 영상 연결 중...")
-            self.log_message.emit(f"후면 카메라 파일 {len(self.back_files)}개 연결")
+            # 3. 우측 카메라 영상 연결
+            self.step_update.emit("우측 카메라 영상 연결 중...")
+            self.log_message.emit(f"우측 카메라 파일 {len(self.right_files)}개 연결")
             
-            back_concat = temp_dir / "back_concat.mp4"
-            if not self.preprocessor.concat_videos(self.back_files, back_concat):
-                self.error_occurred.emit("후면 카메라 영상 연결 실패")
+            right_concat = temp_dir / "right_concat.mp4"
+            if not self.preprocessor.concat_videos(self.right_files, right_concat):
+                self.error_occurred.emit("우측 카메라 영상 연결 실패")
                 self.finished.emit(False)
                 return
             
@@ -158,7 +158,7 @@ class StitchingThread(QThread):
                 back_synced = temp_dir / "back_synced.mp4"
                 
                 if not self.preprocessor.adjust_sync(
-                    front_concat, back_concat, sync_offset,
+                    left_concat, right_concat, sync_offset,
                     front_synced, back_synced
                 ):
                     self.error_occurred.emit("동기화 조정 실패")
@@ -166,7 +166,7 @@ class StitchingThread(QThread):
                     return
                 
                 front_concat = front_synced
-                back_concat = back_synced
+                right_concat = right_synced
             
             current_step += 1
             self.progress_update.emit(current_step, total_steps)

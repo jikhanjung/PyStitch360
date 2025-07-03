@@ -195,8 +195,8 @@ class StitcherWindow(QMainWindow):
         file_group = QGroupBox("GoPro 파일 선택")
         file_layout = QGridLayout(file_group)
         
-        # 전면 카메라 파일
-        file_layout.addWidget(QLabel("전면 카메라:"), 0, 0)
+        # 좌측 카메라 파일
+        file_layout.addWidget(QLabel("좌측 카메라:"), 0, 0)
         self.front_list = QListWidget()
         self.front_list.setMaximumHeight(100)
         file_layout.addWidget(self.front_list, 0, 1)
@@ -205,8 +205,8 @@ class StitcherWindow(QMainWindow):
         front_btn.clicked.connect(lambda: self.select_files("front"))
         file_layout.addWidget(front_btn, 0, 2)
         
-        # 후면 카메라 파일
-        file_layout.addWidget(QLabel("후면 카메라:"), 1, 0)
+        # 우측 카메라 파일
+        file_layout.addWidget(QLabel("우측 카메라:"), 1, 0)
         self.back_list = QListWidget()
         self.back_list.setMaximumHeight(100)
         file_layout.addWidget(self.back_list, 1, 1)
@@ -651,7 +651,7 @@ class StitcherWindow(QMainWindow):
     def start_stitching(self):
         """스티칭 시작"""
         if not self.front_files or not self.back_files:
-            QMessageBox.warning(self, "경고", "전면과 후면 카메라 파일을 모두 선택해주세요.")
+            QMessageBox.warning(self, "경고", "전면과 우측 카메라 파일을 모두 선택해주세요.")
             return
         
         if not self.output_path:
@@ -1005,7 +1005,7 @@ class StitcherWindow(QMainWindow):
     def generate_preview(self):
         """미리보기 생성"""
         if not self.front_files or not self.back_files:
-            QMessageBox.warning(self, "경고", "전면과 후면 카메라 파일을 먼저 선택해주세요.")
+            QMessageBox.warning(self, "경고", "전면과 우측 카메라 파일을 먼저 선택해주세요.")
             return
         
         self.log_text.append("미리보기 생성 시작...")
@@ -1128,8 +1128,8 @@ class StitcherWindow(QMainWindow):
                 "version": "1.0.0"
             },
             "input_files": {
-                "front_camera": [str(f) for f in self.front_files],
-                "back_camera": [str(f) for f in self.back_files]
+                "left_camera": [str(f) for f in self.front_files],
+                "right_camera": [str(f) for f in self.back_files]
             },
             "preprocessing": {
                 "sync_offset_frames": settings["sync_offset"],
@@ -1172,8 +1172,8 @@ class StitcherWindow(QMainWindow):
         try:
             # 입력 파일
             if "input_files" in project_data:
-                self.front_files = [Path(f) for f in project_data["input_files"].get("front_camera", [])]
-                self.back_files = [Path(f) for f in project_data["input_files"].get("back_camera", [])]
+                self.front_files = [Path(f) for f in project_data["input_files"].get("left_camera", [])]
+                self.back_files = [Path(f) for f in project_data["input_files"].get("right_camera", [])]
                 
                 self.front_list.clear()
                 self.front_list.addItems([f.name for f in self.front_files])
