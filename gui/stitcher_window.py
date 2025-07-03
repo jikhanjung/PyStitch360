@@ -608,6 +608,10 @@ class StitcherWindow(QMainWindow):
                 self.right_list.addItems([f.name for f in self.right_files])
             
             self.log_text.append(f"{camera_type} 카메라 파일 {len(files)}개 선택됨")
+            
+            # 양쪽 파일이 모두 있으면 듀얼 카메라 위젯에 로드
+            if self.left_files and self.right_files and hasattr(self, 'dual_camera_widget'):
+                self.dual_camera_widget.load_videos(self.left_files, self.right_files)
     
     def auto_detect_files(self):
         """폴더에서 자동 감지"""
@@ -1194,11 +1198,19 @@ class StitcherWindow(QMainWindow):
                 self.left_list.addItems([f.name for f in self.left_files])
                 self.right_list.clear()
                 self.right_list.addItems([f.name for f in self.right_files])
+                
+                # 듀얼 카메라 위젯에 영상 로드
+                if hasattr(self, 'dual_camera_widget'):
+                    self.dual_camera_widget.load_videos(self.left_files, self.right_files)
             
             # 전처리 설정
             if "preprocessing" in project_data:
                 sync_offset = project_data["preprocessing"].get("sync_offset_frames", 0)
                 self.sync_slider.setValue(sync_offset)
+                
+                # 듀얼 카메라 위젯 동기화도 업데이트
+                if hasattr(self, 'dual_camera_widget'):
+                    self.dual_camera_widget.set_sync_offset(sync_offset)
             
             # 스티칭 설정
             if "stitching" in project_data:
