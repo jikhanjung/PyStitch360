@@ -1,0 +1,249 @@
+"""
+후처리 모듈
+H.264 인코딩, 메타데이터 삽입
+"""
+
+import logging
+import subprocess
+import json
+from pathlib import Path
+from typing import Dict, Any
+import ffmpeg
+
+
+class Postprocessor:
+    """영상 후처리 클래스"""
+    
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+    
+    def encode_h264(self, input_path: Path, output_path: Path, 
+                   crf: int = 23, preset: str = "medium") -> bool:
+        """
+        H.264 인코딩
+        
+        Args:
+            input_path: 입력 파일 경로
+            output_path: 출력 파일 경로
+            crf: CRF 값 (품질, 낮을수록 고품질)
+            preset: 인코딩 프리셋 (ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow)
+            
+        Returns:
+            성공 여부
+        """
+        self.logger.info(f"H.264 인코딩: {input_path} -> {output_path}, CRF={crf}, preset={preset}")
+        
+        try:
+            # FFmpeg를 사용한 H.264 인코딩
+            stream = ffmpeg.input(str(input_path))
+            stream = ffmpeg.output(
+                stream,
+                str(output_path),
+                vcodec='libx264',
+                crf=crf,
+                preset=preset,
+                pix_fmt='yuv420p',  # 호환성을 위한 픽셀 포맷
+                movflags='+faststart'  # 웹 스트리밍 최적화
+            )
+            
+            ffmpeg.run(stream, overwrite_output=True, quiet=True)
+            
+            self.logger.info("H.264 인코딩 완료")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"H.264 인코딩 실패: {e}")
+            return False
+    
+    def insert_metadata(self, video_path: Path, metadata: Dict[str, Any]) -> bool:
+        """
+        360도 영상 메타데이터 삽입
+        
+        Args:
+            video_path: 영상 파일 경로
+            metadata: 메타데이터 딕셔너리
+            
+        Returns:
+            성공 여부
+        """
+        self.logger.info(f"메타데이터 삽입: {len(metadata)}개 항목")
+        
+        try:
+            # 임시 출력 파일
+            temp_path = video_path.parent / f"temp_{video_path.name}"
+            
+            # 기본 360도 메타데이터
+            metadata_args = []
+            
+            # Spherical Video RFC 메타데이터
+            if metadata.get('projection') == 'equirectangular':
+                metadata_args.extend([
+                    '-metadata:s:v:0', 'spherical-video=1',
+                    '-metadata:s:v:0', 'stereo_mode=mono',
+                    '-metadata:s:v:0', 'projection=equirectangular'
+                ])
+            
+            # 제목, 설명 등 추가 메타데이터
+            if 'title' in metadata:
+                metadata_args.extend(['-metadata', f"title={metadata['title']}"])
+            if 'description' in metadata:
+                metadata_args.extend(['-metadata', f"description={metadata['description']}"])
+            if 'creation_time' in metadata:
+                metadata_args.extend(['-metadata', f"creation_time={metadata['creation_time']}"])
+            
+            # FFmpeg 명령 실행
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', str(video_path),
+                *metadata_args,
+                '-c', 'copy',  # 재인코딩 없이 메타데이터만 추가
+                str(temp_path)
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                # 원본 파일을 임시 파일로 교체
+                video_path.unlink()
+                temp_path.rename(video_path)
+                self.logger.info("메타데이터 삽입 완료")
+                return True
+            else:
+                self.logger.error(f"메타데이터 삽입 실패: {result.stderr}")
+                temp_path.unlink(missing_ok=True)
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"메타데이터 삽입 실패: {e}")
+            return False
+    
+    def create_insta360_compatible(self, input_path: Path, output_path: Path) -> bool:
+        """
+        Insta360 Studio 호환 포맷 생성
+        
+        Args:
+            input_path: 입력 파일 경로
+            output_path: 출력 파일 경로
+            
+        Returns:
+            성공 여부
+        """
+        self.logger.info("Insta360 호환 포맷 생성")
+        
+        try:
+            # Insta360 Studio에서 선호하는 설정
+            stream = ffmpeg.input(str(input_path))
+            stream = ffmpeg.output(
+                stream,
+                str(output_path),
+                vcodec='libx264',
+                crf=18,  # 높은 품질
+                preset='slow',
+                pix_fmt='yuv420p',
+                vf='scale=3840:1920',  # 표준 4K equirectangular 해상도
+                r=30,  # 30fps로 통일
+                movflags='+faststart'
+            )
+            
+            ffmpeg.run(stream, overwrite_output=True, quiet=True)
+            
+            # Insta360 호환 메타데이터 삽입
+            metadata = {
+                'projection': 'equirectangular',
+                'title': 'PyStitch360 Generated Video',
+                'description': 'Generated by PyStitch360'
+            }
+            
+            success = self.insert_metadata(output_path, metadata)
+            
+            if success:
+                self.logger.info("Insta360 호환 포맷 생성 완료")
+                return True
+            else:
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Insta360 호환 포맷 생성 실패: {e}")
+            return False
+    
+    def extract_frame(self, video_path: Path, timestamp: float, output_path: Path) -> bool:
+        """
+        특정 시간의 프레임 추출
+        
+        Args:
+            video_path: 영상 파일 경로
+            timestamp: 추출할 시간 (초)
+            output_path: 출력 이미지 경로
+            
+        Returns:
+            성공 여부
+        """
+        self.logger.info(f"프레임 추출: {timestamp}초 -> {output_path}")
+        
+        try:
+            stream = ffmpeg.input(str(video_path), ss=timestamp)
+            stream = ffmpeg.output(stream, str(output_path), vframes=1)
+            ffmpeg.run(stream, overwrite_output=True, quiet=True)
+            
+            self.logger.info("프레임 추출 완료")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"프레임 추출 실패: {e}")
+            return False
+    
+    def create_preview_video(self, input_path: Path, output_path: Path, 
+                           duration: int = 10, scale: str = "1920:960") -> bool:
+        """
+        미리보기용 저화질 영상 생성
+        
+        Args:
+            input_path: 입력 파일 경로
+            output_path: 출력 파일 경로
+            duration: 미리보기 길이 (초)
+            scale: 출력 해상도
+            
+        Returns:
+            성공 여부
+        """
+        self.logger.info(f"미리보기 영상 생성: {duration}초, {scale}")
+        
+        try:
+            stream = ffmpeg.input(str(input_path), t=duration)
+            stream = ffmpeg.output(
+                stream,
+                str(output_path),
+                vcodec='libx264',
+                crf=28,  # 낮은 품질
+                preset='fast',
+                vf=f'scale={scale}',
+                r=15,  # 낮은 프레임레이트
+                movflags='+faststart'
+            )
+            
+            ffmpeg.run(stream, overwrite_output=True, quiet=True)
+            
+            self.logger.info("미리보기 영상 생성 완료")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"미리보기 영상 생성 실패: {e}")
+            return False
+    
+    def get_video_duration(self, video_path: Path) -> float:
+        """
+        영상 길이 가져오기
+        
+        Args:
+            video_path: 영상 파일 경로
+            
+        Returns:
+            영상 길이 (초)
+        """
+        try:
+            probe = ffmpeg.probe(str(video_path))
+            duration = float(probe['streams'][0]['duration'])
+            return duration
+        except Exception as e:
+            self.logger.error(f"영상 길이 가져오기 실패: {e}")
+            return 0.0

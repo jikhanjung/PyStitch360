@@ -1,0 +1,40 @@
+# GoPro 듀얼 카메라 캘리브레이션 설정
+camera_calibration:
+  # 카메라 매트릭스 (임시 값)
+  camera_matrix_left:
+    - [1000.0, 0.0, 960.0]
+    - [0.0, 1000.0, 540.0]
+    - [0.0, 0.0, 1.0]
+  
+  camera_matrix_right:
+    - [1000.0, 0.0, 960.0]
+    - [0.0, 1000.0, 540.0]
+    - [0.0, 0.0, 1.0]
+  
+  # 왜곡 계수 (임시 값)
+  distortion_left: [0.1, -0.2, 0.0, 0.0, 0.0]
+  distortion_right: [0.1, -0.2, 0.0, 0.0, 0.0]
+  
+  # 스테레오 캘리브레이션 (임시 값)
+  rotation_matrix:
+    - [1.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0]
+    - [0.0, 0.0, 1.0]
+  
+  translation_vector: [100.0, 0.0, 0.0]
+
+stitching_settings:
+  # 블렌딩 설정
+  blend_type: "linear"
+  feather_width: 50
+  
+  # 투영 설정
+  projection_type: "equirectangular"
+  output_width: 3840
+  output_height: 1920
+  
+  # 방향 조정 기본값
+  orientation:
+    yaw: 0.0
+    pitch: 0.0
+    roll: 0.0
