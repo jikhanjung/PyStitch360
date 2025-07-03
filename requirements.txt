@@ -1,0 +1,15 @@
+# GUI Framework
+PyQt6>=6.4.0
+
+# Computer Vision and Image Processing
+opencv-python>=4.8.0
+opencv-contrib-python>=4.8.0
+
+# Video Processing
+ffmpeg-python>=0.2.0
+
+# Numerical Computing
+numpy>=1.24.0
+
+# Data Handling
+PyYAML>=6.0
