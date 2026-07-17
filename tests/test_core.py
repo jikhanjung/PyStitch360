@@ -188,3 +188,13 @@ def test_alignment_rejects_degenerate_frames(lens):
         imgs.append(cv2.resize(im, (lens.width, lens.height)))
     with pytest.raises(RuntimeError):
         estimate_alignment(imgs[0], imgs[1], lens, log=lambda s: None)
+
+
+def test_worker_attrs_do_not_shadow_qthread_api():
+    """QThread 메서드(start 등)를 속성이 가리면 GUI가 abort 로 죽는다."""
+    from pystitch.gui.workers import ExportWorker, PlaybackWorker
+
+    w = ExportWorker(None, [], [], [], 0.0, 0.0, 60.0, "out.mp4")
+    assert callable(w.start) and callable(w.run)
+    p = PlaybackWorker(None, None, [], [], 0.0, 0)
+    assert callable(p.start) and callable(p.run)

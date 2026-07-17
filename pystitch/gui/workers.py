@@ -125,7 +125,7 @@ class ExportWorker(QThread):
             segments = [{"start_sec": 0.0, "alignment": segments}]
         self.segments = sorted(segments, key=lambda s: s["start_sec"])
         self.left_files, self.right_files = left_files, right_files
-        self.offset, self.start, self.end = offset_sec, start_sec, end_sec
+        self.offset, self.t_start, self.t_end = offset_sec, start_sec, end_sec
         self.out_path = str(out_path)
         self.user = (pitch_user, roll_user, yaw_user)
         self.codec, self.crf, self.scale = codec, crf, scale
@@ -147,9 +147,9 @@ class ExportWorker(QThread):
         vid_l = ChapteredVideo(self.left_files)
         vid_r = ChapteredVideo(self.right_files)
         fps = vid_l.fps
-        f_start = int(round(self.start * fps))
-        f_end = min(int(round(self.end * fps)), vid_l.total_frames)
-        r_start = int(round((self.start + self.offset) * fps))
+        f_start = int(round(self.t_start * fps))
+        f_end = min(int(round(self.t_end * fps)), vid_l.total_frames)
+        r_start = int(round((self.t_start + self.offset) * fps))
         total = max(0, f_end - f_start)
         if total == 0:
             raise RuntimeError("내보낼 구간이 비어 있음")
@@ -162,7 +162,7 @@ class ExportWorker(QThread):
             return idx
 
         # 모든 세그먼트가 같은 출력 크기를 갖도록 yaw 범위 폭은 첫 세그먼트 기준 고정
-        first_a = self.segments[segment_index_at(self.start)]["alignment"]
+        first_a = self.segments[segment_index_at(self.t_start)]["alignment"]
         w0, w1 = first_a.window(self.user[2])
         half_range = (w1 - w0) / 2
 
@@ -182,7 +182,7 @@ class ExportWorker(QThread):
         ok_r, img_r = vid_r.read_at(r_start)
         if not (ok_l and ok_r):
             raise RuntimeError("시작 프레임 읽기 실패")
-        seg_idx = segment_index_at(self.start)
+        seg_idx = segment_index_at(self.t_start)
         rend = make_renderer(self.segments[seg_idx]["alignment"], img_l, img_r)
         pano_w, pano_h = rend.out_w, rend.out_h
         out_w, out_h = pano_w, pano_h
@@ -196,7 +196,7 @@ class ExportWorker(QThread):
         # 이번 내보내기 구간 안에 있는 이후 세그먼트 경계 (절대 프레임 번호)
         pending = [(int(round(s["start_sec"] * fps)), i)
                    for i, s in enumerate(self.segments)
-                   if i > seg_idx and s["start_sec"] < self.end]
+                   if i > seg_idx and s["start_sec"] < self.t_end]
 
         # 오디오: 좌측 챕터 체인을 concat demuxer 로 연결
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tf:
@@ -208,7 +208,7 @@ class ExportWorker(QThread):
         cmd = (["ffmpeg", "-y", "-v", "error",
                 "-f", "rawvideo", "-pix_fmt", "bgr24",
                 "-s", f"{out_w}x{out_h}", "-r", f"{fps}", "-i", "-",
-                "-f", "concat", "-safe", "0", "-ss", f"{self.start}",
+                "-f", "concat", "-safe", "0", "-ss", f"{self.t_start}",
                 "-t", f"{duration}", "-i", concat_list,
                 "-map", "0:v", "-map", "1:a?"]
                + encoder_args(self.codec, self.crf)
