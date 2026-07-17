@@ -418,7 +418,7 @@ class MainWindow(QMainWindow):
                                             ("roll", "기울기(roll)"),
                                             ("yaw", "센터링(yaw)")]):
             g.addWidget(QLabel(label), 0, col * 2)
-            sp = QDoubleSpinBox(decimals=1, minimum=-15.0, maximum=15.0, singleStep=0.1)
+            sp = QDoubleSpinBox(decimals=1, minimum=-45.0, maximum=45.0, singleStep=0.1)
             sp.valueChanged.connect(lambda _: self._preview_debounced())
             self.spin_user[key] = sp
             g.addWidget(sp, 0, col * 2 + 1)
