@@ -71,7 +71,9 @@ def save_project(path: str | Path, data: dict):
                 names.append(Path(f).name)
         out[f"{side}_names"] = names
     out["segments"] = [
-        {"start_sec": s["start_sec"], "alignment": alignment_to_dict(s["alignment"])}
+        {"start_sec": s["start_sec"],
+         "align_sec": s.get("align_sec", s["start_sec"]),   # 정합 추정 프레임 시각
+         "alignment": alignment_to_dict(s["alignment"])}
         for s in data.get("segments", [])
     ]
     path.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -94,7 +96,9 @@ def load_project(path: str | Path) -> dict:
             resolved.append(str(p))
         d[f"{side}_files"] = resolved
     d["segments"] = [
-        {"start_sec": float(s["start_sec"]), "alignment": alignment_from_dict(s["alignment"])}
+        {"start_sec": float(s["start_sec"]),
+         "align_sec": float(s.get("align_sec", s["start_sec"])),
+         "alignment": alignment_from_dict(s["alignment"])}
         for s in d.get("segments", [])
     ]
     d["segments"].sort(key=lambda s: s["start_sec"])

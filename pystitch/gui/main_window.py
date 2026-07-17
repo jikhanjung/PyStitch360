@@ -557,16 +557,20 @@ class MainWindow(QMainWindow):
         self._busy(False)
         self.btn_align.setEnabled(True)
         a = alignment
-        # 첫 정합은 0초부터, 이후는 현재 프레임부터 적용 (충격 이벤트 재정합)
+        # 첫 정합은 0초부터 커버, 이후는 현재 프레임부터 적용 (충격 이벤트 재정합).
+        # 정합을 추정한 프레임 시각은 align_sec 으로 따로 기억한다.
         start = 0.0 if not self.segments else self.current_time()
+        align_sec = self.current_time()
         replaced = False
         for s in self.segments:
             if abs(s["start_sec"] - start) < 0.5:
                 s["alignment"] = alignment   # 같은 지점 재정합이면 교체
+                s["align_sec"] = align_sec
                 replaced = True
                 break
         if not replaced:
-            self.segments.append({"start_sec": start, "alignment": alignment})
+            self.segments.append({"start_sec": start, "alignment": alignment,
+                                  "align_sec": align_sec})
             self.segments.sort(key=lambda s: s["start_sec"])
         self._refresh_segment_list()
         self.lbl_align.setText(
@@ -586,15 +590,20 @@ class MainWindow(QMainWindow):
         self.segment_list.clear()
         for s in self.segments:
             t = s["start_sec"]
+            at = s.get("align_sec", t)
+            item = f"{int(t//60):02d}:{t%60:04.1f}~"
+            if abs(at - t) >= 0.5:
+                item += f"  (정합점 {int(at//60):02d}:{at%60:04.1f})"
             a = s["alignment"]
-            self.segment_list.addItem(
-                f"{int(t//60):02d}:{t%60:04.1f}~  pitch {a.pitch_auto*57.3:+.1f}° "
-                f"roll {a.roll_auto*57.3:+.1f}°")
+            item += f"  인라이어 {a.n_inliers}"
+            self.segment_list.addItem(item)
 
     def _goto_segment(self):
         row = self.segment_list.currentRow()
         if 0 <= row < len(self.segments) and self.video_l:
-            self.slider.setValue(int(self.segments[row]["start_sec"] * self.video_l.fps))
+            s = self.segments[row]
+            t = s.get("align_sec", s["start_sec"])   # 정합 추정 프레임으로 이동
+            self.slider.setValue(int(t * self.video_l.fps))
 
     def _delete_segment(self):
         row = self.segment_list.currentRow()
