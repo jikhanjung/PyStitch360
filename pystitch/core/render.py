@@ -6,6 +6,7 @@ import numpy as np
 
 from .geometry import build_cylindrical_maps
 from .lens import LensProfile
+from .perspective import build_perspective_maps
 
 
 def compute_gains(warped_l, warped_r, mask_l, mask_r):
@@ -69,29 +70,50 @@ class Renderer:
     분할 렌더링: 심 좌측은 L, 우측은 R 만 사용하므로 각 카메라를
     자기 절반 + 심 밴드까지만 워핑한다 (remap/게인/블렌딩 비용 ≈ 절반).
     scale 로 출력 해상도를 줄일 수 있다 (미리보기용).
+
+    persp_k/persp_m 지정 시 원근비 조절 맵을 원통 맵에 합성해
+    소스에서 한 번의 보간으로 보정된 파노라마를 렌더한다. 심은 중앙
+    열이라 키스톤 후에도 수직으로 유지되고, 마스크·심 가중치·게인·
+    refine_seam 은 모두 합성 이후의 출력 공간에서 동작한다.
+    수평선은 elevation=0 행을 정확히 계산해 사용한다.
     """
 
     def __init__(self, lens: LensProfile, R_wl, R_wr, yaw0, yaw1, el0, el1,
-                 scale=1.0, feather_px=40):
+                 scale=1.0, feather_px=40, persp_k=0.0, persp_m=1.0):
         self.lens = lens
         f = lens.focal * scale
         self.scale = scale
         self.out_w = int((yaw1 - yaw0) * f) & ~1
         self.out_h = int((np.tan(el1) - np.tan(el0)) * f) & ~1
+        self.persp_k, self.persp_m = persp_k, persp_m
+        persp = None
+        if persp_k > 0.0 or persp_m > 1.0:
+            # elevation=0 행: t = linspace(tan(el1), tan(el0)) 이 0이 되는 위치
+            t1, t0 = np.tan(el1), np.tan(el0)
+            horizon = (self.out_h - 1) * t1 / (t1 - t0)
+            persp = build_perspective_maps(self.out_w, self.out_h, horizon,
+                                           persp_k, persp_m)
         self._float_maps, masks = [], []
         src_ones = np.ones((lens.height, lens.width), np.uint8) * 255
         for R_cam in (R_wl, R_wr):
             mx, my = build_cylindrical_maps(lens, R_cam, self.out_w, self.out_h,
                                             yaw0, yaw1, el0, el1)
+            if persp is not None:
+                mx = cv2.remap(mx, persp[0], persp[1], cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_REPLICATE)
+                my = cv2.remap(my, persp[0], persp[1], cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_REPLICATE)
             self._float_maps.append((mx, my))
             masks.append(cv2.remap(src_ones, mx, my, cv2.INTER_NEAREST, borderValue=0))
         self._masks = masks
 
         # 심 밴드 경계: [x0, x1) 만 블렌딩, 바깥은 단일 카메라 복사
+        # (키스톤 시 상단에서 심 주변 소스가 가로로 늘어나므로 밴드도 m배 확장)
         seam_feather = max(2, int(feather_px * scale))
+        band_half = int(seam_feather * max(1.0, persp_m)) // 2 + 2
         xc = self.out_w // 2
-        self._x0 = max(0, xc - seam_feather // 2 - 2)
-        self._x1 = min(self.out_w, xc + seam_feather // 2 + 2)
+        self._x0 = max(0, xc - band_half)
+        self._x1 = min(self.out_w, xc + band_half)
         w_l_full = seam_weights(masks[0], masks[1], yaw0, yaw1,
                                 (yaw0 + yaw1) / 2, seam_feather)
         self.w_l_band = np.ascontiguousarray(w_l_full[:, self._x0 : self._x1])

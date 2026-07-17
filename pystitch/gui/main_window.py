@@ -12,7 +12,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout, QGroupBox,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QListWidget, QMainWindow, QMessageBox, QPlainTextEdit,
     QProgressBar, QPushButton, QSlider, QSpinBox, QSplitter, QTabWidget,
     QVBoxLayout, QWidget,
@@ -105,6 +105,11 @@ class MainWindow(QMainWindow):
                 "codec_index": self.combo_codec.currentIndex(),
                 "crf": self.spin_crf.value(),
                 "scale_index": self.combo_scale.currentIndex(),
+                "perspective": {
+                    "enabled": self.check_persp.isChecked(),
+                    "k": self.spin_persp_k.value(),
+                    "m": self.spin_persp_m.value(),
+                },
             },
         }
 
@@ -157,6 +162,10 @@ class MainWindow(QMainWindow):
         self.combo_codec.setCurrentIndex(int(exp.get("codec_index", 0)))
         self.spin_crf.setValue(int(exp.get("crf", 19)))
         self.combo_scale.setCurrentIndex(int(exp.get("scale_index", 0)))
+        persp = exp.get("perspective", {})
+        self.check_persp.setChecked(bool(persp.get("enabled", False)))
+        self.spin_persp_k.setValue(float(persp.get("k", 0.3)))
+        self.spin_persp_m.setValue(float(persp.get("m", 1.3)))
         self.segments = d.get("segments", [])
         self._refresh_segment_list()
         if self.segments:
@@ -490,6 +499,12 @@ class MainWindow(QMainWindow):
         if self.segments:
             self._preview_timer.start()
 
+    def _persp_params(self) -> tuple[float, float]:
+        """내보내기 탭의 원근비 조절 설정 (미체크 시 항등)."""
+        if not self.check_persp.isChecked():
+            return 0.0, 1.0
+        return self.spin_persp_k.value(), self.spin_persp_m.value()
+
     def _render_preview(self):
         img_l, img_r = self.cur_imgs
         alignment = self.current_alignment()
@@ -501,7 +516,8 @@ class MainWindow(QMainWindow):
         self._preview_worker = PreviewWorker(
             self.lens, alignment, img_l.copy(), img_r.copy(),
             self.spin_user["pitch"].value(), self.spin_user["roll"].value(),
-            self.spin_user["yaw"].value(), self.spin_feather.value())
+            self.spin_user["yaw"].value(), self.spin_feather.value(),
+            persp_k=self._persp_params()[0], persp_m=self._persp_params()[1])
         self._preview_worker.log.connect(self.log)
         self._preview_worker.done.connect(self.pano_pane.set_frame)
         self._preview_worker.failed.connect(lambda m: self.log(f"[오류] {m}"))
@@ -539,6 +555,20 @@ class MainWindow(QMainWindow):
             self.combo_mode.setItemData(1, "ultralytics 미설치 (pip install ultralytics)",
                                         Qt.ItemDataRole.ToolTipRole)
         g.addWidget(self.combo_mode, 2, 3)
+
+        self.check_persp = QCheckBox("원근비 조절 (근경 축소 / 원경 확대)")
+        self.check_persp.stateChanged.connect(lambda _: self._preview_debounced())
+        g.addWidget(self.check_persp, 3, 0, 1, 2)
+        g.addWidget(QLabel("수직 k"), 3, 2)
+        self.spin_persp_k = QDoubleSpinBox(decimals=2, minimum=0.0, maximum=0.9,
+                                           singleStep=0.05, value=0.3)
+        self.spin_persp_k.valueChanged.connect(lambda _: self._preview_debounced())
+        g.addWidget(self.spin_persp_k, 3, 3)
+        g.addWidget(QLabel("키스톤 m"), 3, 4)
+        self.spin_persp_m = QDoubleSpinBox(decimals=2, minimum=1.0, maximum=2.5,
+                                           singleStep=0.05, value=1.3)
+        self.spin_persp_m.valueChanged.connect(lambda _: self._preview_debounced())
+        g.addWidget(self.spin_persp_m, 3, 5)
         v.addLayout(g)
 
         h = QHBoxLayout()
@@ -581,7 +611,8 @@ class MainWindow(QMainWindow):
             self.spin_user["pitch"].value(), self.spin_user["roll"].value(),
             self.spin_user["yaw"].value(),
             codec=codec, crf=self.spin_crf.value(), scale=scale,
-            feather_px=self.spin_feather.value(), ptz=ptz)
+            feather_px=self.spin_feather.value(), ptz=ptz,
+            persp_k=self._persp_params()[0], persp_m=self._persp_params()[1])
         self._export_worker.log.connect(self.log)
         self._export_worker.progress.connect(self._export_progress)
         self._export_worker.finished_ok.connect(self._export_done)

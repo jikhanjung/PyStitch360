@@ -84,19 +84,21 @@ class PreviewWorker(QThread):
 
     def __init__(self, lens, alignment: Alignment, img_l, img_r,
                  pitch_user=0.0, roll_user=0.0, yaw_user=0.0,
-                 feather_px=40, scale=0.25):
+                 feather_px=40, scale=0.25, persp_k=0.0, persp_m=1.0):
         super().__init__()
         self.lens, self.a = lens, alignment
         self.img_l, self.img_r = img_l, img_r
         self.user = (pitch_user, roll_user, yaw_user)
         self.feather_px, self.scale = feather_px, scale
+        self.persp = (persp_k, persp_m)
 
     def run(self):
         try:
             R_wl, R_wr = self.a.rotations(self.user[0], self.user[1])
             yaw0, yaw1 = self.a.window(self.user[2])
             r = Renderer(self.lens, R_wl, R_wr, yaw0, yaw1, self.a.el0, self.a.el1,
-                         scale=self.scale, feather_px=self.feather_px)
+                         scale=self.scale, feather_px=self.feather_px,
+                         persp_k=self.persp[0], persp_m=self.persp[1])
             r.set_gains_from(self.img_l, self.img_r)
             r.refine_seam(self.img_l, self.img_r, log=lambda s: self.log.emit(s))
             self.done.emit(r.render(self.img_l, self.img_r))
@@ -114,7 +116,7 @@ class ExportWorker(QThread):
                  offset_sec, start_sec, end_sec, out_path,
                  pitch_user=0.0, roll_user=0.0, yaw_user=0.0,
                  codec="libx264", crf=19, scale=1.0, feather_px=40,
-                 ptz=False):
+                 ptz=False, persp_k=0.0, persp_m=1.0):
         super().__init__()
         self.lens = lens
         # segments: [{"start_sec": float, "alignment": Alignment}, ...] 오름차순
@@ -129,6 +131,7 @@ class ExportWorker(QThread):
         self.codec, self.crf, self.scale = codec, crf, scale
         self.feather_px = feather_px
         self.ptz = ptz
+        self.persp = (persp_k, persp_m)
         self._cancel = False
 
     def cancel(self):
@@ -168,7 +171,8 @@ class ExportWorker(QThread):
             yaw_c = alignment.yaw_auto + np.deg2rad(self.user[2])
             r = Renderer(self.lens, R_wl, R_wr, yaw_c - half_range, yaw_c + half_range,
                          alignment.el0, alignment.el1,
-                         scale=self.scale, feather_px=self.feather_px)
+                         scale=self.scale, feather_px=self.feather_px,
+                         persp_k=self.persp[0], persp_m=self.persp[1])
             r.set_gains_from(img_l, img_r)
             r.refine_seam(img_l, img_r, log=lambda s: self.log.emit(s))
             return r

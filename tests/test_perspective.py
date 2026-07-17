@@ -73,3 +73,41 @@ def test_invalid_params_raise():
         build_perspective_maps(W, H, HORIZON, k=1.0)
     with pytest.raises(ValueError):
         build_perspective_maps(W, H, HORIZON, m=0.9)
+
+
+def test_renderer_one_pass_matches_two_pass():
+    """Renderer(persp) 원패스 == 일반 렌더 후 PerspectiveWarp 투패스."""
+    import cv2
+
+    from pystitch.core.lens import LensProfile, builtin_profiles
+    from pystitch.core.render import Renderer
+
+    lens = LensProfile.load(next(iter(builtin_profiles().values())))
+    rng = np.random.default_rng(7)
+    im = rng.integers(0, 255, (lens.height // 8, lens.width // 8, 3), np.uint8)
+    im = cv2.resize(im, (lens.width, lens.height))
+    # scale=0.2 렌더(5배 다운샘플)에서 앨리어싱이 없도록 충분히 블러
+    # — 고주파가 남으면 보간 1회/2회 차이가 증폭돼 합성 검증이 안 됨
+    im = cv2.GaussianBlur(im, (0, 0), 8)
+    # 같은 이미지·같은 회전 → 심 블렌딩이 diff 에 기여하지 않아
+    # 맵 합성(보간 순서)만 순수하게 비교된다
+    imgs = [im, im]
+    R = np.eye(3)
+    args = (lens, R, R, -0.7, 0.7, -0.35, 0.15)
+    kw = dict(scale=0.2, feather_px=40)
+    k, m = 0.3, 1.3
+
+    r0 = Renderer(*args, **kw)
+    pano0 = r0.render(*imgs)
+    horizon = (r0.out_h - 1) * np.tan(0.15) / (np.tan(0.15) - np.tan(-0.35))
+    two_pass = PerspectiveWarp(r0.out_w, r0.out_h, horizon, k, m).apply(pano0)
+
+    r1 = Renderer(*args, **kw, persp_k=k, persp_m=m)
+    assert (r1.out_w, r1.out_h) == (r0.out_w, r0.out_h)
+    one_pass = r1.render(*imgs)
+
+    valid = (r1._masks[0] > 0) | (r1._masks[1] > 0)
+    valid = cv2.erode(valid.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+    assert valid.mean() > 0.5  # 커버리지 자체가 있어야 의미 있는 비교
+    diff = np.abs(one_pass.astype(int) - two_pass.astype(int))[valid].mean()
+    assert diff < 3.0  # 보간 1회 vs 2회 차이 수준
