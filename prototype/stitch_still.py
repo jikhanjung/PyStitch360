@@ -159,8 +159,29 @@ def feather_weights(mask_l, mask_r, feather_px=120):
     return (dist_l / wsum).astype(np.float32)
 
 
-def render_pano(imgs, Rs, K, D, out_w, out_h, yaw0, yaw1, el0, el1, feather_px=120):
-    """두 이미지를 원통 파노라마로 워핑 + 게인 보정 + 페더 블렌딩 (1회용)."""
+def seam_weights(mask_l, mask_r, yaw0, yaw1, seam_yaw, feather_px=40):
+    """하프라인 수직 심 가중치: 심 좌측은 L, 우측은 R 카메라만 사용.
+
+    심 주변 feather_px 폭만 선형 블렌딩. 한쪽 마스크가 없는 곳은
+    다른 쪽이 자동으로 채운다 (정규화).
+    """
+    h, w = mask_l.shape
+    yaws = np.linspace(yaw0, yaw1, w)
+    half = feather_px / 2 * (yaw1 - yaw0) / w  # 픽셀 → 라디안
+    ramp = np.clip((seam_yaw + half - yaws) / (2 * half), 0.0, 1.0).astype(np.float32)
+    w_l = np.tile(ramp, (h, 1)) * (mask_l > 0)
+    w_r = np.tile(1.0 - ramp, (h, 1)) * (mask_r > 0)
+    wsum = w_l + w_r
+    wsum[wsum == 0] = 1
+    return (w_l / wsum).astype(np.float32)
+
+
+def render_pano(imgs, Rs, K, D, out_w, out_h, yaw0, yaw1, el0, el1, feather_px=120,
+                seam_yaw=None):
+    """두 이미지를 원통 파노라마로 워핑 + 게인 보정 + 블렌딩 (1회용).
+
+    seam_yaw 가 주어지면 하프라인 수직 심 (좌=L, 우=R), 아니면 마스크 기반 페더.
+    """
     warped, masks = [], []
     for img, R_cam in zip(imgs, Rs):
         mx, my = build_cylindrical_maps(K, D, R_cam, out_w, out_h, yaw0, yaw1, el0, el1)
@@ -168,7 +189,10 @@ def render_pano(imgs, Rs, K, D, out_w, out_h, yaw0, yaw1, el0, el1, feather_px=1
         masks.append(cv2.remap(np.ones(img.shape[:2], np.uint8) * 255, mx, my,
                                cv2.INTER_NEAREST, borderValue=0))
     g_l, g_r = compute_gains(warped[0], warped[1], masks[0], masks[1])
-    w_l = feather_weights(masks[0], masks[1], feather_px)[..., None]
+    if seam_yaw is None:
+        w_l = feather_weights(masks[0], masks[1], feather_px)[..., None]
+    else:
+        w_l = seam_weights(masks[0], masks[1], yaw0, yaw1, seam_yaw)[..., None]
     pano = (warped[0].astype(np.float32) * (w_l * g_l)
             + warped[1].astype(np.float32) * ((1 - w_l) * g_r))
     return np.clip(pano, 0, 255).astype(np.uint8)
@@ -360,7 +384,8 @@ def main():
     print(f"출력 해상도: {out_w}x{out_h}  (수평 {np.rad2deg(g['yaw1']-g['yaw0']):.0f}°)")
 
     pano = render_pano([img_l, img_r], [g["R_wl"], g["R_wr"]], K, D,
-                       out_w, out_h, g["yaw0"], g["yaw1"], g["el0"], g["el1"])
+                       out_w, out_h, g["yaw0"], g["yaw1"], g["el0"], g["el1"],
+                       seam_yaw=(g["yaw0"] + g["yaw1"]) / 2)  # 하프라인 수직 심
     cv2.imwrite(args.out, pano, [cv2.IMWRITE_JPEG_QUALITY, 92])
     print(f"저장: {args.out}")
 

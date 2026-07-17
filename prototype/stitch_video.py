@@ -20,7 +20,7 @@ from stitch_still import (
     setup_alignment,
     build_cylindrical_maps,
     compute_gains,
-    feather_weights,
+    seam_weights,
 )
 
 
@@ -82,7 +82,9 @@ def main():
     gain_l, gain_r = compute_gains(warp_l, warp_r, masks[0], masks[1])
     gain_l_sc = tuple(gain_l) + (1.0,)   # cv2.multiply 용 스칼라
     gain_r_sc = tuple(gain_r) + (1.0,)
-    w_l = feather_weights(masks[0], masks[1])
+    # 하프라인 수직 심: 심 좌측은 L 카메라, 우측은 R 카메라만 사용
+    w_l = seam_weights(masks[0], masks[1], g["yaw0"], g["yaw1"],
+                       (g["yaw0"] + g["yaw1"]) / 2)
     w_r = (1.0 - w_l).astype(np.float32)
     print(f"  캐싱 {time.perf_counter()-t0:.1f}s, 게인 L={gain_l.round(3)} R={gain_r.round(3)}")
 
