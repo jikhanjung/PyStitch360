@@ -22,6 +22,7 @@ from ..core.chapters import ChapteredVideo, find_chapters
 from ..core.encoders import available_encoders
 from ..core.lens import LensProfile, builtin_profiles
 from ..core.project import load_project, save_project
+from ..core.ptz import ptz_available
 from .widgets import FramePane
 from .workers import AlignWorker, ExportWorker, PreviewWorker, SyncWorker
 
@@ -484,6 +485,13 @@ class MainWindow(QMainWindow):
         self.combo_scale = QComboBox()
         self.combo_scale.addItems(["100% (~5900px)", "50% (~2950px)"])
         g.addWidget(self.combo_scale, 2, 1)
+        g.addWidget(QLabel("출력 형식"), 2, 2)
+        self.combo_mode = QComboBox()
+        self.combo_mode.addItems(["파노라마 전체", "가상 PTZ (1080p, 공 추적)"])
+        if not ptz_available():
+            self.combo_mode.setItemData(1, "ultralytics 미설치 (pip install ultralytics)",
+                                        Qt.ItemDataRole.ToolTipRole)
+        g.addWidget(self.combo_mode, 2, 3)
         v.addLayout(g)
 
         h = QHBoxLayout()
@@ -510,6 +518,12 @@ class MainWindow(QMainWindow):
                                              "MP4 (*.mp4)")
         if not out:
             return
+        ptz = self.combo_mode.currentIndex() == 1
+        if ptz and not ptz_available():
+            QMessageBox.warning(self, "내보내기",
+                                "가상 PTZ 에는 ultralytics 가 필요합니다:\n"
+                                "pip install ultralytics")
+            return
         codec = self.encoders[self.combo_codec.currentText()]
         scale = 1.0 if self.combo_scale.currentIndex() == 0 else 0.5
         self._export_worker = ExportWorker(
@@ -520,7 +534,7 @@ class MainWindow(QMainWindow):
             self.spin_user["pitch"].value(), self.spin_user["roll"].value(),
             self.spin_user["yaw"].value(),
             codec=codec, crf=self.spin_crf.value(), scale=scale,
-            feather_px=self.spin_feather.value())
+            feather_px=self.spin_feather.value(), ptz=ptz)
         self._export_worker.log.connect(self.log)
         self._export_worker.progress.connect(self._export_progress)
         self._export_worker.finished_ok.connect(self._export_done)

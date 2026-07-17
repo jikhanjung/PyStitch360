@@ -91,7 +91,8 @@ class ExportWorker(QThread):
     def __init__(self, lens, segments, left_files, right_files,
                  offset_sec, start_sec, end_sec, out_path,
                  pitch_user=0.0, roll_user=0.0, yaw_user=0.0,
-                 codec="libx264", crf=19, scale=1.0, feather_px=40):
+                 codec="libx264", crf=19, scale=1.0, feather_px=40,
+                 ptz=False):
         super().__init__()
         self.lens = lens
         # segments: [{"start_sec": float, "alignment": Alignment}, ...] 오름차순
@@ -105,6 +106,7 @@ class ExportWorker(QThread):
         self.user = (pitch_user, roll_user, yaw_user)
         self.codec, self.crf, self.scale = codec, crf, scale
         self.feather_px = feather_px
+        self.ptz = ptz
         self._cancel = False
 
     def cancel(self):
@@ -156,7 +158,15 @@ class ExportWorker(QThread):
             raise RuntimeError("시작 프레임 읽기 실패")
         seg_idx = segment_index_at(self.start)
         rend = make_renderer(self.segments[seg_idx]["alignment"], img_l, img_r)
-        out_w, out_h = rend.out_w, rend.out_h
+        pano_w, pano_h = rend.out_w, rend.out_h
+        out_w, out_h = pano_w, pano_h
+
+        vptz = None
+        if self.ptz:
+            from ..core.ptz import VirtualPTZ
+            self.log.emit("가상 PTZ 초기화 (YOLO 로드)...")
+            vptz = VirtualPTZ(pano_w, pano_h)
+            out_w, out_h = vptz.out_w, vptz.out_h
         # 이번 내보내기 구간 안에 있는 이후 세그먼트 경계 (절대 프레임 번호)
         pending = [(int(round(s["start_sec"] * fps)), i)
                    for i, s in enumerate(self.segments)
@@ -171,7 +181,7 @@ class ExportWorker(QThread):
         duration = total / fps
         cmd = (["ffmpeg", "-y", "-v", "error",
                 "-f", "rawvideo", "-pix_fmt", "bgr24",
-                "-s", f"{rend.out_w}x{rend.out_h}", "-r", f"{fps}", "-i", "-",
+                "-s", f"{out_w}x{out_h}", "-r", f"{fps}", "-i", "-",
                 "-f", "concat", "-safe", "0", "-ss", f"{self.start}",
                 "-t", f"{duration}", "-i", concat_list,
                 "-map", "0:v", "-map", "1:a?"]
@@ -228,9 +238,11 @@ class ExportWorker(QThread):
                     t_seg = self.segments[si]["start_sec"]
                     self.log.emit(f"[segment] {t_seg:.1f}s 경계 — 렌더러 재구성")
                     rend = make_renderer(self.segments[si]["alignment"], *item)
-                    if (rend.out_w, rend.out_h) != (out_w, out_h):
+                    if (rend.out_w, rend.out_h) != (pano_w, pano_h):
                         raise RuntimeError("세그먼트 출력 크기 불일치")
                 frame = rend.render(*item)
+                if vptz is not None:
+                    frame = vptz.process(frame)
                 q_out.put(frame.tobytes())
                 done += 1
                 if done % 30 == 0:
