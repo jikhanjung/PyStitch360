@@ -209,6 +209,7 @@ class MainWindow(QMainWindow):
         self.spin_persp_m.setValue(float(persp.get("m", 1.3)))
         self.segments = d.get("segments", [])
         self._refresh_segment_list()
+        self._update_auto_labels()
         if self.segments:
             self.lbl_align.setText(f"(프로젝트에서 복원) 세그먼트 {len(self.segments)}개")
             if self.cur_imgs[0] is not None:
@@ -355,6 +356,7 @@ class MainWindow(QMainWindow):
         self.pane_l.set_frame(self.cur_imgs[0])
         self.pane_r.set_frame(self.cur_imgs[1])
         # 정합 탭에서 프레임을 옮기면 파노라마 미리보기도 따라간다
+        self._update_auto_labels()   # 시각에 따라 담당 세그먼트가 바뀔 수 있음
         if self.tabs.currentIndex() == 1 and self.segments:
             self._preview_debounced()
 
@@ -450,6 +452,7 @@ class MainWindow(QMainWindow):
         adj = QGroupBox("미세조정 (자동 추정값에 더해짐, 도 단위)")
         g = QGridLayout(adj)
         self.spin_user = {}
+        self.lbl_auto = {}
         for col, (key, label) in enumerate([("pitch", "수평(pitch)"),
                                             ("roll", "기울기(roll)"),
                                             ("yaw", "센터링(yaw)")]):
@@ -458,6 +461,10 @@ class MainWindow(QMainWindow):
             sp.valueChanged.connect(lambda _: self._preview_debounced())
             self.spin_user[key] = sp
             g.addWidget(sp, 0, col * 2 + 1)
+            la = QLabel("자동 —")            # 현재 세그먼트의 자동 추정값 표시
+            la.setStyleSheet("color: gray")
+            self.lbl_auto[key] = la
+            g.addWidget(la, 1, col * 2 + 1)
         g.addWidget(QLabel("심 페더(px)"), 0, 6)
         self.spin_feather = QSpinBox(minimum=2, maximum=400, value=40)
         self.spin_feather.valueChanged.connect(lambda _: self._preview_debounced())
@@ -504,6 +511,7 @@ class MainWindow(QMainWindow):
             f"인라이어 {a.n_inliers}/{a.n_matches}, 잔차 {a.residual_deg:.2f}°, "
             f"상대회전 {a.yaw_split_deg:.1f}°, 자동 pitch {a.pitch_auto*57.3:+.1f}° "
             f"roll {a.roll_auto*57.3:+.1f}°")
+        self._update_auto_labels()
         self._render_preview()   # 정지 미리보기 갱신 (재생은 ▶ 버튼으로)
 
     def _align_failed(self, msg):
@@ -616,6 +624,17 @@ class MainWindow(QMainWindow):
         self._playing = False
         self.btn_play.setText("▶ 재생")
         self._show_current_frames()
+
+    def _update_auto_labels(self):
+        """미세조정 그룹에 현재 세그먼트의 자동 pitch/roll/yaw 표시."""
+        a = self.current_alignment()
+        for key in self.lbl_auto:
+            if a is None:
+                self.lbl_auto[key].setText("자동 —")
+            else:
+                deg = {"pitch": a.pitch_auto, "roll": a.roll_auto,
+                       "yaw": a.yaw_auto}[key] * 57.29578
+                self.lbl_auto[key].setText(f"자동 {deg:+.2f}°")
 
     def _persp_params(self) -> tuple[float, float]:
         """내보내기 탭의 원근비 조절 설정 (미체크 시 항등)."""
