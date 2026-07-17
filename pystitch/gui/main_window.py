@@ -24,7 +24,9 @@ from ..core.lens import LensProfile, builtin_profiles
 from ..core.project import load_project, save_project
 from ..core.ptz import ptz_available
 from .widgets import FramePane
-from .workers import AlignWorker, ExportWorker, PreviewWorker, SyncWorker
+from .workers import (
+    AlignWorker, ExportWorker, GpmfWorker, PreviewWorker, SyncWorker,
+)
 
 
 class MainWindow(QMainWindow):
@@ -353,6 +355,15 @@ class MainWindow(QMainWindow):
         seg_btns.addWidget(btn_goto)
         seg_btns.addWidget(btn_del)
         seg_v.addLayout(seg_btns)
+
+        seg_v.addWidget(QLabel("자이로 이벤트 후보 (더블클릭=이동)"))
+        self.event_list = QListWidget()
+        self.event_list.setMaximumWidth(280)
+        self.event_list.itemDoubleClicked.connect(self._goto_event)
+        seg_v.addWidget(self.event_list, 1)
+        self.btn_gpmf = QPushButton("자이로에서 충격 이벤트 탐지")
+        self.btn_gpmf.clicked.connect(self._run_gpmf)
+        seg_v.addWidget(self.btn_gpmf)
         mid.addWidget(seg_box)
         v.addLayout(mid, 1)
 
@@ -438,6 +449,42 @@ class MainWindow(QMainWindow):
         if 0 <= row < len(self.segments):
             del self.segments[row]
             self._refresh_segment_list()
+
+    def _run_gpmf(self):
+        if not (self.video_l and self.files_l):
+            QMessageBox.information(self, "이벤트 탐지", "먼저 좌측 영상을 열어주세요.")
+            return
+        durations = [n / self.video_l.fps for n in self.video_l.chapter_frames]
+        self.btn_gpmf.setEnabled(False)
+        self.log("[gpmf] 자이로 데이터 분석 중...")
+        self._gpmf_worker = GpmfWorker(self.files_l, durations)
+        self._gpmf_worker.log.connect(self.log)
+        self._gpmf_worker.done.connect(self._gpmf_done)
+        self._gpmf_worker.failed.connect(self._gpmf_failed)
+        self._gpmf_worker.start()
+
+    def _gpmf_done(self, events):
+        self.btn_gpmf.setEnabled(True)
+        self._gyro_events = events
+        self.event_list.clear()
+        for e in events:
+            kind = "방향변경" if e.persistent else "일시흔들림"
+            self.event_list.addItem(
+                f"{int(e.time_sec//60):02d}:{e.time_sec%60:04.1f}  "
+                f"{e.net_angle_deg:.1f}° [{kind}]")
+        self.log(f"[gpmf] 이벤트 {len(events)}개 — 방향변경 후보로 이동해서 "
+                 f"몇 초 뒤 프레임에서 재정합하면 새 세그먼트가 됩니다")
+
+    def _gpmf_failed(self, msg):
+        self.btn_gpmf.setEnabled(True)
+        self.log(f"[gpmf] 실패: {msg}")
+
+    def _goto_event(self):
+        row = self.event_list.currentRow()
+        if 0 <= row < len(getattr(self, "_gyro_events", [])) and self.video_l:
+            # 이벤트 몇 초 뒤(안정화된 시점)로 이동
+            t = self._gyro_events[row].time_sec + 3.0
+            self.slider.setValue(int(t * self.video_l.fps))
 
     def _preview_debounced(self):
         if self.segments:

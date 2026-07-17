@@ -35,6 +35,28 @@ class SyncWorker(QThread):
             self.failed.emit(str(e))
 
 
+class GpmfWorker(QThread):
+    """자이로 기반 충격 이벤트 탐지 (좌측 카메라 기준)."""
+
+    done = pyqtSignal(list)              # list[GyroEvent]
+    log = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, files, durations):
+        super().__init__()
+        self.files = [str(f) for f in files]
+        self.durations = durations
+
+    def run(self):
+        try:
+            from ..core.gpmf import detect_bump_events
+            events = detect_bump_events(self.files, self.durations,
+                                        log=lambda s: self.log.emit(s))
+            self.done.emit(events)
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(str(e))
+
+
 class AlignWorker(QThread):
     done = pyqtSignal(object)            # Alignment
     log = pyqtSignal(str)
