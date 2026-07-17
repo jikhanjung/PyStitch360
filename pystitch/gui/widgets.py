@@ -4,7 +4,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QLabel, QSizePolicy
 
 
@@ -26,8 +26,35 @@ class FramePane(QLabel):
         self._pixmap: QPixmap | None = None
         self._interactive = interactive
         self._drag_pos = None
+        self._grid = False
         if interactive:
             self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def set_grid(self, on: bool):
+        """정렬 가이드라인 그리드 표시 (중앙 세로선 강조 — 하프라인 맞춤용)."""
+        self._grid = bool(on)
+        self.update()
+
+    def paintEvent(self, ev):
+        super().paintEvent(ev)
+        p = self.pixmap()
+        if not self._grid or p is None or p.isNull():
+            return
+        pw, ph = p.width(), p.height()
+        x0 = (self.width() - pw) // 2
+        y0 = (self.height() - ph) // 2
+        painter = QPainter(self)
+        painter.setPen(QPen(QColor(255, 255, 255, 100), 1))
+        for i in range(1, 8):                       # 세로 8등분
+            x = x0 + pw * i // 8
+            if i != 4:
+                painter.drawLine(x, y0, x, y0 + ph)
+        for j in range(1, 4):                       # 가로 4등분
+            y = y0 + ph * j // 4
+            painter.drawLine(x0, y, x0 + pw, y)
+        painter.setPen(QPen(QColor(255, 210, 0, 210), 3))   # 중앙 세로선 강조
+        painter.drawLine(x0 + pw // 2, y0, x0 + pw // 2, y0 + ph)
+        painter.end()
 
     def displayed_width(self) -> int:
         p = self.pixmap()

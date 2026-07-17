@@ -425,6 +425,7 @@ class MainWindow(QMainWindow):
         self.pano_pane = FramePane("파노라마 미리보기 (드래그: yaw/pitch, Shift+드래그: roll)",
                                    interactive=True)
         self.pano_pane.dragged.connect(self._pano_dragged)
+        self.pano_pane.set_grid(True)
         mid.addWidget(self.pano_pane, 1)
 
         seg_box = QGroupBox("세그먼트 (방향 변동 구간)")
@@ -458,6 +459,10 @@ class MainWindow(QMainWindow):
         self.btn_play.setMaximumWidth(90)
         self.btn_play.clicked.connect(self._toggle_play)
         tl.addWidget(self.btn_play)
+        self.check_grid = QCheckBox("그리드")
+        self.check_grid.setChecked(True)
+        self.check_grid.toggled.connect(self.pano_pane.set_grid)
+        tl.addWidget(self.check_grid)
         for text, d in [("-10", -10), ("-1", -1), ("+1", 1), ("+10", 10)]:
             b = QPushButton(text)
             b.setMaximumWidth(48)
