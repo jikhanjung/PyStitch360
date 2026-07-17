@@ -14,8 +14,8 @@ def compute_gains(warped_l, warped_r, mask_l, mask_r):
     overlap = (mask_l > 0) & (mask_r > 0)
     if overlap.sum() < 1000:
         return np.ones(3), np.ones(3)
-    mean_l = warped_l[overlap].reshape(-1, 3).mean(axis=0)
-    mean_r = warped_r[overlap].reshape(-1, 3).mean(axis=0)
+    mean_l = np.maximum(warped_l[overlap].reshape(-1, 3).mean(axis=0), 1e-3)
+    mean_r = np.maximum(warped_r[overlap].reshape(-1, 3).mean(axis=0), 1e-3)
     target = np.sqrt(mean_l * mean_r)
     return target / mean_l, target / mean_r
 
