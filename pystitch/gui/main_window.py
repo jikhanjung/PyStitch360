@@ -422,7 +422,9 @@ class MainWindow(QMainWindow):
         v.addLayout(top)
 
         mid = QHBoxLayout()
-        self.pano_pane = FramePane("파노라마 미리보기")
+        self.pano_pane = FramePane("파노라마 미리보기 (드래그: yaw/pitch, Shift+드래그: roll)",
+                                   interactive=True)
+        self.pano_pane.dragged.connect(self._pano_dragged)
         mid.addWidget(self.pano_pane, 1)
 
         seg_box = QGroupBox("세그먼트 (방향 변동 구간)")
@@ -691,6 +693,26 @@ class MainWindow(QMainWindow):
         self._playing = False
         self.btn_play.setText("▶ 재생")
         self._show_current_frames()
+
+    def _pano_dragged(self, dx: float, dy: float, shift: bool):
+        """미리보기 드래그로 yaw/pitch(Shift: roll) 조절 — 내용이 커서를 따라온다."""
+        a = self.current_alignment()
+        w_px = self.pano_pane.displayed_width()
+        h_px = self.pano_pane.displayed_height()
+        if a is None or w_px == 0 or h_px == 0:
+            return
+        yaw0, yaw1 = a.window(self.spin_user["yaw"].value())
+        deg_x = (yaw1 - yaw0) * 57.29578 / w_px
+        el0, el1 = self._view_el()
+        deg_y = (el1 - el0) * 57.29578 / h_px
+        if shift:
+            sp = self.spin_user["roll"]
+            sp.setValue(sp.value() + dx * deg_x * 0.3)   # roll 은 완만하게
+        else:
+            sy = self.spin_user["yaw"]
+            sy.setValue(sy.value() - dx * deg_x)
+            sp = self.spin_user["pitch"]
+            sp.setValue(sp.value() + dy * deg_y)
 
     def _update_auto_labels(self):
         """미세조정 그룹에 현재 세그먼트의 자동 pitch/roll/yaw 표시."""
