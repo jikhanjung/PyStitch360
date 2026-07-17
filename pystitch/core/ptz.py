@@ -88,7 +88,7 @@ class VirtualPTZ:
     """
 
     def __init__(self, pano_w: int, pano_h: int, out_w: int = 1920, out_h: int = 1080,
-                 detect_every: int = 5, detect_width: int = 1280,
+                 detect_every: int = 3, detect_width: int = 2944,
                  weights: str | Path | None = None):
         if pano_w < out_w or pano_h < out_h:
             raise ValueError(
@@ -98,7 +98,9 @@ class VirtualPTZ:
         self.out_w, self.out_h = out_w, out_h
         self.detect_every = detect_every
         self.det_scale = detect_width / pano_w
-        self.detector = Detector(weights)
+        # imgsz 를 축소본 크기와 일치시켜 YOLO 내부 재축소로 인한
+        # 실효 해상도 손실(공 소실의 주범)을 막는다
+        self.detector = Detector(weights, imgsz=detect_width)
         self.smoother = PTZSmoother()
         self._i = 0
         self._last_det = np.zeros((0, 4))
@@ -121,3 +123,245 @@ class VirtualPTZ:
         y0 = max(0, min(y0, self.pano_h - self.out_h))
         return np.ascontiguousarray(
             pano[y0 : y0 + self.out_h, x0 : x0 + self.out_w])
+
+
+# ================================================================ 2패스 PTZ
+# 오프라인 내보내기용: 1패스에서 전체 검출 궤적을 모으고(전역 스무딩이
+# 가능해짐), 2패스에서 크롭·인코딩한다. 실측(devlog 007): 검출 해상도를
+# 2944px 로 올리면 경기장 안 공 검출률 0% → 52% (conf>=0.25).
+
+def detect_raw(model, frame, det_w=2944, conf=0.2):
+    """(N,4) [cx, cy, conf, is_ball] — 파노라마 원본 좌표계."""
+    scale = det_w / frame.shape[1]
+    small = cv2.resize(frame, None, fx=scale, fy=scale,
+                       interpolation=cv2.INTER_AREA)
+    r = model.predict(small, imgsz=det_w, conf=conf,
+                      classes=[_CLS_PERSON, _CLS_BALL], verbose=False)[0]
+    out = []
+    for b in r.boxes:
+        x1, y1, x2, y2 = b.xyxy[0].tolist()
+        out.append(((x1 + x2) / 2 / scale, (y1 + y2) / 2 / scale,
+                    float(b.conf[0]), float(int(b.cls[0]) == _CLS_BALL)))
+    return np.array(out) if out else np.zeros((0, 4))
+
+
+def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
+                  weights=None, log=print):
+    """1패스: 프레임 샘플마다 공/선수 검출. 반환 dict 는 JSON 직렬화 가능.
+
+    field_top_frac 위(원경 트랙·관중석)의 공/선수는 장외로 버린다.
+    """
+    from ultralytics import YOLO
+    model = YOLO(str(weights or _DEFAULT_WEIGHTS))
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise RuntimeError(f"열 수 없음: {path}")
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    pano_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    pano_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    field_top = field_top_frac * pano_h
+    frames_idx, balls, players = [], [], []
+    import time
+    t0 = time.perf_counter()
+    i = 0
+    while True:
+        ok = cap.grab()
+        if not ok:
+            break
+        if i % detect_every == 0:
+            ok, frame = cap.retrieve()
+            if not ok:
+                break
+            det = detect_raw(model, frame, det_w)
+            in_field = det[(det[:, 1] >= field_top)] if len(det) else det
+            b = in_field[in_field[:, 3] > 0.5] if len(in_field) else in_field
+            p = in_field[in_field[:, 3] < 0.5] if len(in_field) else in_field
+            best = b[b[:, 2].argmax(), :3].tolist() if len(b) else None
+            frames_idx.append(i)
+            balls.append(best)
+            players.append(p[:, :2].round(1).tolist() if len(p) else [])
+            if len(frames_idx) % 300 == 0:
+                el = time.perf_counter() - t0
+                log(f"[analyze] {i}/{total} ({i/max(el,1e-9):.1f}fps)")
+        i += 1
+    cap.release()
+    return {"video": str(path), "total_frames": i, "fps": fps,
+            "pano_w": pano_w, "pano_h": pano_h,
+            "detect_every": detect_every, "det_w": det_w,
+            "field_top_frac": field_top_frac,
+            "frames": frames_idx, "balls": balls, "players": players}
+
+
+def _gaussian1d(x, sigma):
+    """NaN 없는 1D 배열의 가우시안 스무딩 (경계는 edge 패딩, zero-phase)."""
+    if sigma <= 0:
+        return x.copy()
+    n = int(4 * sigma) | 1
+    t = np.arange(n) - n // 2
+    k = np.exp(-0.5 * (t / sigma) ** 2)
+    k /= k.sum()
+    pad = np.concatenate([np.full(n // 2, x[0]), x, np.full(n // 2, x[-1])])
+    return np.convolve(pad, k, "valid")
+
+
+def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
+               ball_conf=0.25, max_jump_per_frame=120.0, gap_fill_sec=2.0,
+               sigma_slow=1.2, sigma_fast=0.35, fast_err_px=400.0,
+               zoom_margin=260.0, top_margin=160,
+               decoy_static_px=30.0, decoy_iso_px=700.0, decoy_win_sec=3.0,
+               log=print):
+    """검출 궤적 → 프레임별 (cx, cy, crop_w) 계획.
+
+    - 공: conf 게이팅 + 점프 게이팅, gap_fill_sec 까지 선형 보간.
+    - 정적 미끼 필터: decoy_win_sec 창 내내 decoy_static_px 안에 정지해 있고
+      모든 선수로부터 decoy_iso_px 이상 고립된 '공'은 오검출(낙엽·마킹 등)로
+      기각. 실제 공은 경기 중 장시간 정지+고립 상태가 없다 (코너킥 준비 등
+      짧은 예외는 줌아웃으로 처리돼 해가 없음).
+    - 공 없는 구간: 선수 중앙값 주변(트림 평균) 목표 + 줌아웃(선수 분포 커버).
+    - 스무딩: 기본 sigma_slow(초). 잔차가 fast_err_px 를 넘는 구간(공이 빠르게
+      이동)만 sigma_fast 추종으로 크로스페이드 — "평상시 최대한 부드럽게".
+    - top_margin: 파노라마 상단 검은 스티칭 경계를 크롭에 넣지 않기 위한
+      상단 여백(px). 최대 줌아웃 높이도 이만큼 줄어든다.
+    """
+    fps = analysis["fps"]
+    total = analysis["total_frames"]
+    idx = np.array(analysis["frames"])
+    n = len(idx)
+
+    # --- 0. 정적 미끼 기각 ----------------------------------------------
+    cand = np.array([b[:2] if b is not None and b[2] >= ball_conf else (np.nan, np.nan)
+                     for b in analysis["balls"]])
+    # 고립도: 선수 검출이 있는 샘플에서만 판정 가능 (-1 = 판정 불가 → 유지)
+    iso = np.full(n, -1.0)
+    for i in range(n):
+        if not np.isnan(cand[i, 0]) and analysis["players"][i]:
+            pl = np.asarray(analysis["players"][i], dtype=float).reshape(-1, 2)
+            iso[i] = np.hypot(*(pl - cand[i]).T).min()
+    iso[iso < 0] = 0.0
+    win = max(1, int(decoy_win_sec * fps / max(np.diff(idx).mean(), 1)))
+    decoy = np.zeros(n, bool)
+    for i in range(n):
+        if np.isnan(cand[i, 0]) or iso[i] <= decoy_iso_px:
+            continue
+        w = cand[max(0, i - win): i + win + 1]
+        w = w[~np.isnan(w[:, 0])]
+        if len(w) >= 3 and np.hypot(*(w - cand[i]).T).max() <= decoy_static_px:
+            decoy[i] = True
+
+    # --- 1. 공 수락 (게이팅) --------------------------------------------
+    ball = np.full((n, 2), np.nan)
+    last = None          # (sample_i, x, y)
+    for i, b in enumerate(analysis["balls"]):
+        if b is None or b[2] < ball_conf or decoy[i]:
+            continue
+        x, y, c = b
+        if last is not None and c < 0.5:
+            gap_frames = idx[i] - idx[last[0]]
+            if np.hypot(x - last[1], y - last[2]) > max_jump_per_frame * max(gap_frames, 1):
+                continue  # 순간이동 — 장외/오검출로 간주
+        ball[i] = (x, y)
+        last = (i, x, y)
+
+    # --- 2. 갭 보간 (짧은 가림/미검출) ----------------------------------
+    known = ~np.isnan(ball[:, 0])
+    gap_max = gap_fill_sec * fps
+    filled = ball.copy()
+    ki = np.where(known)[0]
+    for a, b_ in zip(ki[:-1], ki[1:]):
+        if 0 < idx[b_] - idx[a] <= gap_max:
+            for col in (0, 1):
+                filled[a:b_ + 1, col] = np.interp(idx[a:b_ + 1], [idx[a], idx[b_]],
+                                                  [ball[a, col], ball[b_, col]])
+    known = ~np.isnan(filled[:, 0])
+
+    # --- 3. 목표점 + 줌 ------------------------------------------------
+    max_crop_w = int(min(pano_w, (pano_h - top_margin) * out_w / out_h))
+    tx = np.empty(n)
+    ty = np.empty(n)
+    zw = np.full(n, float(out_w))
+    prev = (pano_w / 2, pano_h * 0.55)
+    for i in range(n):
+        if known[i]:
+            tx[i], ty[i] = filled[i]
+        else:
+            pl = np.array(analysis["players"][i], dtype=float).reshape(-1, 2)
+            if len(pl) >= 3:
+                med = np.median(pl[:, 0])
+                keep = pl[np.abs(pl[:, 0] - med) < pano_w * 0.25]
+                tx[i], ty[i] = keep[:, 0].mean(), keep[:, 1].mean()
+                span = (np.percentile(pl[:, 0], 90) - np.percentile(pl[:, 0], 10)
+                        + 2 * zoom_margin)
+                zw[i] = np.clip(span, out_w, max_crop_w)
+            else:
+                tx[i], ty[i] = prev
+                zw[i] = max_crop_w   # 정보 부족 — 최대한 넓게
+        prev = (tx[i], ty[i])
+
+    # --- 4. 프레임별 업샘플 + 적응 스무딩 -------------------------------
+    fr = np.arange(total)
+    fx = np.interp(fr, idx, tx)
+    fy = np.interp(fr, idx, ty)
+    fz = np.interp(fr, idx, zw)
+    slow = _gaussian1d(fx, sigma_slow * fps)
+    fast = _gaussian1d(fx, sigma_fast * fps)
+    err = np.abs(fx - slow)
+    w = 1.0 / (1.0 + np.exp(-(err - fast_err_px) / (fast_err_px * 0.25)))
+    w = _gaussian1d(w, 0.5 * fps)
+    cx = (1 - w) * slow + w * fast
+    cy = _gaussian1d(fy, 2.0 * fps)
+    cw = _gaussian1d(fz, 2.0 * fps)
+    if log:
+        log(f"[plan] 공 궤적 {known.mean():.0%} (보간 포함), "
+            f"정적 미끼 기각 {decoy.mean():.0%}, "
+            f"빠른 추종 구간 {(w > 0.5).mean():.0%}, "
+            f"줌아웃(>1.05x) {(cw > out_w * 1.05).mean():.0%}")
+    return {"cx": cx, "cy": cy, "crop_w": cw, "top_margin": top_margin}
+
+
+def render_plan(pano_path, out_path, plan, out_w=1920, out_h=1080,
+                codec="libx264", crf=20, log=print):
+    """2패스: 계획대로 크롭(필요 시 줌아웃 다운스케일)해 인코딩. fps 반환."""
+    import subprocess
+    import time
+
+    from .encoders import encoder_args
+    cap = cv2.VideoCapture(str(pano_path))
+    pano_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    pano_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cmd = (["ffmpeg", "-y", "-v", "error",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{out_w}x{out_h}", "-r", f"{fps}", "-i", "-",
+            "-i", str(pano_path), "-map", "0:v", "-map", "1:a?"]
+           + encoder_args(codec, crf)
+           + ["-pix_fmt", "yuv420p", "-c:a", "copy", "-shortest", str(out_path)])
+    enc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    cx, cy, cw = plan["cx"], plan["cy"], plan["crop_w"]
+    top_margin = int(plan.get("top_margin", 0))
+    t0 = time.perf_counter()
+    done = 0
+    try:
+        for i in range(len(cx)):
+            ok, frame = cap.read()
+            if not ok:
+                break
+            w = int(round(min(cw[i], pano_w, pano_h * out_w / out_h))) & ~1
+            h = int(round(w * out_h / out_w)) & ~1
+            x0 = int(round(cx[i] - w / 2))
+            y0 = int(round(cy[i] - h / 2))
+            x0 = max(0, min(x0, pano_w - w))
+            y0 = max(min(top_margin, pano_h - h), min(y0, pano_h - h))
+            crop = frame[y0:y0 + h, x0:x0 + w]
+            if w != out_w:
+                crop = cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_AREA)
+            enc.stdin.write(np.ascontiguousarray(crop).tobytes())
+            done += 1
+            if done % 900 == 0:
+                el = time.perf_counter() - t0
+                log(f"[render] {done}/{len(cx)} @ {done/el:.2f}fps")
+    finally:
+        enc.stdin.close()
+        enc.wait()
+        cap.release()
+    return done / max(time.perf_counter() - t0, 1e-9)
