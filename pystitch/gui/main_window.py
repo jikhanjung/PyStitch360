@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
 
 from ..core.chapters import ChapteredVideo, find_chapters
 from ..core.lens import LensProfile, builtin_profiles
+from ..core.project import load_project, save_project
 from .widgets import FramePane
 from .workers import AlignWorker, ExportWorker, PreviewWorker, SyncWorker
 
@@ -56,7 +57,98 @@ class MainWindow(QMainWindow):
         split.setSizes([760, 140])
         self.setCentralWidget(split)
 
+        self.project_path: Path | None = None
+        self._build_menu()
         self._load_profiles()
+
+    # ------------------------------------------------------------ 메뉴/프로젝트
+
+    def _build_menu(self):
+        m = self.menuBar().addMenu("파일(&F)")
+        m.addAction("프로젝트 열기...", self._open_project)
+        m.addAction("프로젝트 저장", self._save_project)
+        m.addAction("프로젝트 다른 이름으로 저장...", lambda: self._save_project(as_new=True))
+        m.addSeparator()
+        m.addAction("종료", self.close)
+
+    def _gather_project(self) -> dict:
+        segments = []
+        if self.alignment is not None:
+            segments.append({"start_sec": 0.0, "alignment": self.alignment})
+        return {
+            "left_files": [str(p) for p in self.files_l],
+            "right_files": [str(p) for p in self.files_r],
+            "offset_sec": self.spin_offset.value(),
+            "lens_profile": self.profile_combo.currentText(),
+            "segments": segments,
+            "user": {k: sp.value() for k, sp in self.spin_user.items()}
+                    | {"feather_px": self.spin_feather.value()},
+            "export": {
+                "start": self.spin_start.value(), "end": self.spin_end.value(),
+                "codec_index": self.combo_codec.currentIndex(),
+                "crf": self.spin_crf.value(),
+                "scale_index": self.combo_scale.currentIndex(),
+            },
+        }
+
+    def _save_project(self, as_new=False):
+        if self.project_path is None or as_new:
+            path, _ = QFileDialog.getSaveFileName(self, "프로젝트 저장",
+                                                  "project.pystitch.json",
+                                                  "PyStitch 프로젝트 (*.json)")
+            if not path:
+                return
+            self.project_path = Path(path)
+        try:
+            save_project(self.project_path, self._gather_project())
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "저장 실패", str(e))
+            return
+        self.setWindowTitle(f"PyStitch360 — {self.project_path.name}")
+        self.log(f"[project] 저장: {self.project_path}")
+
+    def _open_project(self):
+        path, _ = QFileDialog.getOpenFileName(self, "프로젝트 열기", "",
+                                              "PyStitch 프로젝트 (*.json)")
+        if not path:
+            return
+        try:
+            d = load_project(path)
+            self._apply_project(d)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "열기 실패", str(e))
+            return
+        self.project_path = Path(path)
+        self.setWindowTitle(f"PyStitch360 — {self.project_path.name}")
+        self.log(f"[project] 열기: {path}")
+
+    def _apply_project(self, d: dict):
+        if d.get("lens_profile") in self.profiles:
+            self.profile_combo.setCurrentText(d["lens_profile"])
+        if d.get("left_files"):
+            self._load_side("L", d["left_files"])
+        if d.get("right_files"):
+            self._load_side("R", d["right_files"])
+        self.spin_offset.setValue(float(d.get("offset_sec", 0.0)))
+        user = d.get("user", {})
+        for k, sp in self.spin_user.items():
+            sp.setValue(float(user.get(k, 0.0)))
+        self.spin_feather.setValue(int(user.get("feather_px", 40)))
+        exp = d.get("export", {})
+        self.spin_start.setValue(float(exp.get("start", 0.0)))
+        self.spin_end.setValue(float(exp.get("end", 60.0)))
+        self.combo_codec.setCurrentIndex(int(exp.get("codec_index", 0)))
+        self.spin_crf.setValue(int(exp.get("crf", 19)))
+        self.combo_scale.setCurrentIndex(int(exp.get("scale_index", 0)))
+        segments = d.get("segments", [])
+        if segments:
+            self.alignment = segments[0]["alignment"]
+            a = self.alignment
+            self.lbl_align.setText(
+                f"(프로젝트에서 복원) 상대회전 {a.yaw_split_deg:.1f}°, "
+                f"자동 pitch {a.pitch_auto*57.3:+.1f}° roll {a.roll_auto*57.3:+.1f}°")
+            if self.cur_imgs[0] is not None:
+                self._render_preview()
 
     # ------------------------------------------------------------ 공통
 
@@ -139,8 +231,11 @@ class MainWindow(QMainWindow):
             "GoPro 영상 (*.MP4 *.mp4)")
         if not path:
             return
+        self._load_side(side, find_chapters(path))
+
+    def _load_side(self, side: str, files):
         try:
-            chapters = find_chapters(path)
+            chapters = [Path(f) for f in files]
             vid = ChapteredVideo(chapters)
         except Exception as e:  # noqa: BLE001
             QMessageBox.warning(self, "열기 실패", str(e))
