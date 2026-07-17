@@ -85,6 +85,7 @@ class Renderer:
         self.scale = scale
         self.out_w = int((yaw1 - yaw0) * f) & ~1
         self.out_h = int((np.tan(el1) - np.tan(el0)) * f) & ~1
+        self.el0, self.el1 = el0, el1
         self.persp_k, self.persp_m = persp_k, persp_m
         persp = None
         if persp_k > 0.0 or persp_m > 1.0:
@@ -186,6 +187,10 @@ class Renderer:
             tmpl = gl[y0 + margin : y1 - margin, xc - band : xc + band]
             if tmpl.std() < 4:   # 무늬 없는 잔디뿐이면 신뢰 불가
                 continue
+            # 가로 에지가 없으면 세로 매칭이 원리적으로 불가 (aperture) —
+            # 심 근처의 방사형 잔디 줄무늬는 수직선이라 여기서 걸러진다
+            if np.abs(cv2.Sobel(tmpl, cv2.CV_32F, 0, 1, ksize=3)).mean() < 6.0:
+                continue
             region = gr[max(0, y0) : min(self.out_h, y1), xc - band : xc + band]
             if region.shape[0] < tmpl.shape[0] + 4:
                 continue
@@ -193,7 +198,10 @@ class Renderer:
             _, score, _, loc = cv2.minMaxLoc(res)
             if score < 0.35:
                 continue
-            dys.append(float(loc[1] - margin))
+            dy = float(loc[1] - margin)
+            if abs(dy) >= margin - 2:    # 탐색 경계 포화 = 가짜 매칭
+                continue
+            dys.append(dy)
             rows.append((y0 + y1) / 2)
             wts.append(float(score))
         return np.array(rows), np.array(dys), np.array(wts)
@@ -205,12 +213,21 @@ class Renderer:
         행별 dy 만큼 이동시키되, 심에서 멀어질수록 0 으로 테이퍼.
         """
         rows, dys, wts = self._measure_seam_dy(img_l, img_r)
-        if len(rows) < 3:
+        if len(rows) < 4:
             log("[seam-refine] 측정 타일 부족 — 생략")
             return 0.0
-        # 행에 대한 2차 다항 가중 피팅 (완만한 시차 프로파일)
-        coef = np.polyfit(rows, dys, 2, w=wts)
-        dy_fit = np.polyval(coef, np.arange(self.out_h)).astype(np.float32)
+        # 물리 모델 피팅: 시차는 거리 반비례 → 수평선 아래에서
+        # dy = a + b·tan(-el), 위(원거리)에서는 상수 a.
+        # 자유 다항식과 달리 pitch/세로범위가 바뀌어도 elevation 공간에서
+        # 일관되고, 측정 없는 최하단으로도 물리적으로 타당하게 외삽된다.
+        t1, t0 = np.tan(self.el1), np.tan(self.el0)
+        t_rows = t1 + np.arange(self.out_h) / (self.out_h - 1) * (t0 - t1)
+        depth_all = np.maximum(-t_rows, 0.0)          # ∝ 1/거리 (수평선 아래)
+        depth_m = depth_all[rows.astype(int)]
+        A = np.stack([np.ones_like(depth_m), depth_m], axis=1)
+        sw = np.sqrt(wts)
+        coef, *_ = np.linalg.lstsq(A * sw[:, None], dys * sw, rcond=None)
+        dy_fit = (coef[0] + coef[1] * depth_all).astype(np.float32)
         dy_fit = np.clip(dy_fit, -30 * self.scale - 5, 30 * self.scale + 5)
         rms0 = float(np.sqrt(np.average(dys**2, weights=wts)))
 
