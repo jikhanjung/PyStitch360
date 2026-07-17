@@ -295,3 +295,79 @@ class ExportWorker(QThread):
             el = time.perf_counter() - t0
             self.log.emit(f"완료: {done} 프레임 / {el:.0f}s = {done/max(el,1e-9):.2f} fps")
             self.finished_ok.emit(self.out_path)
+
+
+class PlaybackWorker(QThread):
+    """정합된 파노라마 동영상 재생 (미리보기 해상도).
+
+    렌더러는 시작 시 1회만 구성(게인·심 보정 포함)하고, 자체
+    ChapteredVideo 인스턴스로 순차 디코딩 — GUI 쪽 디코더와 충돌 없음.
+    display_fps 로 프레임을 건너뛰며 실시간 속도에 맞춘다.
+    """
+
+    frame_ready = pyqtSignal(object, int)     # pano ndarray, 절대 프레임 번호
+    log = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, lens, alignment, left_files, right_files, offset_sec,
+                 start_frame, pitch_user=0.0, roll_user=0.0, yaw_user=0.0,
+                 feather_px=40, scale=0.25, display_fps=10.0,
+                 persp_k=0.0, persp_m=1.0):
+        super().__init__()
+        self.lens, self.a = lens, alignment
+        self.left_files = [str(f) for f in left_files]
+        self.right_files = [str(f) for f in right_files]
+        self.offset, self.start_frame = offset_sec, start_frame
+        self.user = (pitch_user, roll_user, yaw_user)
+        self.feather_px, self.scale = feather_px, scale
+        self.display_fps = display_fps
+        self.persp = (persp_k, persp_m)
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        vid_l = vid_r = None
+        try:
+            vid_l = ChapteredVideo(self.left_files)
+            vid_r = ChapteredVideo(self.right_files)
+            fps = vid_l.fps
+            step = max(1, int(round(fps / self.display_fps)))
+            f = self.start_frame
+            ok_l, img_l = vid_l.read_at(f)
+            ok_r, img_r = vid_r.read_at(int(round(f + self.offset * fps)))
+            if not (ok_l and ok_r):
+                raise RuntimeError("재생 시작 프레임 읽기 실패")
+            R_wl, R_wr = self.a.rotations(self.user[0], self.user[1])
+            yaw0, yaw1 = self.a.window(self.user[2])
+            rend = Renderer(self.lens, R_wl, R_wr, yaw0, yaw1,
+                            self.a.el0, self.a.el1,
+                            scale=self.scale, feather_px=self.feather_px,
+                            persp_k=self.persp[0], persp_m=self.persp[1])
+            rend.set_gains_from(img_l, img_r)
+            rend.refine_seam(img_l, img_r, log=lambda s: self.log.emit(s))
+            t0 = time.perf_counter()
+            played = 0
+            while not self._stop:
+                self.frame_ready.emit(rend.render(img_l, img_r), f)
+                # 실시간 페이스: 다음 표시 시각까지 대기 (렌더가 느리면 자연 감속)
+                played += 1
+                lag = played * step / fps - (time.perf_counter() - t0)
+                if lag > 0:
+                    time.sleep(min(lag, 0.5))
+                for k in range(step):
+                    if k < step - 1:   # 건너뛰는 프레임은 색변환 없이 grab만
+                        ok_l, ok_r = vid_l.grab(), vid_r.grab()
+                    else:
+                        ok_l, img_l = vid_l.read()
+                        ok_r, img_r = vid_r.read()
+                f += step
+                if not (ok_l and ok_r):
+                    break
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(str(e))
+        finally:
+            for v in (vid_l, vid_r):
+                if v is not None:
+                    v.release()

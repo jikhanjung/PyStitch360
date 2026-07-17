@@ -116,6 +116,18 @@ class ChapteredVideo:
             self._pos += 1
         return ok, frame
 
+    def grab(self) -> bool:
+        """다음 프레임을 디코딩만 하고 반환하지 않음 (건너뛰기용, read()보다 쌈)."""
+        if self._cap is None:
+            self.seek_frame(self._pos)
+        ok = self._cap.grab()
+        if not ok and self._chapter + 1 < len(self.files):
+            self._open_chapter(self._chapter + 1)
+            ok = self._cap.grab()
+        if ok:
+            self._pos += 1
+        return ok
+
     def read_at(self, frame: int):
         self.seek_frame(frame)
         return self.read()

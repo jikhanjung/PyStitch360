@@ -25,7 +25,8 @@ from ..core.project import load_project, save_project
 from ..core.ptz import ptz_available
 from .widgets import FramePane
 from .workers import (
-    AlignWorker, ExportWorker, GpmfWorker, PreviewWorker, SyncWorker,
+    AlignWorker, ExportWorker, GpmfWorker, PlaybackWorker, PreviewWorker,
+    SyncWorker,
 )
 
 
@@ -50,11 +51,15 @@ class MainWindow(QMainWindow):
         self._align_worker = None
         self._preview_worker = None
         self._export_worker = None
+        self._playback_worker = None
+        self._playing = False
 
         tabs = QTabWidget()
         tabs.addTab(self._build_sync_tab(), "1. 영상·동기화")
         tabs.addTab(self._build_align_tab(), "2. 정합·미리보기")
         tabs.addTab(self._build_export_tab(), "3. 내보내기")
+        tabs.currentChanged.connect(lambda _: self._stop_playback())
+        self.tabs = tabs
 
         self.log_box = QPlainTextEdit(readOnly=True)
         self.log_box.setMaximumBlockCount(500)
@@ -273,6 +278,8 @@ class MainWindow(QMainWindow):
         if self.video_l and self.video_r:
             self.slider.setEnabled(True)
             self.slider.setRange(0, self.video_l.total_frames - 1)
+            self.slider2.setEnabled(True)
+            self.slider2.setRange(0, self.video_l.total_frames - 1)
             self._show_current_frames()
 
     def _update_file_label(self):
@@ -294,13 +301,15 @@ class MainWindow(QMainWindow):
             cs = round(t * 100)                      # 표시 단위(1/100초)로 먼저 반올림
             m, cs = divmod(cs, 6000)                 # "04:60.00" 방지
             self.lbl_time.setText(f"{m:02d}:{cs/100:05.2f}")
+            if hasattr(self, "lbl_time2"):
+                self.lbl_time2.setText(self.lbl_time.text())
 
     def _step(self, d: int):
         if self.slider.isEnabled():
             self.slider.setValue(self.slider.value() + d)
 
     def _show_current_frames(self):
-        if not (self.video_l and self.video_r):
+        if not (self.video_l and self.video_r) or self._playing:
             return
         fl = self.slider.value()
         fr = int(round(fl + self.spin_offset.value() * self.video_l.fps))
@@ -309,6 +318,9 @@ class MainWindow(QMainWindow):
         self.cur_imgs = (img_l if ok_l else None, img_r if ok_r else None)
         self.pane_l.set_frame(self.cur_imgs[0])
         self.pane_r.set_frame(self.cur_imgs[1])
+        # 정합 탭에서 프레임을 옮기면 파노라마 미리보기도 따라간다
+        if self.tabs.currentIndex() == 1 and self.segments:
+            self._preview_debounced()
 
     def _auto_sync(self):
         if not (self.files_l and self.files_r):
@@ -376,6 +388,29 @@ class MainWindow(QMainWindow):
         mid.addWidget(seg_box)
         v.addLayout(mid, 1)
 
+        # 타임라인 (1번 탭 슬라이더와 양방향 동기) + 재생
+        tl = QHBoxLayout()
+        self.btn_play = QPushButton("▶ 재생")
+        self.btn_play.setMaximumWidth(90)
+        self.btn_play.clicked.connect(self._toggle_play)
+        tl.addWidget(self.btn_play)
+        for text, d in [("-10", -10), ("-1", -1), ("+1", 1), ("+10", 10)]:
+            b = QPushButton(text)
+            b.setMaximumWidth(48)
+            b.clicked.connect(lambda _, dd=d: (self._stop_playback(), self._step(dd)))
+            tl.addWidget(b)
+        self.slider2 = QSlider(Qt.Orientation.Horizontal)
+        self.slider2.setEnabled(False)
+        self.slider2.sliderPressed.connect(self._stop_playback)
+        self.slider2.valueChanged.connect(self.slider.setValue)
+        self.slider.valueChanged.connect(self.slider2.setValue)
+        self.slider.sliderPressed.connect(self._stop_playback)
+        tl.addWidget(self.slider2, 1)
+        self.lbl_time2 = QLabel("--:--.--")
+        self.lbl_time2.setMinimumWidth(110)
+        tl.addWidget(self.lbl_time2)
+        v.addLayout(tl)
+
         adj = QGroupBox("미세조정 (자동 추정값에 더해짐, 도 단위)")
         g = QGridLayout(adj)
         self.spin_user = {}
@@ -398,6 +433,7 @@ class MainWindow(QMainWindow):
         return w
 
     def _run_align(self):
+        self._stop_playback()
         img_l, img_r = self.cur_imgs
         if img_l is None or img_r is None:
             QMessageBox.information(self, "정합", "먼저 1번 탭에서 영상을 열고 프레임을 선택하세요.")
@@ -432,7 +468,7 @@ class MainWindow(QMainWindow):
             f"인라이어 {a.n_inliers}/{a.n_matches}, 잔차 {a.residual_deg:.2f}°, "
             f"상대회전 {a.yaw_split_deg:.1f}°, 자동 pitch {a.pitch_auto*57.3:+.1f}° "
             f"roll {a.roll_auto*57.3:+.1f}°")
-        self._render_preview()
+        self._start_playback()   # 정합 결과는 정지 프레임이 아니라 영상으로 확인
 
     def _align_failed(self, msg):
         self.btn_align.setEnabled(True)
@@ -498,6 +534,52 @@ class MainWindow(QMainWindow):
     def _preview_debounced(self):
         if self.segments:
             self._preview_timer.start()
+
+    # ------------------------------------------------------------ 재생
+    def _toggle_play(self):
+        if self._playing:
+            self._stop_playback()
+            return
+        if self.current_alignment() is None:
+            QMessageBox.information(self, "재생", "먼저 정합을 실행하세요.")
+            return
+        self._start_playback()
+
+    def _start_playback(self):
+        alignment = self.current_alignment()
+        if (self._playing or alignment is None
+                or not (self.files_l and self.files_r)):
+            return
+        if self._playback_worker is not None and self._playback_worker.isRunning():
+            return
+        k, m = self._persp_params()
+        w = PlaybackWorker(
+            self.lens, alignment, self.files_l, self.files_r,
+            self.spin_offset.value(), self.slider.value(),
+            self.spin_user["pitch"].value(), self.spin_user["roll"].value(),
+            self.spin_user["yaw"].value(), self.spin_feather.value(),
+            persp_k=k, persp_m=m)
+        w.frame_ready.connect(self._playback_frame)
+        w.log.connect(self.log)
+        w.failed.connect(lambda msg: self.log(f"[오류] 재생: {msg}"))
+        w.finished.connect(self._playback_finished)
+        self._playback_worker = w
+        self._playing = True
+        self.btn_play.setText("⏸ 정지")
+        w.start()
+
+    def _stop_playback(self):
+        if self._playback_worker is not None and self._playback_worker.isRunning():
+            self._playback_worker.stop()   # _playing 해제는 finished 에서
+
+    def _playback_frame(self, pano, f):
+        self.pano_pane.set_frame(pano)
+        self.slider.setValue(f)            # _show_current_frames 는 재생 중 무시
+
+    def _playback_finished(self):
+        self._playing = False
+        self.btn_play.setText("▶ 재생")
+        self._show_current_frames()
 
     def _persp_params(self) -> tuple[float, float]:
         """내보내기 탭의 원근비 조절 설정 (미체크 시 항등)."""
@@ -588,6 +670,7 @@ class MainWindow(QMainWindow):
         return w
 
     def _start_export(self):
+        self._stop_playback()
         if not self.segments:
             QMessageBox.information(self, "내보내기", "먼저 2번 탭에서 정합을 실행하세요.")
             return
