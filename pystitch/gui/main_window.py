@@ -10,7 +10,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import QSettings, Qt, QTimer
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QListWidget, QMainWindow, QMessageBox, QPlainTextEdit,
@@ -78,10 +78,54 @@ class MainWindow(QMainWindow):
     def _build_menu(self):
         m = self.menuBar().addMenu("파일(&F)")
         m.addAction("프로젝트 열기...", self._open_project)
+        self._recent_menu = m.addMenu("최근 프로젝트")
         m.addAction("프로젝트 저장", self._save_project)
         m.addAction("프로젝트 다른 이름으로 저장...", lambda: self._save_project(as_new=True))
         m.addSeparator()
         m.addAction("종료", self.close)
+        self._rebuild_recent_menu()
+
+    # ------------------------------------------------------------ 최근 프로젝트
+    _MAX_RECENT = 10
+
+    def _recent_projects(self) -> list[str]:
+        v = QSettings("PyStitch360", "PyStitch360").value("recent_projects", [])
+        if isinstance(v, str):          # QSettings 는 원소 1개 리스트를 str 로 돌려줄 수 있음
+            v = [v]
+        return [p for p in (v or []) if Path(p).exists()]
+
+    def _remember_recent(self, path):
+        paths = [str(path)] + [p for p in self._recent_projects() if p != str(path)]
+        QSettings("PyStitch360", "PyStitch360").setValue(
+            "recent_projects", paths[: self._MAX_RECENT])
+        self._rebuild_recent_menu()
+
+    def _rebuild_recent_menu(self):
+        self._recent_menu.clear()
+        recent = self._recent_projects()
+        self._recent_menu.setEnabled(bool(recent))
+        for p in recent:
+            self._recent_menu.addAction(
+                Path(p).name, lambda checked=False, pp=p: self._open_recent(pp))
+        if recent:
+            self._recent_menu.addSeparator()
+            self._recent_menu.addAction("목록 비우기", self._clear_recent)
+
+    def _clear_recent(self):
+        QSettings("PyStitch360", "PyStitch360").remove("recent_projects")
+        self._rebuild_recent_menu()
+
+    def _open_recent(self, path: str):
+        try:
+            d = load_project(path)
+            self._apply_project(d)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "열기 실패", str(e))
+            return
+        self.project_path = Path(path)
+        self.setWindowTitle(f"PyStitch360 — {self.project_path.name}")
+        self.log(f"[project] 열기: {path}")
+        self._remember_recent(path)
 
     def current_time(self) -> float:
         return self.slider.value() / self.video_l.fps if self.video_l else 0.0
@@ -133,21 +177,13 @@ class MainWindow(QMainWindow):
             return
         self.setWindowTitle(f"PyStitch360 — {self.project_path.name}")
         self.log(f"[project] 저장: {self.project_path}")
+        self._remember_recent(self.project_path)
 
     def _open_project(self):
         path, _ = QFileDialog.getOpenFileName(self, "프로젝트 열기", "",
                                               "PyStitch 프로젝트 (*.json)")
-        if not path:
-            return
-        try:
-            d = load_project(path)
-            self._apply_project(d)
-        except Exception as e:  # noqa: BLE001
-            QMessageBox.warning(self, "열기 실패", str(e))
-            return
-        self.project_path = Path(path)
-        self.setWindowTitle(f"PyStitch360 — {self.project_path.name}")
-        self.log(f"[project] 열기: {path}")
+        if path:
+            self._open_recent(path)
 
     def _apply_project(self, d: dict):
         if d.get("lens_profile") in self.profiles:
@@ -468,7 +504,7 @@ class MainWindow(QMainWindow):
             f"인라이어 {a.n_inliers}/{a.n_matches}, 잔차 {a.residual_deg:.2f}°, "
             f"상대회전 {a.yaw_split_deg:.1f}°, 자동 pitch {a.pitch_auto*57.3:+.1f}° "
             f"roll {a.roll_auto*57.3:+.1f}°")
-        self._start_playback()   # 정합 결과는 정지 프레임이 아니라 영상으로 확인
+        self._render_preview()   # 정지 미리보기 갱신 (재생은 ▶ 버튼으로)
 
     def _align_failed(self, msg):
         self.btn_align.setEnabled(True)
