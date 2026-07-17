@@ -867,11 +867,12 @@ class MainWindow(QMainWindow):
         self._export_worker.failed.connect(self._export_failed)
         self.btn_export.setEnabled(False)
         self.btn_cancel.setEnabled(True)
-        self.progress.setValue(0)
+        self.progress.setRange(0, 0)   # 준비 단계(렌더러 구성) 동안 불확정 표시
+        self.progress.setFormat("준비 중...")
         self._export_worker.start()
 
     def _export_progress(self, done, total, fps):
-        self.progress.setMaximum(total)
+        self.progress.setRange(0, total)
         self.progress.setValue(done)
         remain = (total - done) / fps if fps > 0 else 0
         self.progress.setFormat(f"%p%  ({done}/{total}, {fps:.1f}fps, 남은 시간 {remain/60:.0f}분)")
@@ -879,12 +880,18 @@ class MainWindow(QMainWindow):
     def _export_done(self, path):
         self.btn_export.setEnabled(True)
         self.btn_cancel.setEnabled(False)
+        self.progress.setRange(0, 1)
+        self.progress.setValue(1)
+        self.progress.setFormat("완료")
         self.log(f"[export] 저장: {path}")
         QMessageBox.information(self, "내보내기", f"완료: {path}")
 
     def _export_failed(self, msg):
         self.btn_export.setEnabled(True)
         self.btn_cancel.setEnabled(False)
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.progress.setFormat("")
         self.log(f"[export] 실패: {msg}")
 
     def _cancel_export(self):

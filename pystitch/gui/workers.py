@@ -252,6 +252,7 @@ class ExportWorker(QThread):
                     self._cancel = True
                     break
 
+        self.log.emit(f"인코딩 시작: {total}프레임 ({total/fps/60:.1f}분 분량)")
         t_reader = threading.Thread(target=reader, daemon=True)
         t_writer = threading.Thread(target=writer, daemon=True)
         t_reader.start()
