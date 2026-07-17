@@ -88,12 +88,17 @@ class ExportWorker(QThread):
     finished_ok = pyqtSignal(str)
     failed = pyqtSignal(str)
 
-    def __init__(self, lens, alignment: Alignment, left_files, right_files,
+    def __init__(self, lens, segments, left_files, right_files,
                  offset_sec, start_sec, end_sec, out_path,
                  pitch_user=0.0, roll_user=0.0, yaw_user=0.0,
                  codec="libx264", crf=19, scale=1.0, feather_px=40):
         super().__init__()
-        self.lens, self.a = lens, alignment
+        self.lens = lens
+        # segments: [{"start_sec": float, "alignment": Alignment}, ...] 오름차순
+        # (하위호환: Alignment 단일 객체도 허용)
+        if isinstance(segments, Alignment):
+            segments = [{"start_sec": 0.0, "alignment": segments}]
+        self.segments = sorted(segments, key=lambda s: s["start_sec"])
         self.left_files, self.right_files = left_files, right_files
         self.offset, self.start, self.end = offset_sec, start_sec, end_sec
         self.out_path = str(out_path)
@@ -122,17 +127,40 @@ class ExportWorker(QThread):
         if total == 0:
             raise RuntimeError("내보낼 구간이 비어 있음")
 
+        def segment_index_at(t: float) -> int:
+            idx = 0
+            for i, s in enumerate(self.segments):
+                if s["start_sec"] <= t + 1e-6:
+                    idx = i
+            return idx
+
+        # 모든 세그먼트가 같은 출력 크기를 갖도록 yaw 범위 폭은 첫 세그먼트 기준 고정
+        first_a = self.segments[segment_index_at(self.start)]["alignment"]
+        w0, w1 = first_a.window(self.user[2])
+        half_range = (w1 - w0) / 2
+
+        def make_renderer(alignment, img_l, img_r) -> Renderer:
+            R_wl, R_wr = alignment.rotations(self.user[0], self.user[1])
+            yaw_c = alignment.yaw_auto + np.deg2rad(self.user[2])
+            r = Renderer(self.lens, R_wl, R_wr, yaw_c - half_range, yaw_c + half_range,
+                         alignment.el0, alignment.el1,
+                         scale=self.scale, feather_px=self.feather_px)
+            r.set_gains_from(img_l, img_r)
+            r.refine_seam(img_l, img_r, log=lambda s: self.log.emit(s))
+            return r
+
         self.log.emit("정합 렌더러 준비 중...")
         ok_l, img_l = vid_l.read_at(f_start)
         ok_r, img_r = vid_r.read_at(r_start)
         if not (ok_l and ok_r):
             raise RuntimeError("시작 프레임 읽기 실패")
-        R_wl, R_wr = self.a.rotations(self.user[0], self.user[1])
-        yaw0, yaw1 = self.a.window(self.user[2])
-        rend = Renderer(self.lens, R_wl, R_wr, yaw0, yaw1, self.a.el0, self.a.el1,
-                        scale=self.scale, feather_px=self.feather_px)
-        rend.set_gains_from(img_l, img_r)
-        rend.refine_seam(img_l, img_r, log=lambda s: self.log.emit(s))
+        seg_idx = segment_index_at(self.start)
+        rend = make_renderer(self.segments[seg_idx]["alignment"], img_l, img_r)
+        out_w, out_h = rend.out_w, rend.out_h
+        # 이번 내보내기 구간 안에 있는 이후 세그먼트 경계 (절대 프레임 번호)
+        pending = [(int(round(s["start_sec"] * fps)), i)
+                   for i, s in enumerate(self.segments)
+                   if i > seg_idx and s["start_sec"] < self.end]
 
         # 오디오: 좌측 챕터 체인을 concat demuxer 로 연결
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tf:
@@ -194,6 +222,14 @@ class ExportWorker(QThread):
                 item = q_in.get()
                 if item is None:
                     break
+                abs_frame = f_start + done
+                if pending and abs_frame >= pending[0][0]:
+                    _, si = pending.pop(0)
+                    t_seg = self.segments[si]["start_sec"]
+                    self.log.emit(f"[segment] {t_seg:.1f}s 경계 — 렌더러 재구성")
+                    rend = make_renderer(self.segments[si]["alignment"], *item)
+                    if (rend.out_w, rend.out_h) != (out_w, out_h):
+                        raise RuntimeError("세그먼트 출력 크기 불일치")
                 frame = rend.render(*item)
                 q_out.put(frame.tobytes())
                 done += 1

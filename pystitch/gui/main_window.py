@@ -13,8 +13,9 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout, QGroupBox,
-    QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
-    QPushButton, QSlider, QSpinBox, QSplitter, QTabWidget, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QListWidget, QMainWindow, QMessageBox, QPlainTextEdit,
+    QProgressBar, QPushButton, QSlider, QSpinBox, QSplitter, QTabWidget,
+    QVBoxLayout, QWidget,
 )
 
 from ..core.chapters import ChapteredVideo, find_chapters
@@ -37,7 +38,9 @@ class MainWindow(QMainWindow):
         self.files_l: list[Path] = []
         self.files_r: list[Path] = []
         self.lens: LensProfile | None = None
-        self.alignment = None
+        # 세그먼트: 방향이 (충격 등으로) 바뀐 구간마다 하나의 정합
+        # [{"start_sec": float, "alignment": Alignment}, ...] 시작 시각 오름차순
+        self.segments: list[dict] = []
         self.cur_imgs = (None, None)     # 현재 표시 중인 (L, R) 프레임
         # 워커 참조는 용도별로 분리 (실행 중 재할당 시 QThread 파괴 → 크래시)
         self._sync_worker = None
@@ -72,10 +75,20 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         m.addAction("종료", self.close)
 
+    def current_time(self) -> float:
+        return self.slider.value() / self.video_l.fps if self.video_l else 0.0
+
+    def current_alignment(self):
+        """현재 슬라이더 시각을 담당하는 세그먼트의 정합."""
+        t = self.current_time()
+        chosen = None
+        for s in self.segments:
+            if s["start_sec"] <= t + 1e-6:
+                chosen = s
+        return (chosen or (self.segments[0] if self.segments else None) or {}).get("alignment")
+
     def _gather_project(self) -> dict:
-        segments = []
-        if self.alignment is not None:
-            segments.append({"start_sec": 0.0, "alignment": self.alignment})
+        segments = self.segments
         return {
             "left_files": [str(p) for p in self.files_l],
             "right_files": [str(p) for p in self.files_r],
@@ -141,13 +154,10 @@ class MainWindow(QMainWindow):
         self.combo_codec.setCurrentIndex(int(exp.get("codec_index", 0)))
         self.spin_crf.setValue(int(exp.get("crf", 19)))
         self.combo_scale.setCurrentIndex(int(exp.get("scale_index", 0)))
-        segments = d.get("segments", [])
-        if segments:
-            self.alignment = segments[0]["alignment"]
-            a = self.alignment
-            self.lbl_align.setText(
-                f"(프로젝트에서 복원) 상대회전 {a.yaw_split_deg:.1f}°, "
-                f"자동 pitch {a.pitch_auto*57.3:+.1f}° roll {a.roll_auto*57.3:+.1f}°")
+        self.segments = d.get("segments", [])
+        self._refresh_segment_list()
+        if self.segments:
+            self.lbl_align.setText(f"(프로젝트에서 복원) 세그먼트 {len(self.segments)}개")
             if self.cur_imgs[0] is not None:
                 self._render_preview()
 
@@ -318,15 +328,32 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(w)
 
         top = QHBoxLayout()
-        self.btn_align = QPushButton("현재 프레임으로 자동 정합")
+        self.btn_align = QPushButton("현재 프레임으로 자동 정합 (세그먼트 추가)")
         self.btn_align.clicked.connect(self._run_align)
         self.lbl_align = QLabel("정합 없음")
         top.addWidget(self.btn_align)
         top.addWidget(self.lbl_align, 1)
         v.addLayout(top)
 
+        mid = QHBoxLayout()
         self.pano_pane = FramePane("파노라마 미리보기")
-        v.addWidget(self.pano_pane, 1)
+        mid.addWidget(self.pano_pane, 1)
+
+        seg_box = QGroupBox("세그먼트 (방향 변동 구간)")
+        seg_v = QVBoxLayout(seg_box)
+        self.segment_list = QListWidget()
+        self.segment_list.setMaximumWidth(280)
+        seg_v.addWidget(self.segment_list, 1)
+        seg_btns = QHBoxLayout()
+        btn_goto = QPushButton("이동")
+        btn_goto.clicked.connect(self._goto_segment)
+        btn_del = QPushButton("삭제")
+        btn_del.clicked.connect(self._delete_segment)
+        seg_btns.addWidget(btn_goto)
+        seg_btns.addWidget(btn_del)
+        seg_v.addLayout(seg_btns)
+        mid.addWidget(seg_box)
+        v.addLayout(mid, 1)
 
         adj = QGroupBox("미세조정 (자동 추정값에 더해짐, 도 단위)")
         g = QGridLayout(adj)
@@ -367,8 +394,19 @@ class MainWindow(QMainWindow):
 
     def _align_done(self, alignment):
         self.btn_align.setEnabled(True)
-        self.alignment = alignment
         a = alignment
+        # 첫 정합은 0초부터, 이후는 현재 프레임부터 적용 (충격 이벤트 재정합)
+        start = 0.0 if not self.segments else self.current_time()
+        replaced = False
+        for s in self.segments:
+            if abs(s["start_sec"] - start) < 0.5:
+                s["alignment"] = alignment   # 같은 지점 재정합이면 교체
+                replaced = True
+                break
+        if not replaced:
+            self.segments.append({"start_sec": start, "alignment": alignment})
+            self.segments.sort(key=lambda s: s["start_sec"])
+        self._refresh_segment_list()
         self.lbl_align.setText(
             f"인라이어 {a.n_inliers}/{a.n_matches}, 잔차 {a.residual_deg:.2f}°, "
             f"상대회전 {a.yaw_split_deg:.1f}°, 자동 pitch {a.pitch_auto*57.3:+.1f}° "
@@ -380,19 +418,40 @@ class MainWindow(QMainWindow):
         self.lbl_align.setText("정합 실패")
         self.log(f"[오류] {msg}")
 
+    def _refresh_segment_list(self):
+        self.segment_list.clear()
+        for s in self.segments:
+            t = s["start_sec"]
+            a = s["alignment"]
+            self.segment_list.addItem(
+                f"{int(t//60):02d}:{t%60:04.1f}~  pitch {a.pitch_auto*57.3:+.1f}° "
+                f"roll {a.roll_auto*57.3:+.1f}°")
+
+    def _goto_segment(self):
+        row = self.segment_list.currentRow()
+        if 0 <= row < len(self.segments) and self.video_l:
+            self.slider.setValue(int(self.segments[row]["start_sec"] * self.video_l.fps))
+
+    def _delete_segment(self):
+        row = self.segment_list.currentRow()
+        if 0 <= row < len(self.segments):
+            del self.segments[row]
+            self._refresh_segment_list()
+
     def _preview_debounced(self):
-        if self.alignment is not None:
+        if self.segments:
             self._preview_timer.start()
 
     def _render_preview(self):
         img_l, img_r = self.cur_imgs
-        if self.alignment is None or img_l is None or img_r is None:
+        alignment = self.current_alignment()
+        if alignment is None or img_l is None or img_r is None:
             return
         if self._preview_worker is not None and self._preview_worker.isRunning():
             self._preview_timer.start()   # 이전 렌더 끝난 뒤 재시도
             return
         self._preview_worker = PreviewWorker(
-            self.lens, self.alignment, img_l.copy(), img_r.copy(),
+            self.lens, alignment, img_l.copy(), img_r.copy(),
             self.spin_user["pitch"].value(), self.spin_user["roll"].value(),
             self.spin_user["yaw"].value(), self.spin_feather.value())
         self._preview_worker.log.connect(self.log)
@@ -444,7 +503,7 @@ class MainWindow(QMainWindow):
         return w
 
     def _start_export(self):
-        if self.alignment is None:
+        if not self.segments:
             QMessageBox.information(self, "내보내기", "먼저 2번 탭에서 정합을 실행하세요.")
             return
         out, _ = QFileDialog.getSaveFileName(self, "출력 파일", "panorama.mp4",
@@ -454,7 +513,7 @@ class MainWindow(QMainWindow):
         codec = self.encoders[self.combo_codec.currentText()]
         scale = 1.0 if self.combo_scale.currentIndex() == 0 else 0.5
         self._export_worker = ExportWorker(
-            self.lens, self.alignment,
+            self.lens, self.segments,
             [str(p) for p in self.files_l], [str(p) for p in self.files_r],
             self.spin_offset.value(), self.spin_start.value(), self.spin_end.value(),
             out,
