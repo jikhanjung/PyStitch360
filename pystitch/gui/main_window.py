@@ -477,14 +477,29 @@ class MainWindow(QMainWindow):
         g = QGridLayout(adj)
         self.spin_user = {}
         self.lbl_auto = {}
+        def step_btn(sp, text, delta):
+            b = QPushButton(text)
+            b.setMaximumWidth(36)
+            b.setAutoRepeat(True)          # 꾹 누르면 연속 조절
+            b.clicked.connect(lambda _, s=sp, d=delta: s.setValue(s.value() + d))
+            return b
+
         for col, (key, label) in enumerate([("pitch", "수평(pitch)"),
                                             ("roll", "기울기(roll)"),
                                             ("yaw", "센터링(yaw)")]):
             g.addWidget(QLabel(label), 0, col * 2)
             sp = QDoubleSpinBox(decimals=1, minimum=-45.0, maximum=45.0, singleStep=0.1)
+            sp.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
             sp.valueChanged.connect(lambda _: self._preview_debounced())
             self.spin_user[key] = sp
-            g.addWidget(sp, 0, col * 2 + 1)
+            row = QHBoxLayout()
+            row.setSpacing(2)
+            row.addWidget(step_btn(sp, "−1", -1.0))
+            row.addWidget(step_btn(sp, "−.1", -0.1))
+            row.addWidget(sp, 1)
+            row.addWidget(step_btn(sp, "+.1", 0.1))
+            row.addWidget(step_btn(sp, "+1", 1.0))
+            g.addLayout(row, 0, col * 2 + 1)
             la = QLabel("자동 —")            # 현재 세그먼트의 자동 추정값 표시
             la.setStyleSheet("color: gray")
             self.lbl_auto[key] = la
