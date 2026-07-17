@@ -116,16 +116,26 @@ class MainWindow(QMainWindow):
         self._rebuild_recent_menu()
 
     def _open_recent(self, path: str):
+        self._busy(True)
         try:
             d = load_project(path)
             self._apply_project(d)
         except Exception as e:  # noqa: BLE001
             QMessageBox.warning(self, "열기 실패", str(e))
             return
+        finally:
+            self._busy(False)
         self.project_path = Path(path)
         self.setWindowTitle(f"PyStitch360 — {self.project_path.name}")
         self.log(f"[project] 열기: {path}")
         self._remember_recent(path)
+
+    def _busy(self, on: bool):
+        """블로킹 작업/백그라운드 대기 중 wait cursor 표시 (스택 균형 유지할 것)."""
+        if on:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        else:
+            QApplication.restoreOverrideCursor()
 
     def current_time(self) -> float:
         return self.slider.value() / self.video_l.fps if self.video_l else 0.0
@@ -299,12 +309,15 @@ class MainWindow(QMainWindow):
         self._load_side(side, find_chapters(path))
 
     def _load_side(self, side: str, files):
+        self._busy(True)
         try:
             chapters = [Path(f) for f in files]
             vid = ChapteredVideo(chapters)
         except Exception as e:  # noqa: BLE001
             QMessageBox.warning(self, "열기 실패", str(e))
             return
+        finally:
+            self._busy(False)
         if side == "L":
             self.video_l, self.files_l = vid, chapters
         else:
@@ -350,8 +363,12 @@ class MainWindow(QMainWindow):
             return
         fl = self.slider.value()
         fr = int(round(fl + self.spin_offset.value() * self.video_l.fps))
-        ok_l, img_l = self.video_l.read_at(fl)
-        ok_r, img_r = self.video_r.read_at(fr)
+        self._busy(True)
+        try:
+            ok_l, img_l = self.video_l.read_at(fl)
+            ok_r, img_r = self.video_r.read_at(fr)
+        finally:
+            self._busy(False)
         self.cur_imgs = (img_l if ok_l else None, img_r if ok_r else None)
         self.pane_l.set_frame(self.cur_imgs[0])
         self.pane_r.set_frame(self.cur_imgs[1])
@@ -369,9 +386,11 @@ class MainWindow(QMainWindow):
         self._sync_worker = SyncWorker(self.files_l[0], self.files_r[0], start)
         self._sync_worker.done.connect(self._sync_done)
         self._sync_worker.failed.connect(self._worker_failed)
+        self._busy(True)
         self._sync_worker.start()
 
     def _sync_done(self, offset, conf):
+        self._busy(False)
         self.btn_autosync.setEnabled(True)
         self.spin_offset.setValue(offset)
         fps = self.video_l.fps if self.video_l else 29.97
@@ -379,6 +398,7 @@ class MainWindow(QMainWindow):
                  + (" — 낮음, 수동 확인 필요" if conf < 4 else ""))
 
     def _worker_failed(self, msg):
+        self._busy(False)
         self.btn_autosync.setEnabled(True)
         self.btn_align.setEnabled(True)
         self.log(f"[오류] {msg}")
@@ -486,13 +506,18 @@ class MainWindow(QMainWindow):
             return
         self.btn_align.setEnabled(False)
         self.lbl_align.setText("정합 중...")
-        self._align_worker = AlignWorker(img_l.copy(), img_r.copy(), self.lens)
+        # 재정합(세그먼트 추가) 시 수평/센터링은 기존 값 재사용 — 한 경기에서
+        # 수평이 바뀌는 일은 거의 없고 재추정 노이즈만 끼어든다
+        self._align_worker = AlignWorker(img_l.copy(), img_r.copy(), self.lens,
+                                         reuse_level=self.current_alignment())
         self._align_worker.log.connect(self.log)
         self._align_worker.done.connect(self._align_done)
         self._align_worker.failed.connect(self._align_failed)
+        self._busy(True)
         self._align_worker.start()
 
     def _align_done(self, alignment):
+        self._busy(False)
         self.btn_align.setEnabled(True)
         a = alignment
         # 첫 정합은 0초부터, 이후는 현재 프레임부터 적용 (충격 이벤트 재정합)
@@ -515,6 +540,7 @@ class MainWindow(QMainWindow):
         self._render_preview()   # 정지 미리보기 갱신 (재생은 ▶ 버튼으로)
 
     def _align_failed(self, msg):
+        self._busy(False)
         self.btn_align.setEnabled(True)
         self.lbl_align.setText("정합 실패")
         self.log(f"[오류] {msg}")
@@ -550,9 +576,11 @@ class MainWindow(QMainWindow):
         self._gpmf_worker.log.connect(self.log)
         self._gpmf_worker.done.connect(self._gpmf_done)
         self._gpmf_worker.failed.connect(self._gpmf_failed)
+        self._busy(True)
         self._gpmf_worker.start()
 
     def _gpmf_done(self, events):
+        self._busy(False)
         self.btn_gpmf.setEnabled(True)
         self._gyro_events = events
         self.event_list.clear()
@@ -565,6 +593,7 @@ class MainWindow(QMainWindow):
                  f"몇 초 뒤 프레임에서 재정합하면 새 세그먼트가 됩니다")
 
     def _gpmf_failed(self, msg):
+        self._busy(False)
         self.btn_gpmf.setEnabled(True)
         self.log(f"[gpmf] 실패: {msg}")
 
@@ -609,6 +638,8 @@ class MainWindow(QMainWindow):
         w.finished.connect(self._playback_finished)
         self._playback_worker = w
         self._playing = True
+        self._play_busy = True
+        self._busy(True)
         self.btn_play.setText("⏸ 정지")
         w.start()
 
@@ -617,10 +648,16 @@ class MainWindow(QMainWindow):
             self._playback_worker.stop()   # _playing 해제는 finished 에서
 
     def _playback_frame(self, pano, f):
+        if getattr(self, '_play_busy', False):
+            self._play_busy = False
+            self._busy(False)
         self.pano_pane.set_frame(pano)
         self.slider.setValue(f)            # _show_current_frames 는 재생 중 무시
 
     def _playback_finished(self):
+        if getattr(self, '_play_busy', False):
+            self._play_busy = False
+            self._busy(False)
         self._playing = False
         self.btn_play.setText("▶ 재생")
         self._show_current_frames()

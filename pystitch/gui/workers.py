@@ -62,14 +62,16 @@ class AlignWorker(QThread):
     log = pyqtSignal(str)
     failed = pyqtSignal(str)
 
-    def __init__(self, img_l, img_r, lens: LensProfile):
+    def __init__(self, img_l, img_r, lens: LensProfile, reuse_level=None):
         super().__init__()
         self.img_l, self.img_r, self.lens = img_l, img_r, lens
+        self.reuse_level = reuse_level
 
     def run(self):
         try:
             a = estimate_alignment(self.img_l, self.img_r, self.lens,
-                                   log=lambda s: self.log.emit(s))
+                                   log=lambda s: self.log.emit(s),
+                                   reuse_level=self.reuse_level)
             self.done.emit(a)
         except Exception as e:  # noqa: BLE001
             self.failed.emit(str(e))

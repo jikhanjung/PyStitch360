@@ -188,8 +188,14 @@ def find_halfway_line_yaw(imgs, Rs, lens: LensProfile, yaw_range, el0, el1,
     return float(yaws[peak])
 
 
-def estimate_alignment(img_l, img_r, lens: LensProfile, log=print) -> Alignment:
-    """프레임 쌍에서 전체 정합 추정 (상대 회전 + 자동 수평 + 자동 센터링)."""
+def estimate_alignment(img_l, img_r, lens: LensProfile, log=print,
+                       reuse_level: "Alignment | None" = None) -> Alignment:
+    """프레임 쌍에서 전체 정합 추정 (상대 회전 + 자동 수평 + 자동 센터링).
+
+    reuse_level 이 주어지면 수평(pitch/roll)·센터링(yaw)은 그 값을 그대로 쓰고
+    상대 회전만 재추정한다 — 한 경기 안에서 수평이 바뀌는 일은 거의 없고,
+    재추정 노이즈로 세그먼트마다 뷰가 미세하게 달라지는 것을 막는다.
+    """
     pts_l, pts_r = match_overlap(img_l, img_r)
     if len(pts_l) < 20:
         raise RuntimeError(f"겹침 영역 매칭 부족 ({len(pts_l)}쌍) — 프레임을 바꿔보세요")
@@ -209,11 +215,17 @@ def estimate_alignment(img_l, img_r, lens: LensProfile, log=print) -> Alignment:
     Rh = half_rotation(R_lr)
     yaw_range = np.deg2rad(yaw_split / 2) + HALF_HFOV_RAD
 
-    pitch, roll = auto_level([img_l, img_r], [Rh, Rh.T], lens, yaw_range, log=log)
-    R_adj = rot_xz(pitch, roll)
-    yaw_c = find_halfway_line_yaw([img_l, img_r], [Rh @ R_adj, Rh.T @ R_adj],
-                                  lens, yaw_range, EL0_RAD, EL1_RAD)
-    log(f"[align] 수평 pitch {np.rad2deg(pitch):+.2f}° roll {np.rad2deg(roll):+.2f}°, 하프라인 {np.rad2deg(yaw_c):+.2f}°")
+    if reuse_level is not None:
+        pitch, roll = reuse_level.pitch_auto, reuse_level.roll_auto
+        yaw_c = reuse_level.yaw_auto
+        log(f"[align] 수평/센터링 기존 값 재사용: pitch {np.rad2deg(pitch):+.2f}° "
+            f"roll {np.rad2deg(roll):+.2f}° yaw {np.rad2deg(yaw_c):+.2f}°")
+    else:
+        pitch, roll = auto_level([img_l, img_r], [Rh, Rh.T], lens, yaw_range, log=log)
+        R_adj = rot_xz(pitch, roll)
+        yaw_c = find_halfway_line_yaw([img_l, img_r], [Rh @ R_adj, Rh.T @ R_adj],
+                                      lens, yaw_range, EL0_RAD, EL1_RAD)
+        log(f"[align] 수평 pitch {np.rad2deg(pitch):+.2f}° roll {np.rad2deg(roll):+.2f}°, 하프라인 {np.rad2deg(yaw_c):+.2f}°")
 
     return Alignment(
         Rh=Rh, yaw_split_deg=yaw_split,
