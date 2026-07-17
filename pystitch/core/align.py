@@ -162,6 +162,8 @@ def auto_level(imgs, Rs, lens: LensProfile, yaw_range, scale=0.2, log=print):
         pitch += step[0]
         roll += step[1]
         log(f"[auto-level] 반복 {it+1}: 인라이어 {n} → pitch {np.rad2deg(pitch):+.2f}°, roll {np.rad2deg(roll):+.2f}°")
+    if max(abs(pitch), abs(roll)) >= np.deg2rad(24):
+        log("[auto-level] 경고: 보정값이 한계(±25°) 부근 — 정합 기하가 비정상일 가능성")
     return pitch, roll
 
 
@@ -196,6 +198,13 @@ def estimate_alignment(img_l, img_r, lens: LensProfile, log=print) -> Alignment:
     R_lr, inliers, errs = estimate_relative_rotation(rays_l, rays_r)
     yaw_split = float(np.rad2deg(np.linalg.norm(cv2.Rodrigues(R_lr)[0])))
     log(f"[align] 매칭 {len(pts_l)} → 인라이어 {inliers.sum()}, 잔차 {np.median(errs):.3f}°, 상대회전 {yaw_split:.2f}°")
+    if inliers.sum() < 30:
+        # 인라이어 소수의 RANSAC 해는 겉보기 잔차가 작아도 회전이 엉터리다
+        # (실사례: 3/108 인라이어 → 상대회전 99.7°, auto-level ±25° 발산, 검은 화면)
+        raise RuntimeError(
+            f"정합 실패: 인라이어 {inliers.sum()}개 (최소 30) — 두 카메라가 같은 "
+            "장면을 안정적으로 보는 경기 중 프레임에서 다시 시도하세요. "
+            "동기화 오프셋이 맞는지도 확인 (1번 탭 '오디오 자동 동기화')")
 
     Rh = half_rotation(R_lr)
     yaw_range = np.deg2rad(yaw_split / 2) + HALF_HFOV_RAD

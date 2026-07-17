@@ -173,3 +173,18 @@ def test_audio_sync_synthetic(tmp_path):
     offset, conf = estimate_offset(str(base), str(delayed), duration=20)
     assert abs(offset - 1.5) < 0.02, f"offset={offset}"
     assert conf > 4
+
+
+def test_alignment_rejects_degenerate_frames(lens):
+    """무관한 두 이미지(가짜 매칭/저인라이어)는 예외 — 검은 화면 방지 게이트."""
+    import cv2
+
+    from pystitch.core.align import estimate_alignment
+
+    rng = np.random.default_rng(11)
+    imgs = []
+    for _ in range(2):
+        im = rng.integers(0, 255, (270, 480, 3), np.uint8)
+        imgs.append(cv2.resize(im, (lens.width, lens.height)))
+    with pytest.raises(RuntimeError):
+        estimate_alignment(imgs[0], imgs[1], lens, log=lambda s: None)
