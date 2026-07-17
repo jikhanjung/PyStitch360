@@ -1,8 +1,10 @@
 """백그라운드 워커 스레드 (동기화, 정합, 미리보기, 내보내기)."""
 from __future__ import annotations
 
+import queue
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -11,6 +13,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from ..core.align import Alignment, estimate_alignment
 from ..core.chapters import ChapteredVideo
+from ..core.encoders import encoder_args
 from ..core.lens import LensProfile
 from ..core.render import Renderer
 from ..core.sync import estimate_offset
@@ -138,39 +141,74 @@ class ExportWorker(QThread):
             concat_list = tf.name
 
         duration = total / fps
-        cmd = ["ffmpeg", "-y", "-v", "error",
-               "-f", "rawvideo", "-pix_fmt", "bgr24",
-               "-s", f"{rend.out_w}x{rend.out_h}", "-r", f"{fps}", "-i", "-",
-               "-f", "concat", "-safe", "0", "-ss", f"{self.start}",
-               "-t", f"{duration}", "-i", concat_list,
-               "-map", "0:v", "-map", "1:a?",
-               "-c:v", self.codec, "-preset", "fast", "-crf", str(self.crf),
-               "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"]
-        if self.codec == "libx265":
-            cmd += ["-tag:v", "hvc1"]
-        cmd.append(self.out_path)
+        cmd = (["ffmpeg", "-y", "-v", "error",
+                "-f", "rawvideo", "-pix_fmt", "bgr24",
+                "-s", f"{rend.out_w}x{rend.out_h}", "-r", f"{fps}", "-i", "-",
+                "-f", "concat", "-safe", "0", "-ss", f"{self.start}",
+                "-t", f"{duration}", "-i", concat_list,
+                "-map", "0:v", "-map", "1:a?"]
+               + encoder_args(self.codec, self.crf)
+               + ["-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", self.out_path])
         enc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
+        # 3단 파이프라인: 읽기 → 렌더(이 스레드) → 인코더 쓰기
         vid_l.seek_frame(f_start)
         vid_r.seek_frame(r_start)
+        q_in: queue.Queue = queue.Queue(maxsize=4)
+        q_out: queue.Queue = queue.Queue(maxsize=4)
+
+        def reader():
+            for _ in range(total):
+                if self._cancel:
+                    break
+                ok_l, im_l = vid_l.read()
+                ok_r, im_r = vid_r.read()
+                if not (ok_l and ok_r):
+                    break
+                q_in.put((im_l, im_r))
+            q_in.put(None)
+
+        def writer():
+            while True:
+                buf = q_out.get()
+                if buf is None:
+                    break
+                try:
+                    enc.stdin.write(buf)
+                except BrokenPipeError:
+                    self._cancel = True
+                    break
+
+        t_reader = threading.Thread(target=reader, daemon=True)
+        t_writer = threading.Thread(target=writer, daemon=True)
+        t_reader.start()
+        t_writer.start()
+
         t0 = time.perf_counter()
         done = 0
         try:
-            for i in range(total):
+            while True:
                 if self._cancel:
                     self.log.emit("사용자 취소")
                     break
-                ok_l, img_l = vid_l.read()
-                ok_r, img_r = vid_r.read()
-                if not (ok_l and ok_r):
-                    self.log.emit(f"입력 종료 (프레임 {i})")
+                item = q_in.get()
+                if item is None:
                     break
-                frame = rend.render(img_l, img_r)
-                enc.stdin.write(frame.tobytes())
+                frame = rend.render(*item)
+                q_out.put(frame.tobytes())
                 done += 1
                 if done % 30 == 0:
                     self.progress.emit(done, total, done / (time.perf_counter() - t0))
         finally:
+            # reader 가 가득 찬 큐에 막혀 있지 않도록 비운 뒤 종료 대기
+            while not q_in.empty():
+                try:
+                    q_in.get_nowait()
+                except queue.Empty:
+                    break
+            t_reader.join(timeout=10)
+            q_out.put(None)
+            t_writer.join(timeout=60)
             enc.stdin.close()
             enc.wait()
             vid_l.release()

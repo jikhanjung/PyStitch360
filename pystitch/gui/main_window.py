@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..core.chapters import ChapteredVideo, find_chapters
+from ..core.encoders import available_encoders
 from ..core.lens import LensProfile, builtin_profiles
 from ..core.project import load_project, save_project
 from .widgets import FramePane
@@ -414,7 +415,8 @@ class MainWindow(QMainWindow):
         g.addWidget(self.spin_end, 0, 3)
         g.addWidget(QLabel("코덱"), 1, 0)
         self.combo_codec = QComboBox()
-        self.combo_codec.addItems(["libx264 (H.264)", "libx265 (HEVC)"])
+        self.encoders = available_encoders()   # NVENC 등 실제 가용 인코더만
+        self.combo_codec.addItems(list(self.encoders))
         g.addWidget(self.combo_codec, 1, 1)
         g.addWidget(QLabel("CRF"), 1, 2)
         self.spin_crf = QSpinBox(minimum=10, maximum=35, value=19)
@@ -449,7 +451,7 @@ class MainWindow(QMainWindow):
                                              "MP4 (*.mp4)")
         if not out:
             return
-        codec = "libx264" if self.combo_codec.currentIndex() == 0 else "libx265"
+        codec = self.encoders[self.combo_codec.currentText()]
         scale = 1.0 if self.combo_scale.currentIndex() == 0 else 0.5
         self._export_worker = ExportWorker(
             self.lens, self.alignment,

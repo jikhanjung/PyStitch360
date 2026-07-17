@@ -66,6 +66,8 @@ def render_pano(imgs, Rs, lens: LensProfile, out_w, out_h, yaw0, yaw1, el0, el1,
 class Renderer:
     """remap 테이블·가중치를 캐싱한 프레임 렌더러 (미리보기·내보내기 공용).
 
+    분할 렌더링: 심 좌측은 L, 우측은 R 만 사용하므로 각 카메라를
+    자기 절반 + 심 밴드까지만 워핑한다 (remap/게인/블렌딩 비용 ≈ 절반).
     scale 로 출력 해상도를 줄일 수 있다 (미리보기용).
     """
 
@@ -83,28 +85,59 @@ class Renderer:
                                             yaw0, yaw1, el0, el1)
             self._float_maps.append((mx, my))
             masks.append(cv2.remap(src_ones, mx, my, cv2.INTER_NEAREST, borderValue=0))
-        self.maps = [cv2.convertMaps(mx, my, cv2.CV_16SC2) for mx, my in self._float_maps]
-        seam_feather = max(2, int(feather_px * scale))
-        self.w_l = seam_weights(masks[0], masks[1], yaw0, yaw1,
-                                (yaw0 + yaw1) / 2, seam_feather)
-        self.w_r = (1.0 - self.w_l).astype(np.float32)
-        self.gain_l = (1.0, 1.0, 1.0, 1.0)
-        self.gain_r = (1.0, 1.0, 1.0, 1.0)
         self._masks = masks
 
+        # 심 밴드 경계: [x0, x1) 만 블렌딩, 바깥은 단일 카메라 복사
+        seam_feather = max(2, int(feather_px * scale))
+        xc = self.out_w // 2
+        self._x0 = max(0, xc - seam_feather // 2 - 2)
+        self._x1 = min(self.out_w, xc + seam_feather // 2 + 2)
+        w_l_full = seam_weights(masks[0], masks[1], yaw0, yaw1,
+                                (yaw0 + yaw1) / 2, seam_feather)
+        self.w_l_band = np.ascontiguousarray(w_l_full[:, self._x0 : self._x1])
+        self.w_r_band = (1.0 - self.w_l_band).astype(np.float32)
+
+        self._rebuild_cropped_maps()
+        self.gain_l = (1.0, 1.0, 1.0, 1.0)
+        self.gain_r = (1.0, 1.0, 1.0, 1.0)
+
+    def _rebuild_cropped_maps(self):
+        """분할 렌더용 크롭 맵: L 은 [0, x1), R 은 [x0, out_w)."""
+        (mxl, myl), (mxr, myr) = self._float_maps
+        self.maps = [
+            cv2.convertMaps(np.ascontiguousarray(mxl[:, : self._x1]),
+                            np.ascontiguousarray(myl[:, : self._x1]), cv2.CV_16SC2),
+            cv2.convertMaps(np.ascontiguousarray(mxr[:, self._x0 :]),
+                            np.ascontiguousarray(myr[:, self._x0 :]), cv2.CV_16SC2),
+        ]
+        self._crop_off = (0, self._x0)
+
     def warp(self, img, side: int):
+        """크롭 영역 워핑 (L: 폭 x1, R: 폭 out_w-x0)."""
         return cv2.remap(img, *self.maps[side], interpolation=cv2.INTER_LINEAR)
 
     def set_gains_from(self, img_l, img_r):
-        g_l, g_r = compute_gains(self.warp(img_l, 0), self.warp(img_r, 1),
-                                 self._masks[0], self._masks[1])
+        """심 밴드 영역에서 채널 게인 추정."""
+        x0, x1 = self._x0, self._x1
+        band_l = self.warp(img_l, 0)[:, x0:x1]
+        band_r = self.warp(img_r, 1)[:, : x1 - x0]
+        g_l, g_r = compute_gains(band_l, band_r,
+                                 self._masks[0][:, x0:x1], self._masks[1][:, x0:x1])
         self.gain_l = tuple(g_l) + (1.0,)
         self.gain_r = tuple(g_r) + (1.0,)
 
     def render(self, img_l, img_r):
-        warp_l = cv2.multiply(self.warp(img_l, 0), self.gain_l)
-        warp_r = cv2.multiply(self.warp(img_r, 1), self.gain_r)
-        return cv2.blendLinear(warp_l, warp_r, self.w_l, self.w_r)
+        x0, x1 = self._x0, self._x1
+        warp_l = cv2.multiply(self.warp(img_l, 0), self.gain_l)   # 폭 x1
+        warp_r = cv2.multiply(self.warp(img_r, 1), self.gain_r)   # 폭 out_w-x0
+        out = np.empty((self.out_h, self.out_w, 3), np.uint8)
+        out[:, :x0] = warp_l[:, :x0]
+        out[:, x1:] = warp_r[:, x1 - x0 :]
+        out[:, x0:x1] = cv2.blendLinear(
+            np.ascontiguousarray(warp_l[:, x0:x1]),
+            np.ascontiguousarray(warp_r[:, : x1 - x0]),
+            self.w_l_band, self.w_r_band)
+        return out
 
     # ---------------------------------------------------------- 심 Y 정렬
 
@@ -113,10 +146,18 @@ class Renderer:
 
         L 밴드를 템플릿으로 R 밴드(세로 여유 margin)에서 매칭. 반환 dy>0 은
         같은 내용이 R 에서 dy 픽셀 아래에 있음을 뜻한다.
+        측정 밴드(±band)는 렌더용 크롭보다 넓으므로 float 맵에서 직접 워핑.
         """
         xc = self.out_w // 2
-        gl = cv2.cvtColor(self.warp(img_l, 0), cv2.COLOR_BGR2GRAY)
-        gr = cv2.cvtColor(self.warp(img_r, 1), cv2.COLOR_BGR2GRAY)
+        lo, hi = max(0, xc - band), min(self.out_w, xc + band)
+        warped = []
+        for side, img in ((0, img_l), (1, img_r)):
+            mx, my = self._float_maps[side]
+            w = cv2.remap(img, np.ascontiguousarray(mx[:, lo:hi]),
+                          np.ascontiguousarray(my[:, lo:hi]), cv2.INTER_LINEAR)
+            warped.append(cv2.cvtColor(w, cv2.COLOR_BGR2GRAY))
+        gl, gr = warped
+        xc = (hi - lo) // 2  # 이하 인덱싱은 밴드 로컬 좌표
         rows, dys, wts = [], [], []
         for y0 in range(0, self.out_h - tile_h, tile_h):
             y1 = y0 + tile_h
@@ -161,14 +202,14 @@ class Renderer:
         mx2 = cv2.remap(mx, gx, gy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
         my2 = cv2.remap(my, gx, gy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
         self._float_maps[1] = (mx2, my2)
-        self.maps[1] = cv2.convertMaps(mx2, my2, cv2.CV_16SC2)
+        self._rebuild_cropped_maps()
 
         # 검증 재측정 — 악화되면 롤백 (부호/피팅 안전장치)
         rows2, dys2, wts2 = self._measure_seam_dy(img_l, img_r)
         rms1 = float(np.sqrt(np.average(dys2**2, weights=wts2))) if len(rows2) >= 3 else rms0
         if rms1 > rms0:
             self._float_maps[1] = (mx, my)
-            self.maps[1] = cv2.convertMaps(mx, my, cv2.CV_16SC2)
+            self._rebuild_cropped_maps()
             log(f"[seam-refine] 개선 없음 (rms {rms0:.1f}→{rms1:.1f}px) — 롤백")
             return 0.0
         log(f"[seam-refine] 심 세로 어긋남 rms {rms0:.1f}px → {rms1:.1f}px")
