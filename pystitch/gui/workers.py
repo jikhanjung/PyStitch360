@@ -86,19 +86,23 @@ class PreviewWorker(QThread):
 
     def __init__(self, lens, alignment: Alignment, img_l, img_r,
                  pitch_user=0.0, roll_user=0.0, yaw_user=0.0,
-                 feather_px=40, scale=0.25, persp_k=0.0, persp_m=1.0):
+                 feather_px=40, scale=0.25, persp_k=0.0, persp_m=1.0,
+                 el0=None, el1=None):
         super().__init__()
         self.lens, self.a = lens, alignment
         self.img_l, self.img_r = img_l, img_r
         self.user = (pitch_user, roll_user, yaw_user)
         self.feather_px, self.scale = feather_px, scale
         self.persp = (persp_k, persp_m)
+        self.el = (el0, el1)
 
     def run(self):
         try:
             R_wl, R_wr = self.a.rotations(self.user[0], self.user[1])
             yaw0, yaw1 = self.a.window(self.user[2])
-            r = Renderer(self.lens, R_wl, R_wr, yaw0, yaw1, self.a.el0, self.a.el1,
+            el0 = self.el[0] if self.el[0] is not None else self.a.el0
+            el1 = self.el[1] if self.el[1] is not None else self.a.el1
+            r = Renderer(self.lens, R_wl, R_wr, yaw0, yaw1, el0, el1,
                          scale=self.scale, feather_px=self.feather_px,
                          persp_k=self.persp[0], persp_m=self.persp[1])
             r.set_gains_from(self.img_l, self.img_r)
@@ -118,7 +122,7 @@ class ExportWorker(QThread):
                  offset_sec, start_sec, end_sec, out_path,
                  pitch_user=0.0, roll_user=0.0, yaw_user=0.0,
                  codec="libx264", crf=19, scale=1.0, feather_px=40,
-                 ptz=False, persp_k=0.0, persp_m=1.0):
+                 ptz=False, persp_k=0.0, persp_m=1.0, el0=None, el1=None):
         super().__init__()
         self.lens = lens
         # segments: [{"start_sec": float, "alignment": Alignment}, ...] 오름차순
@@ -134,6 +138,7 @@ class ExportWorker(QThread):
         self.feather_px = feather_px
         self.ptz = ptz
         self.persp = (persp_k, persp_m)
+        self.el = (el0, el1)
         self._cancel = False
 
     def cancel(self):
@@ -171,8 +176,10 @@ class ExportWorker(QThread):
         def make_renderer(alignment, img_l, img_r) -> Renderer:
             R_wl, R_wr = alignment.rotations(self.user[0], self.user[1])
             yaw_c = alignment.yaw_auto + np.deg2rad(self.user[2])
+            el0 = self.el[0] if self.el[0] is not None else alignment.el0
+            el1 = self.el[1] if self.el[1] is not None else alignment.el1
             r = Renderer(self.lens, R_wl, R_wr, yaw_c - half_range, yaw_c + half_range,
-                         alignment.el0, alignment.el1,
+                         el0, el1,
                          scale=self.scale, feather_px=self.feather_px,
                          persp_k=self.persp[0], persp_m=self.persp[1])
             r.set_gains_from(img_l, img_r)
@@ -314,7 +321,7 @@ class PlaybackWorker(QThread):
     def __init__(self, lens, alignment, left_files, right_files, offset_sec,
                  start_frame, pitch_user=0.0, roll_user=0.0, yaw_user=0.0,
                  feather_px=40, scale=0.25, display_fps=10.0,
-                 persp_k=0.0, persp_m=1.0):
+                 persp_k=0.0, persp_m=1.0, el0=None, el1=None):
         super().__init__()
         self.lens, self.a = lens, alignment
         self.left_files = [str(f) for f in left_files]
@@ -324,6 +331,7 @@ class PlaybackWorker(QThread):
         self.feather_px, self.scale = feather_px, scale
         self.display_fps = display_fps
         self.persp = (persp_k, persp_m)
+        self.el = (el0, el1)
         self._stop = False
 
     def stop(self):
@@ -343,8 +351,9 @@ class PlaybackWorker(QThread):
                 raise RuntimeError("재생 시작 프레임 읽기 실패")
             R_wl, R_wr = self.a.rotations(self.user[0], self.user[1])
             yaw0, yaw1 = self.a.window(self.user[2])
-            rend = Renderer(self.lens, R_wl, R_wr, yaw0, yaw1,
-                            self.a.el0, self.a.el1,
+            el0 = self.el[0] if self.el[0] is not None else self.a.el0
+            el1 = self.el[1] if self.el[1] is not None else self.a.el1
+            rend = Renderer(self.lens, R_wl, R_wr, yaw0, yaw1, el0, el1,
                             scale=self.scale, feather_px=self.feather_px,
                             persp_k=self.persp[0], persp_m=self.persp[1])
             rend.set_gains_from(img_l, img_r)

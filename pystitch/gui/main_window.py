@@ -158,7 +158,9 @@ class MainWindow(QMainWindow):
             "lens_profile": self.profile_combo.currentText(),
             "segments": segments,
             "user": {k: sp.value() for k, sp in self.spin_user.items()}
-                    | {"feather_px": self.spin_feather.value()},
+                    | {"feather_px": self.spin_feather.value(),
+                       "el_top_deg": self.spin_el_top.value(),
+                       "el_bottom_deg": self.spin_el_bottom.value()},
             "export": {
                 "start": self.spin_start.value(), "end": self.spin_end.value(),
                 "codec_index": self.combo_codec.currentIndex(),
@@ -207,6 +209,8 @@ class MainWindow(QMainWindow):
         for k, sp in self.spin_user.items():
             sp.setValue(float(user.get(k, 0.0)))
         self.spin_feather.setValue(int(user.get("feather_px", 40)))
+        self.spin_el_top.setValue(float(user.get("el_top_deg", 10.0)))
+        self.spin_el_bottom.setValue(float(user.get("el_bottom_deg", -38.0)))
         exp = d.get("export", {})
         self.spin_start.setValue(float(exp.get("start", 0.0)))
         self.spin_end.setValue(float(exp.get("end", 60.0)))
@@ -489,6 +493,17 @@ class MainWindow(QMainWindow):
         self.spin_feather = QSpinBox(minimum=2, maximum=400, value=40)
         self.spin_feather.valueChanged.connect(lambda _: self._preview_debounced())
         g.addWidget(self.spin_feather, 0, 7)
+        # 출력 세로 범위 (elevation, 도) — 아래를 내리면 발밑이 더 담긴다
+        g.addWidget(QLabel("세로 위(도)"), 0, 8)
+        self.spin_el_top = QDoubleSpinBox(decimals=0, minimum=0.0, maximum=45.0,
+                                          singleStep=1.0, value=10.0)
+        self.spin_el_top.valueChanged.connect(lambda _: self._preview_debounced())
+        g.addWidget(self.spin_el_top, 0, 9)
+        g.addWidget(QLabel("세로 아래(도)"), 1, 8)
+        self.spin_el_bottom = QDoubleSpinBox(decimals=0, minimum=-60.0, maximum=-5.0,
+                                             singleStep=1.0, value=-38.0)
+        self.spin_el_bottom.valueChanged.connect(lambda _: self._preview_debounced())
+        g.addWidget(self.spin_el_bottom, 1, 9)
         v.addWidget(adj)
 
         self._preview_timer = QTimer(singleShot=True, interval=400)
@@ -631,7 +646,7 @@ class MainWindow(QMainWindow):
             self.spin_offset.value(), self.slider.value(),
             self.spin_user["pitch"].value(), self.spin_user["roll"].value(),
             self.spin_user["yaw"].value(), self.spin_feather.value(),
-            persp_k=k, persp_m=m)
+            persp_k=k, persp_m=m, el0=self._view_el()[0], el1=self._view_el()[1])
         w.frame_ready.connect(self._playback_frame)
         w.log.connect(self.log)
         w.failed.connect(lambda msg: self.log(f"[오류] 재생: {msg}"))
@@ -673,6 +688,11 @@ class MainWindow(QMainWindow):
                        "yaw": a.yaw_auto}[key] * 57.29578
                 self.lbl_auto[key].setText(f"자동 {deg:+.2f}°")
 
+    def _view_el(self) -> tuple[float, float]:
+        """출력 세로 범위 (el0=아래, el1=위, 라디안)."""
+        return (self.spin_el_bottom.value() / 57.29578,
+                self.spin_el_top.value() / 57.29578)
+
     def _persp_params(self) -> tuple[float, float]:
         """내보내기 탭의 원근비 조절 설정 (미체크 시 항등)."""
         if not self.check_persp.isChecked():
@@ -691,7 +711,8 @@ class MainWindow(QMainWindow):
             self.lens, alignment, img_l.copy(), img_r.copy(),
             self.spin_user["pitch"].value(), self.spin_user["roll"].value(),
             self.spin_user["yaw"].value(), self.spin_feather.value(),
-            persp_k=self._persp_params()[0], persp_m=self._persp_params()[1])
+            persp_k=self._persp_params()[0], persp_m=self._persp_params()[1],
+            el0=self._view_el()[0], el1=self._view_el()[1])
         self._preview_worker.log.connect(self.log)
         self._preview_worker.done.connect(self.pano_pane.set_frame)
         self._preview_worker.failed.connect(lambda m: self.log(f"[오류] {m}"))
@@ -787,7 +808,8 @@ class MainWindow(QMainWindow):
             self.spin_user["yaw"].value(),
             codec=codec, crf=self.spin_crf.value(), scale=scale,
             feather_px=self.spin_feather.value(), ptz=ptz,
-            persp_k=self._persp_params()[0], persp_m=self._persp_params()[1])
+            persp_k=self._persp_params()[0], persp_m=self._persp_params()[1],
+            el0=self._view_el()[0], el1=self._view_el()[1])
         self._export_worker.log.connect(self.log)
         self._export_worker.progress.connect(self._export_progress)
         self._export_worker.finished_ok.connect(self._export_done)
