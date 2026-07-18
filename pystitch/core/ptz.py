@@ -131,7 +131,7 @@ class VirtualPTZ:
 # 2944px 로 올리면 경기장 안 공 검출률 0% → 52% (conf>=0.25).
 
 def detect_raw(model, frame, det_w=2944, conf=0.2):
-    """(N,4) [cx, cy, conf, is_ball] — 파노라마 원본 좌표계."""
+    """(N,6) [cx, cy, conf, is_ball, w, h] — 파노라마 원본 좌표계."""
     scale = det_w / frame.shape[1]
     small = cv2.resize(frame, None, fx=scale, fy=scale,
                        interpolation=cv2.INTER_AREA)
@@ -141,8 +141,9 @@ def detect_raw(model, frame, det_w=2944, conf=0.2):
     for b in r.boxes:
         x1, y1, x2, y2 = b.xyxy[0].tolist()
         out.append(((x1 + x2) / 2 / scale, (y1 + y2) / 2 / scale,
-                    float(b.conf[0]), float(int(b.cls[0]) == _CLS_BALL)))
-    return np.array(out) if out else np.zeros((0, 4))
+                    float(b.conf[0]), float(int(b.cls[0]) == _CLS_BALL),
+                    (x2 - x1) / scale, (y2 - y1) / scale))
+    return np.array(out) if out else np.zeros((0, 6))
 
 
 def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
@@ -180,13 +181,14 @@ def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
             best = b[b[:, 2].argmax(), :3].tolist() if len(b) else None
             frames_idx.append(i)
             balls.append(best)
-            players.append(p[:, :2].round(1).tolist() if len(p) else [])
+            players.append(p[:, [0, 1, 4, 5]].round(1).tolist() if len(p) else [])
             if len(frames_idx) % 300 == 0:
                 el = time.perf_counter() - t0
                 log(f"[analyze] {i}/{total} ({i/max(el,1e-9):.1f}fps)")
         i += 1
     cap.release()
     return {"video": str(path), "total_frames": i, "fps": fps,
+            "players_fmt": "cxcywh",     # 구캐시(cxcy 2열)와 소비부 호환
             "pano_w": pano_w, "pano_h": pano_h,
             "detect_every": detect_every, "det_w": det_w,
             "field_top_frac": field_top_frac,
@@ -220,7 +222,7 @@ def link_ball_tracks(analysis, ball_conf=0.25, max_jump_per_frame=120.0):
     iso = np.zeros(n)
     for i in range(n):
         if not np.isnan(cand[i, 0]) and analysis["players"][i]:
-            pl = np.asarray(analysis["players"][i], dtype=float).reshape(-1, 2)
+            pl = np.asarray(analysis["players"][i], dtype=float)[:, :2]
             iso[i] = np.hypot(*(pl - cand[i]).T).min()
 
     assoc_gap = 2.5 * fps               # 이 이상 끊기면 새 트랙
@@ -254,7 +256,8 @@ def link_ball_tracks(analysis, ball_conf=0.25, max_jump_per_frame=120.0):
     p_ty = np.full(n, np.nan)
     p_span = np.zeros(n)
     for i in range(n):
-        pl = np.asarray(analysis["players"][i], dtype=float).reshape(-1, 2)
+        pl = np.asarray(analysis["players"][i], dtype=float)
+        pl = pl[:, :2] if pl.ndim == 2 else pl.reshape(-1, 2)
         p_cnt[i] = len(pl)
         if len(pl) >= 3:
             med = np.median(pl[:, 0])

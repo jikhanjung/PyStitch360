@@ -168,3 +168,13 @@ def test_near_ball_widens_crop():
     mid = slice(200, 700)
     assert far["crop_w"][mid].mean() < 2100          # 원경: 1.1배 이하
     assert near["crop_w"][mid].mean() > 2700         # 최하단: ~1.6배
+
+
+def test_player_bbox_format_compatible():
+    """선수가 (cx,cy,w,h) 4열이어도 계획 로직은 중심 2열만 사용해 동일 동작."""
+    frames = list(range(0, 900, 3))
+    players4 = [[[float(x), 900.0, 40.0, 90.0] for x in np.linspace(2200, 4800, 20)]
+                for _ in frames]
+    plan = build_plan(_analysis(frames, [None] * len(frames), players4),
+                      PANO_W, PANO_H, log=None)
+    assert np.abs(plan["cx"][300:600] - 3500).max() < 400   # 2열 케이스와 동일
