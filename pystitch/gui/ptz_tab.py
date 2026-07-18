@@ -121,6 +121,7 @@ class TrackBar(QWidget):
 
 class AnalyzeWorker(QThread):
     done = pyqtSignal(dict)
+    progress = pyqtSignal(int, int, float)   # done_frames, total, fps
     log = pyqtSignal(str)
     failed = pyqtSignal(str)
 
@@ -137,6 +138,7 @@ class AnalyzeWorker(QThread):
         try:
             d = analyze_video(self.video_path, weights=self.weights,
                               cancel=lambda: self._cancel,
+                              progress=lambda i, t, f: self.progress.emit(i, t, f),
                               log=lambda s: self.log.emit(s))
             if d is None:
                 self.failed.emit("취소됨")
@@ -659,11 +661,21 @@ class PtzTab(QWidget):
         self.log(f"[ptz] 자동 분석 시작 (모델: {weights or 'yolov8n(내장)'}) — "
                  "진행은 로그에 표시")
         w = AnalyzeWorker(str(self.pano_path), weights=weights)
+        w.progress.connect(self._analyze_progress)
         w.log.connect(self.log)
         w.done.connect(self._analyze_done)
         w.failed.connect(self._analyze_failed)
         self._analyze_worker = w
         w.start()
+
+    def _analyze_progress(self, done, total, fps):
+        if self._render_worker is not None and self._render_worker.isRunning():
+            return                              # 내보내기가 진행바 사용 중
+        self.progress.setRange(0, max(total, 1))
+        self.progress.setValue(done)
+        remain = (total - done) / fps / 60 if fps > 0 else 0
+        self.progress.setFormat(
+            f"분석 %p%  ({done}/{total}, {fps:.1f}fps, 남은 시간 {remain:.0f}분)")
 
     def _analyze_done(self, d):
         self.analysis = d

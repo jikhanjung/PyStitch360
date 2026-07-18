@@ -148,7 +148,7 @@ def detect_raw(model, frame, det_w=2944, conf=0.2):
 
 def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
                   weights=None, far_boost=True, far_band_frac=0.58,
-                  cancel=None, log=print):
+                  cancel=None, progress=None, log=print):
     """1패스: 프레임 샘플마다 공/선수 검출. 반환 dict 는 JSON 직렬화 가능.
 
     field_top_frac 위(원경 트랙·관중석)의 공/선수는 장외로 버린다.
@@ -250,6 +250,9 @@ def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
             balls.append(kept[0] if kept else None)
             ball_cands.append(kept)
             players.append(prow)
+            if len(frames_idx) % 30 == 0 and progress is not None:
+                el = time.perf_counter() - t0
+                progress(i, total, i / max(el, 1e-9))
             if len(frames_idx) % 300 == 0:
                 el = time.perf_counter() - t0
                 log(f"[analyze] {i}/{total} ({i/max(el,1e-9):.1f}fps)")
