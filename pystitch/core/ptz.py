@@ -146,7 +146,7 @@ def detect_raw(model, frame, det_w=2944, conf=0.2):
     return np.array(out) if out else np.zeros((0, 6))
 
 
-def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
+def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
                   weights=None, far_boost=True, far_band_frac=0.58,
                   cancel=None, progress=None, checkpoint_path=None,
                   checkpoint_every=1500, log=print):
@@ -161,6 +161,9 @@ def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
     같은 조건(영상·파라미터·모델)의 체크포인트가 있으면 그 프레임부터 재개.
     취소 시에도 그 지점까지 저장한다. (재개 시 ByteTrack 선수 ID 는 경계에서
     새로 시작 — 팀 분류는 트랙릿 단위라 영향 미미.)
+
+    det_w 기본값(None)은 파노라마 폭의 1/2 (32의 배수, 4416 상한) — 8K 급
+    소스에서도 검출 해상도가 소스에 비례해 따라간다 (5906px → 2944 동일).
     """
     import json as _json
     from ultralytics import YOLO
@@ -173,6 +176,8 @@ def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
     fps = cap.get(cv2.CAP_PROP_FPS)
     pano_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     pano_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if det_w is None:
+        det_w = min(round(pano_w / 2 / 32) * 32, 4416)
     field_top = field_top_frac * pano_h
     frames_idx, balls, players = [], [], []
     ball_cands = []
