@@ -16,6 +16,7 @@ class FramePane(QLabel):
     """
 
     dragged = pyqtSignal(float, float, bool)
+    clicked = pyqtSignal(float, float)   # 표시 픽스맵 기준 좌표 비율 (0~1)
 
     def __init__(self, placeholder="영상 없음", interactive=False):
         super().__init__(placeholder)
@@ -67,6 +68,8 @@ class FramePane(QLabel):
     def mousePressEvent(self, ev):
         if self._interactive and ev.button() == Qt.MouseButton.LeftButton:
             self._drag_pos = ev.position()
+            self._press_pos = ev.position()
+            self._moved = 0.0
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
         super().mousePressEvent(ev)
 
@@ -74,12 +77,22 @@ class FramePane(QLabel):
         if self._drag_pos is not None:
             d = ev.position() - self._drag_pos
             self._drag_pos = ev.position()
+            self._moved += abs(d.x()) + abs(d.y())
             shift = bool(ev.modifiers() & Qt.KeyboardModifier.ShiftModifier)
             self.dragged.emit(d.x(), d.y(), shift)
         super().mouseMoveEvent(ev)
 
     def mouseReleaseEvent(self, ev):
         if self._drag_pos is not None:
+            if self._moved < 4.0:        # 이동 없는 프레스+릴리스 = 클릭
+                p = self.pixmap()
+                if p is not None and not p.isNull():
+                    x0 = (self.width() - p.width()) / 2
+                    y0 = (self.height() - p.height()) / 2
+                    fx = (self._press_pos.x() - x0) / p.width()
+                    fy = (self._press_pos.y() - y0) / p.height()
+                    if 0.0 <= fx <= 1.0 and 0.0 <= fy <= 1.0:
+                        self.clicked.emit(fx, fy)
             self._drag_pos = None
             self.setCursor(Qt.CursorShape.OpenHandCursor)
         super().mouseReleaseEvent(ev)

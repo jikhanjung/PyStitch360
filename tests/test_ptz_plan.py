@@ -104,3 +104,26 @@ def test_static_isolated_decoy_rejected():
                 for _ in frames]
     plan2 = build_plan(_analysis(frames, balls, players2), PANO_W, PANO_H, log=None)
     assert np.abs(plan2["cx"][mid] - 4900).max() < 100
+
+
+def test_keyframes_override_auto():
+    """키프레임은 자동 검출을 덮어쓰고(±1.5s 억제), 멀리서는 자동 추종 유지."""
+    frames = list(range(0, 1800, 3))
+    balls = [[2000.0, 900.0, 0.5] for _ in frames]          # 자동: 내내 x=2000
+    plan = build_plan(_analysis(frames, balls), PANO_W, PANO_H,
+                      keyframes=[(900, 4000.0, 1000.0)], log=None)
+    assert abs(plan["cx"][900] - 4000) < 350        # 키프레임 지점: 수동 위치
+    assert abs(plan["cx"][150] - 2000) < 50         # 먼 곳: 자동 유지
+    assert abs(plan["cx"][1700] - 2000) < 50
+
+
+def test_keyframe_pair_bridges_detection_gap():
+    """자동 검출이 전혀 없는 구간도 인접 키프레임(<=8s)끼리 직접 보간."""
+    frames = list(range(0, 2700, 3))
+    balls = [None] * len(frames)                    # 자동 검출 전무
+    kfs = [(300, 1500.0, 900.0), (480, 3000.0, 900.0)]   # 6초 간격
+    plan = build_plan(_analysis(frames, balls), PANO_W, PANO_H,
+                      keyframes=kfs, log=None)
+    mid = plan["cx"][390]                           # 중간 지점 ≈ 평균
+    assert abs(mid - 2250) < 300
+    assert np.all(plan["crop_w"][360:420] < 1920 * 1.25)  # 구간 중앙: 줌인 유지

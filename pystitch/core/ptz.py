@@ -210,6 +210,7 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
                sigma_slow=1.2, sigma_fast=0.35, fast_err_px=400.0,
                zoom_margin=260.0, top_margin=160,
                decoy_static_px=30.0, decoy_iso_px=700.0, decoy_win_sec=3.0,
+               keyframes=None, kf_suppress_sec=1.5, kf_bridge_sec=8.0,
                log=print):
     """검출 궤적 → 프레임별 (cx, cy, crop_w) 계획.
 
@@ -218,6 +219,9 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
       모든 선수로부터 decoy_iso_px 이상 고립된 '공'은 오검출(낙엽·마킹 등)로
       기각. 실제 공은 경기 중 장시간 정지+고립 상태가 없다 (코너킥 준비 등
       짧은 예외는 줌아웃으로 처리돼 해가 없음).
+    - keyframes: [(frame_idx, x, y), ...] 사용자 지정 공 위치. 자동 검출보다
+      우선한다 — 키프레임 ±kf_suppress_sec 의 자동 샘플은 버리고, 인접
+      키프레임끼리는 kf_bridge_sec 까지 직접 보간으로 잇는다.
     - 공 없는 구간: 선수 중앙값 주변(트림 평균) 목표 + 줌아웃(선수 분포 커버).
     - 스무딩: 기본 sigma_slow(초). 잔차가 fast_err_px 를 넘는 구간(공이 빠르게
       이동)만 sigma_fast 추종으로 크로스페이드 — "평상시 최대한 부드럽게".
@@ -229,47 +233,107 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
     idx = np.array(analysis["frames"])
     n = len(idx)
 
-    # --- 0. 정적 미끼 기각 ----------------------------------------------
+    # --- 0. 공 후보 → 트랙 구성 -----------------------------------------
+    # 오검출은 프레임이 아니라 트랙 단위로 다룬다: 시간 연속으로 연결한 뒤
+    # 트랙 통계(정지/고립/중복)로 통째로 기각 — 정지 낙엽, 장외에서 움직이는
+    # 다른 공, 순간 오검출이 여기서 걸러진다.
     cand = np.array([b[:2] if b is not None and b[2] >= ball_conf else (np.nan, np.nan)
                      for b in analysis["balls"]])
-    # 고립도: 선수 검출이 있는 샘플에서만 판정 가능 (-1 = 판정 불가 → 유지)
-    iso = np.full(n, -1.0)
+    # 고립도: 선수 검출이 있는 샘플에서만 판정 가능 (없으면 0 = 보수적 유지)
+    iso = np.zeros(n)
     for i in range(n):
         if not np.isnan(cand[i, 0]) and analysis["players"][i]:
             pl = np.asarray(analysis["players"][i], dtype=float).reshape(-1, 2)
             iso[i] = np.hypot(*(pl - cand[i]).T).min()
-    iso[iso < 0] = 0.0
-    win = max(1, int(decoy_win_sec * fps / max(np.diff(idx).mean(), 1)))
-    decoy = np.zeros(n, bool)
-    for i in range(n):
-        if np.isnan(cand[i, 0]) or iso[i] <= decoy_iso_px:
-            continue
-        w = cand[max(0, i - win): i + win + 1]
-        w = w[~np.isnan(w[:, 0])]
-        if len(w) >= 3 and np.hypot(*(w - cand[i]).T).max() <= decoy_static_px:
-            decoy[i] = True
 
-    # --- 1. 공 수락 (게이팅) --------------------------------------------
-    ball = np.full((n, 2), np.nan)
-    last = None          # (sample_i, x, y)
-    for i, b in enumerate(analysis["balls"]):
-        if b is None or b[2] < ball_conf or decoy[i]:
+    assoc_gap = 2.5 * fps               # 이 이상 끊기면 새 트랙
+    tracks: list[list[int]] = []        # 샘플 인덱스 목록
+    for i in range(n):
+        if np.isnan(cand[i, 0]):
             continue
-        x, y, c = b
-        if last is not None and c < 0.5:
-            gap_frames = idx[i] - idx[last[0]]
-            if np.hypot(x - last[1], y - last[2]) > max_jump_per_frame * max(gap_frames, 1):
-                continue  # 순간이동 — 장외/오검출로 간주
-        ball[i] = (x, y)
-        last = (i, x, y)
+        best, best_d = None, None
+        for t in tracks:
+            gap = idx[i] - idx[t[-1]]
+            if not 0 < gap <= assoc_gap:
+                continue
+            # 최근 5점 평균 기준 — 검출 노이즈로 트랙이 갈라지지 않게.
+            # +150px 은 빠른 이동 시 평균이 뒤처지는 지연 보상.
+            # 거리 상한 700px: 긴 공백 뒤 원거리 오브젝트(낙엽 등)가 공 트랙에
+            # 흡수되는 것을 차단 — 장거리 패스는 새 트랙으로 갈라져도
+            # 시간 중복이 없으면 그대로 수락되므로 손실이 없다.
+            ref = cand[t[-5:]].mean(axis=0)
+            d = float(np.hypot(*(cand[i] - ref)))
+            if (d <= min(max_jump_per_frame * gap, 700) + 150
+                    and (best_d is None or d < best_d)):
+                best, best_d = t, d
+        if best is None:
+            tracks.append([i])
+        else:
+            best.append(i)
+
+    def _track_stats(t):
+        pts = cand[t]
+        # 정지 판정은 중앙값 기준 80% 반경 — 트랙이 흡수한 이탈 샘플에 강건
+        med = np.median(pts, axis=0)
+        r80 = float(np.percentile(np.hypot(*(pts - med).T), 80))
+        dur = (idx[t[-1]] - idx[t[0]]) / fps
+        iso_frac = float(np.mean(iso[t] > decoy_iso_px))
+        return r80, dur, iso_frac
+
+    accepted: list[list[int]] = []
+    covered = np.zeros(n, bool)
+    rej = {"static": 0, "isolated": 0, "overlap": 0}
+    # 점수: 길이 + 선수 근접 가점 (경기 공은 선수 곁에 오래 머문다)
+    order = sorted(tracks, key=lambda t: -(len(t) * (2.0 - _track_stats(t)[2])))
+    for t in order:
+        r80, dur, iso_frac = _track_stats(t)
+        if r80 <= decoy_static_px and iso_frac > 0.5 and dur >= decoy_win_sec:
+            rej["static"] += 1          # 정지 + 고립 (낙엽·마킹)
+            continue
+        # 실측: 진짜 공 트랙의 고립 비율은 0.00~0.04, 미끼는 0.8 안팎 —
+        # 5초 이상 지속 트랙이 절반 넘게 고립돼 있으면 경기 공이 아니다
+        if dur >= 5.0 and iso_frac > 0.5:
+            rej["isolated"] += 1        # 선수와 무관한 물체 (낙엽·장외 공)
+            continue
+        lo, hi = t[0], t[-1]
+        if covered[lo:hi + 1].mean() > 0.5:
+            rej["overlap"] += 1         # 이미 수락된 트랙과 시간 중복 (경합 오검출)
+            continue
+        accepted.append(t)
+        covered[lo:hi + 1] = True
+
+    ball = np.full((n, 2), np.nan)
+    for t in accepted:
+        for i in t:
+            ball[i] = cand[i]
+    if log and (tracks or accepted):
+        log(f"[plan] 공 트랙 {len(tracks)}개 → 수락 {len(accepted)}개 "
+            f"(기각: 정지미끼 {rej['static']}, 장외고립 {rej['isolated']}, "
+            f"중복 {rej['overlap']})")
+
+    # --- 1.5 사용자 키프레임 병합 (자동보다 우선) -----------------------
+    kf_idx = []
+    if keyframes:
+        sup = kf_suppress_sec * fps
+        for kf_f, kx, ky in sorted(keyframes):
+            near = np.abs(idx - kf_f) <= sup
+            ball[near] = np.nan          # 키프레임 주변 자동 샘플 무효화
+        for kf_f, kx, ky in sorted(keyframes):
+            i = int(np.argmin(np.abs(idx - kf_f)))
+            ball[i] = (kx, ky)
+            kf_idx.append(i)
 
     # --- 2. 갭 보간 (짧은 가림/미검출) ----------------------------------
     known = ~np.isnan(ball[:, 0])
     gap_max = gap_fill_sec * fps
     filled = ball.copy()
     ki = np.where(known)[0]
+    kf_set = set(kf_idx)
     for a, b_ in zip(ki[:-1], ki[1:]):
-        if 0 < idx[b_] - idx[a] <= gap_max:
+        gap = idx[b_] - idx[a]
+        # 인접 키프레임 쌍은 더 긴 간격도 직접 보간으로 잇는다
+        limit = kf_bridge_sec * fps if (a in kf_set and b_ in kf_set) else gap_max
+        if 0 < gap <= limit:
             for col in (0, 1):
                 filled[a:b_ + 1, col] = np.interp(idx[a:b_ + 1], [idx[a], idx[b_]],
                                                   [ball[a, col], ball[b_, col]])
@@ -311,16 +375,25 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
     cx = (1 - w) * slow + w * fast
     cy = _gaussian1d(fy, 2.0 * fps)
     cw = _gaussian1d(fz, 2.0 * fps)
+    # 키프레임 앵커: 스무딩이 뭉갠 위치를 국소 보정해 클릭 시점에는
+    # 카메라가 정확히 그 지점을 보도록 보장 (가우시안 창으로 부드럽게)
+    if keyframes:
+        anchor_sigma = 0.8 * fps
+        for kf_f, kx, ky in sorted(keyframes):
+            j = int(np.clip(kf_f, 0, total - 1))
+            g = np.exp(-0.5 * ((fr - j) / anchor_sigma) ** 2)
+            cx = cx + (kx - cx[j]) * g
+            cy = cy + (ky - cy[j]) * g
     if log:
         log(f"[plan] 공 궤적 {known.mean():.0%} (보간 포함), "
-            f"정적 미끼 기각 {decoy.mean():.0%}, "
             f"빠른 추종 구간 {(w > 0.5).mean():.0%}, "
             f"줌아웃(>1.05x) {(cw > out_w * 1.05).mean():.0%}")
     return {"cx": cx, "cy": cy, "crop_w": cw, "top_margin": top_margin}
 
 
 def render_plan(pano_path, out_path, plan, out_w=1920, out_h=1080,
-                codec="libx264", crf=20, log=print):
+                codec="libx264", crf=20, log=print, progress=None,
+                cancel=None):
     """2패스: 계획대로 크롭(필요 시 줌아웃 다운스케일)해 인코딩. fps 반환."""
     import subprocess
     import time
@@ -343,6 +416,9 @@ def render_plan(pano_path, out_path, plan, out_w=1920, out_h=1080,
     done = 0
     try:
         for i in range(len(cx)):
+            if cancel is not None and cancel():
+                log("[render] 사용자 취소")
+                break
             ok, frame = cap.read()
             if not ok:
                 break
@@ -357,6 +433,8 @@ def render_plan(pano_path, out_path, plan, out_w=1920, out_h=1080,
                 crop = cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_AREA)
             enc.stdin.write(np.ascontiguousarray(crop).tobytes())
             done += 1
+            if done % 90 == 0 and progress is not None:
+                progress(done, len(cx), done / (time.perf_counter() - t0))
             if done % 900 == 0:
                 el = time.perf_counter() - t0
                 log(f"[render] {done}/{len(cx)} @ {done/el:.2f}fps")

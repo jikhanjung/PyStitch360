@@ -58,6 +58,9 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._build_sync_tab(), "1. 영상·동기화")
         tabs.addTab(self._build_align_tab(), "2. 정합·미리보기")
         tabs.addTab(self._build_export_tab(), "3. 내보내기")
+        from .ptz_tab import PtzTab
+        self.ptz_tab = PtzTab(self.log, self._last_video_dir, self._remember_video_dir)
+        tabs.addTab(self.ptz_tab, "4. 가상 PTZ")
         tabs.currentChanged.connect(lambda _: self._stop_playback())
         self.tabs = tabs
 
@@ -304,12 +307,22 @@ class MainWindow(QMainWindow):
         v.addLayout(ctl)
         return w
 
+    def _last_video_dir(self) -> str:
+        """영상 열기 대화상자 시작 폴더: 현재 열린 영상 → 최근 사용 폴더."""
+        if self.files_l:
+            return str(Path(self.files_l[0]).parent)
+        return str(QSettings("PyStitch360", "PyStitch360").value("last_video_dir", ""))
+
+    def _remember_video_dir(self, d: str):
+        QSettings("PyStitch360", "PyStitch360").setValue("last_video_dir", d)
+
     def _open_video(self, side: str):
         path, _ = QFileDialog.getOpenFileName(
-            self, f"{'좌측' if side == 'L' else '우측'} 영상 (첫 챕터)", "",
-            "GoPro 영상 (*.MP4 *.mp4)")
+            self, f"{'좌측' if side == 'L' else '우측'} 영상 (첫 챕터)",
+            self._last_video_dir(), "GoPro 영상 (*.MP4 *.mp4)")
         if not path:
             return
+        self._remember_video_dir(str(Path(path).parent))
         self._load_side(side, find_chapters(path))
 
     def _load_side(self, side: str, files):
