@@ -174,25 +174,122 @@ def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
             ok, frame = cap.retrieve()
             if not ok:
                 break
-            det = detect_raw(model, frame, det_w)
-            in_field = det[(det[:, 1] >= field_top)] if len(det) else det
-            b = in_field[in_field[:, 3] > 0.5] if len(in_field) else in_field
-            p = in_field[in_field[:, 3] < 0.5] if len(in_field) else in_field
-            best = b[b[:, 2].argmax(), :3].tolist() if len(b) else None
+            scale = det_w / frame.shape[1]
+            small = cv2.resize(frame, None, fx=scale, fy=scale,
+                               interpolation=cv2.INTER_AREA)
+            r = model.track(small, imgsz=det_w, conf=0.2,
+                            classes=[_CLS_PERSON, _CLS_BALL],
+                            persist=True, verbose=False)[0]
+            hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+            best, best_conf = None, -1.0
+            prow = []
+            for b_ in r.boxes:
+                x1, y1, x2, y2 = b_.xyxy[0].tolist()
+                cxs, cys = (x1 + x2) / 2 / scale, (y1 + y2) / 2 / scale
+                conf = float(b_.conf[0])
+                if cys < field_top:
+                    continue                       # 장외 (원경 트랙·관중석)
+                if int(b_.cls[0]) == _CLS_BALL:
+                    if conf > best_conf:
+                        best, best_conf = [round(cxs, 1), round(cys, 1),
+                                           round(conf, 3)], conf
+                    continue
+                tid = int(b_.id[0]) if b_.id is not None else -1
+                # 유니폼 색: 박스 상반신(위 절반, 가로 중앙 60%) HSV 평균
+                tx1 = int(x1 + (x2 - x1) * 0.2)
+                tx2 = int(x2 - (x2 - x1) * 0.2)
+                torso = hsv[int(y1):int((y1 + y2) / 2), max(tx1, 0):max(tx2, 1)]
+                hm, sm, vm = (torso.reshape(-1, 3).mean(axis=0).tolist()
+                              if torso.size else (0.0, 0.0, 0.0))
+                prow.append([round(cxs, 1), round(cys, 1),
+                             round((x2 - x1) / scale, 1), round((y2 - y1) / scale, 1),
+                             tid, round(hm, 1), round(sm, 1), round(vm, 1)])
             frames_idx.append(i)
             balls.append(best)
-            players.append(p[:, [0, 1, 4, 5]].round(1).tolist() if len(p) else [])
+            players.append(prow)
             if len(frames_idx) % 300 == 0:
                 el = time.perf_counter() - t0
                 log(f"[analyze] {i}/{total} ({i/max(el,1e-9):.1f}fps)")
         i += 1
     cap.release()
     return {"video": str(path), "total_frames": i, "fps": fps,
-            "players_fmt": "cxcywh",     # 구캐시(cxcy 2열)와 소비부 호환
+            "players_fmt": "cxcywh_id_hsv",   # 구캐시(2/4열)와 소비부 호환
             "pano_w": pano_w, "pano_h": pano_h,
             "detect_every": detect_every, "det_w": det_w,
             "field_top_frac": field_top_frac,
             "frames": frames_idx, "balls": balls, "players": players}
+
+
+def classify_teams(analysis, k=3):
+    """트랙릿(선수 ID)별 유니폼 색으로 팀 분류.
+
+    분석의 선수 행이 [cx,cy,w,h,id,h,s,v] 형식일 때만 동작. 특징은
+    채도로 가중한 색상 벡터 (s·cos h, s·sin h, v) 의 트랙릿 중앙값.
+    farthest-point 초기화 k-means (k=3) → 검출 수 기준 상위 2개 군집이
+    팀 0/1, 나머지는 2(심판·GK 등). 반환: {track_id: 팀번호}.
+    """
+    feats: dict[int, list] = {}
+    for prow in analysis["players"]:
+        for p in prow:
+            if len(p) >= 8 and p[4] >= 0:
+                h, s_, v = p[5], p[6], p[7]
+                a = h / 90.0 * np.pi          # OpenCV H 는 0~180
+                feats.setdefault(int(p[4]), []).append(
+                    (s_ * np.cos(a), s_ * np.sin(a), v))
+    if not feats:
+        return {}
+    ids = sorted(feats)
+    X = np.array([np.median(feats[t], axis=0) for t in ids])
+    n_det = np.array([len(feats[t]) for t in ids], float)
+    k = min(k, len(ids))
+    # farthest-point 초기화 (결정적)
+    centers = [X[int(np.argmax(np.linalg.norm(X - X.mean(0), axis=1)))]]
+    while len(centers) < k:
+        d = np.min([np.linalg.norm(X - c, axis=1) for c in centers], axis=0)
+        centers.append(X[int(np.argmax(d))])
+    C = np.array(centers)
+    for _ in range(20):
+        lab = np.argmin(np.linalg.norm(X[:, None] - C[None], axis=2), axis=1)
+        newC = np.array([X[lab == j].mean(0) if np.any(lab == j) else C[j]
+                         for j in range(k)])
+        if np.allclose(newC, C):
+            break
+        C = newC
+    # 군집 크기(검출 수 합) 순으로 팀 번호 재배열: 0,1 = 양 팀, 2 = 기타
+    sizes = [n_det[lab == j].sum() for j in range(k)]
+    order = np.argsort(sizes)[::-1]
+    remap = {int(order[r]): min(r, 2) for r in range(k)}
+    return {t: remap[int(l)] for t, l in zip(ids, lab)}
+
+
+def ground_positions(players_row, pano_w, pano_h, cam_height=4.0,
+                     el_top_deg=10.0, el_bottom_deg=-38.0):
+    """선수 발 위치(박스 하단 중앙)를 카메라 기준 지면 좌표(m)로 투영.
+
+    원통 파노라마: 열 ↔ yaw 선형, 행 ↔ tan(elevation) 선형. 초점거리는
+    f = H / (tan el_top − tan el_bottom) 으로 역산되므로 파라미터는 카메라
+    높이뿐. 반환 X = 터치라인 방향(우+), Y = 경기장 안쪽 깊이(m).
+    수평선 근처(el > −0.5°)는 기하적으로 불안정하므로 제외.
+
+    입력 행 형식: [cx, cy, w, h, (id), (h,s,v)] — 4열 이상이면 동작.
+    반환: [(X, Y, track_id, 원소 인덱스), ...]
+    """
+    t_top, t_bot = np.tan(np.deg2rad(el_top_deg)), np.tan(np.deg2rad(el_bottom_deg))
+    f = pano_h / (t_top - t_bot)
+    yaw_span = pano_w / f
+    out = []
+    for j, p in enumerate(players_row):
+        if len(p) < 4:
+            continue
+        foot_x, foot_y = p[0], p[1] + p[3] / 2.0
+        phi = (foot_x / max(pano_w - 1, 1) - 0.5) * yaw_span
+        t = t_top + (foot_y / max(pano_h - 1, 1)) * (t_bot - t_top)
+        if t > -0.0087:                  # el > -0.5도 — 수평선 근처 제외
+            continue
+        d = cam_height / (-t)
+        tid = int(p[4]) if len(p) >= 5 else -1
+        out.append((d * np.sin(phi), d * np.cos(phi), tid, j))
+    return out
 
 
 def _gaussian1d(x, sigma):

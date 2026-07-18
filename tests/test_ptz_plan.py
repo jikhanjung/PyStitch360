@@ -178,3 +178,49 @@ def test_player_bbox_format_compatible():
     plan = build_plan(_analysis(frames, [None] * len(frames), players4),
                       PANO_W, PANO_H, log=None)
     assert np.abs(plan["cx"][300:600] - 3500).max() < 400   # 2열 케이스와 동일
+
+
+def test_classify_teams_by_kit_color():
+    """유니폼 색으로 팀 2개 + 기타(심판) 분류 — ID별 다수 검출."""
+    from pystitch.core.ptz import classify_teams
+    frames = list(range(0, 300, 3))
+    rng = np.random.default_rng(2)
+    def det(tid, h, s, v):
+        return [1000.0, 900.0, 40.0, 90.0, tid,
+                h + rng.normal(0, 3), s + rng.normal(0, 8), v + rng.normal(0, 8)]
+    players = []
+    for _ in frames:
+        row = []
+        for tid in range(0, 8):     # 팀A: 파랑 (H~120 in OpenCV 0~180)
+            row.append(det(tid, 120, 180, 150))
+        for tid in range(10, 18):   # 팀B: 빨강 (H~0)
+            row.append(det(tid, 3, 190, 160))
+        row.append(det(30, 60, 200, 200))   # 심판: 형광 노랑-초록
+        players.append(row)
+    a = _analysis(frames, [None] * len(frames), players)
+    teams = classify_teams(a)
+    ta = {teams[t] for t in range(0, 8)}
+    tb = {teams[t] for t in range(10, 18)}
+    assert len(ta) == 1 and len(tb) == 1 and ta != tb   # 팀 내 일관, 팀 간 상이
+    assert ta | tb == {0, 1}                             # 상위 2개 군집이 팀
+    assert teams[30] == 2                                # 심판은 기타
+
+
+def test_ground_positions_geometry():
+    """지면 투영 기하: 화면 중앙 열은 X=0, 아래 행일수록 가깝고 대칭."""
+    from pystitch.core.ptz import ground_positions
+    W, H, h_cam = 5906, 1680, 4.0
+    # 중앙 열, 세로 여러 위치의 발끝 (박스 h=0 으로 발=cy)
+    cx = (W - 1) / 2                                # 픽셀 0..W-1 의 정중앙
+    rows = [[cx, y, 40.0, 0.0] for y in (600.0, 1000.0, 1500.0)]
+    pts = ground_positions(rows, W, H, cam_height=h_cam)
+    assert len(pts) == 3
+    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+    assert all(abs(x) < 1e-6 for x in xs)          # 중앙 열 → X=0
+    assert ys[0] > ys[1] > ys[2] > 0               # 위 행일수록 멀다
+    # 좌우 대칭
+    pl = ground_positions([[cx - 800, 1000.0, 40.0, 0.0]], W, H, cam_height=h_cam)
+    pr = ground_positions([[cx + 800, 1000.0, 40.0, 0.0]], W, H, cam_height=h_cam)
+    assert abs(pl[0][0] + pr[0][0]) < 1e-6 and abs(pl[0][1] - pr[0][1]) < 1e-6
+    # 수평선 근처는 제외
+    assert ground_positions([[cx, 300.0, 40.0, 0.0]], W, H) == []

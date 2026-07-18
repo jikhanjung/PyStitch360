@@ -12,7 +12,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QCheckBox
 from PyQt6.QtGui import QColor, QPainter
 from PyQt6.QtWidgets import (
     QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout, QLabel, QListWidget,
@@ -22,10 +22,56 @@ from PyQt6.QtWidgets import (
 
 from ..core.encoders import available_encoders
 from ..core.ptz import (
-    accept_ball_tracks, analyze_video, build_plan, link_ball_tracks,
-    ptz_available, render_plan,
+    accept_ball_tracks, analyze_video, build_plan, classify_teams,
+    ground_positions, link_ball_tracks, ptz_available, render_plan,
 )
 from .widgets import FramePane
+
+
+TEAM_COLORS = [(60, 60, 230), (230, 140, 40), (60, 200, 230)]   # BGR: 팀0, 팀1, 기타
+
+
+class RadarView(QWidget):
+    """탑다운 레이더: 카메라 기준 지면 좌표(m)의 선수(팀 색)·공 표시."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(180)
+        self.points: list = []      # (X, Y, team)
+        self.ball = None            # (X, Y) or None
+
+    def set_data(self, points, ball=None):
+        self.points, self.ball = list(points), ball
+        self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(30, 60, 34))
+        W, H = self.width(), self.height()
+        # 표시 범위: X -55..55m, Y 0..75m (카메라 = 하단 중앙)
+        def px(X, Y):
+            return (int((X + 55) / 110 * (W - 1)),
+                    int((1 - Y / 75) * (H - 1)))
+        p.setPen(QColor(255, 255, 255, 45))
+        for gx in range(-50, 51, 10):
+            p.drawLine(*px(gx, 0), *px(gx, 75))
+        for gy in range(0, 76, 10):
+            p.drawLine(*px(-55, gy), *px(55, gy))
+        p.setPen(QColor(255, 255, 255, 140))
+        p.drawLine(*px(0, 0), *px(0, 75))            # 하프라인 방향
+        for X, Y, team in self.points:
+            b, g, r = TEAM_COLORS[min(max(team, 0), 2)]
+            p.setBrush(QColor(r, g, b))
+            p.setPen(Qt.PenStyle.NoPen)
+            x, y = px(X, Y)
+            p.drawEllipse(x - 4, y - 4, 8, 8)
+        if self.ball is not None:
+            p.setBrush(QColor(255, 255, 255))
+            x, y = px(*self.ball)
+            p.drawEllipse(x - 3, y - 3, 6, 6)
+        p.setPen(QColor(255, 255, 255, 160))
+        p.drawText(6, 14, "레이더 (카메라 기준, 10m 격자)")
+        p.end()
 
 
 class TrackBar(QWidget):
@@ -98,7 +144,9 @@ class LinkWorker(QThread):
         self.analysis = analysis
 
     def run(self):
-        self.done.emit(link_ball_tracks(self.analysis))
+        linked = link_ball_tracks(self.analysis)
+        linked["teams"] = classify_teams(self.analysis)
+        self.done.emit(linked)
 
 
 class PlanWorker(QThread):
@@ -274,6 +322,7 @@ class PtzTab(QWidget):
         self._plan_worker = None
         self._link_worker = None
         self._linked = None
+        self._teams = {}
         self._play_worker = None
         self._playing = False
         self._proxy_worker = None
@@ -310,6 +359,12 @@ class PtzTab(QWidget):
         self.pane.clicked.connect(self._pane_clicked)
         mid.addWidget(self.pane, 1)
         side = QVBoxLayout()
+        self.radar = RadarView()
+        side.addWidget(self.radar)
+        self.check_players = QCheckBox("선수 표시 (팀 색)")
+        self.check_players.setChecked(True)
+        self.check_players.toggled.connect(lambda _: self._redraw())
+        side.addWidget(self.check_players)
         side.addWidget(QLabel("공 트랙 (더블클릭=이동)"))
         self.track_list = QListWidget()
         self.track_list.setMaximumWidth(240)
@@ -588,15 +643,19 @@ class PtzTab(QWidget):
         self._playing = False
         self.btn_play.setText("▶ 재생")
 
-    def _current_auto_ball(self):
-        """현재 시각 근처(±0.5s)의 자동 검출 공."""
+    def _current_sample(self):
+        """현재 시각 근처(±0.5s)의 분석 샘플 인덱스."""
         if self.analysis is None:
             return None
         idx = np.asarray(self.analysis["frames"])
         i = int(np.argmin(np.abs(idx - self.slider.value())))
         if abs(idx[i] - self.slider.value()) > 0.5 * self.fps:
             return None
-        return self.analysis["balls"][i]
+        return i
+
+    def _current_auto_ball(self):
+        i = self._current_sample()
+        return None if i is None else self.analysis["balls"][i]
 
     def _show_frame(self):
         """현재 프레임 디코딩 + 오버레이. 디코딩 결과는 캐시된다."""
@@ -655,6 +714,34 @@ class PtzTab(QWidget):
                 p = (int(kx * sc), int(ky * sc))
                 cv2.drawMarker(frame, p, (0, 0, 255), cv2.MARKER_CROSS,
                                max(20, int(60 * sc)), max(3, int(8 * sc)))
+        # 선수 박스(팀 색) + 레이더
+        si = self._current_sample()
+        radar_pts = []
+        if si is not None:
+            prow = self.analysis["players"][si]
+            if self.check_players.isChecked():
+                for pp in prow:
+                    if len(pp) < 4:
+                        continue
+                    team = self._teams.get(int(pp[4]), 2) if len(pp) >= 5 else 2
+                    color = TEAM_COLORS[min(max(team, 0), 2)]
+                    x1 = int((pp[0] - pp[2] / 2) * sc)
+                    y1 = int((pp[1] - pp[3] / 2) * sc)
+                    x2 = int((pp[0] + pp[2] / 2) * sc)
+                    y2 = int((pp[1] + pp[3] / 2) * sc)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color,
+                                  max(2, int(4 * sc)))
+            for X, Y, tid, j in ground_positions(prow, self.pano_w, self.pano_h):
+                radar_pts.append((X, Y, self._teams.get(tid, 2)))
+            ball_g = None
+            bb = self.analysis["balls"][si]
+            if bb is not None:
+                g = ground_positions([[bb[0], bb[1], 0.0, 0.0]],
+                                     self.pano_w, self.pano_h)
+                ball_g = (g[0][0], g[0][1]) if g else None
+            self.radar.set_data(radar_pts, ball_g)
+        else:
+            self.radar.set_data([], None)
         self.pane.set_frame(frame)
 
     # ------------------------------------------------------------ 키프레임
@@ -779,7 +866,11 @@ class PtzTab(QWidget):
 
     def _link_done(self, linked):
         self._linked = linked
-        self.log(f"[ptz] 트랙 연결 완료: {len(linked['tracks'])}개")
+        self._teams = linked.pop("teams", {}) or {}
+        n_team = sum(1 for v in self._teams.values() if v < 2)
+        self.log(f"[ptz] 트랙 연결 완료: {len(linked['tracks'])}개"
+                 + (f", 팀 분류 선수 ID {n_team}개" if self._teams else
+                    " (팀 분류: ID 포함 재분석 필요)"))
         self._recompute_tracks()
         self._plan_dirty()
 
