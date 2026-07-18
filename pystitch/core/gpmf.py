@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import struct
 import subprocess
+from .encoders import ffmpeg_bin
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,7 +34,7 @@ def extract_gpmf(video: str) -> bytes:
     if idx is None:
         raise ValueError(f"GPMF(gpmd) 트랙 없음: {video}")
     r = subprocess.run(
-        ["ffmpeg", "-v", "error", "-i", str(video),
+        [ffmpeg_bin(), "-v", "error", "-i", str(video),
          "-map", f"0:{idx}", "-c", "copy", "-f", "data", "-"],
         capture_output=True)
     if r.returncode != 0:

@@ -408,7 +408,7 @@ def render_plan(pano_path, out_path, plan, out_w=1920, out_h=1080,
     pano_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     pano_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
-    cmd = (["ffmpeg", "-y", "-v", "error",
+    cmd = ([ffmpeg_bin(), "-y", "-v", "error",
             "-f", "rawvideo", "-pix_fmt", "bgr24",
             "-s", f"{out_w}x{out_h}", "-r", f"{fps}", "-i", "-",
             "-i", str(pano_path), "-map", "0:v", "-map", "1:a?"]

@@ -14,10 +14,32 @@ CANDIDATES = {
 
 
 @lru_cache(maxsize=1)
+def ffmpeg_bin() -> str:
+    """ffmpeg 실행 파일 탐색: PATH → 플랫폼별 흔한 설치 위치.
+
+    Windows 에서 winget 설치 직후에는 이전에 뜬 터미널의 PATH 에 없어서
+    콤보가 libx264 폴백만 보여주는 사고가 있었다 — 직접 경로도 훑는다.
+    """
+    import os
+    import shutil
+    import sys
+    p = shutil.which("ffmpeg")
+    if p:
+        return p
+    if sys.platform == "win32":
+        for c in (os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Links\ffmpeg.exe"),
+                  r"C:\ffmpeg\bin\ffmpeg.exe",
+                  os.path.expandvars(r"%ProgramData%\chocolatey\bin\ffmpeg.exe")):
+            if os.path.exists(c):
+                return c
+    return "ffmpeg"
+
+
+@lru_cache(maxsize=1)
 def available_encoders() -> dict[str, str]:
     """실제 사용 가능한 인코더만 (표시 이름 → ffmpeg 인코더 이름)."""
     try:
-        out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+        out = subprocess.run([ffmpeg_bin(), "-hide_banner", "-encoders"],
                              capture_output=True, text=True, timeout=15).stdout
     except Exception:  # noqa: BLE001
         out = ""

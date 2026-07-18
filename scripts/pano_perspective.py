@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import cv2  # noqa: E402
 
-from pystitch.core.encoders import encoder_args  # noqa: E402
+from pystitch.core.encoders import encoder_args, ffmpeg_bin  # noqa: E402
 from pystitch.core.perspective import PerspectiveWarp  # noqa: E402
 
 
@@ -43,7 +43,7 @@ def main():
           f"horizon={horizon:.0f}px k={args.k} m={args.m}", flush=True)
 
     warp = PerspectiveWarp(w, h, horizon, args.k, args.m)
-    cmd = (["ffmpeg", "-y", "-v", "error",
+    cmd = ([ffmpeg_bin(), "-y", "-v", "error",
             "-f", "rawvideo", "-pix_fmt", "bgr24",
             "-s", f"{w}x{h}", "-r", f"{fps}", "-i", "-",
             "-i", args.pano, "-map", "0:v", "-map", "1:a?"]

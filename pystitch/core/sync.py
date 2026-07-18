@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import subprocess
+from .encoders import ffmpeg_bin
 import tempfile
 import wave
 from pathlib import Path
@@ -15,7 +16,7 @@ def _extract_audio(video: str, start: float, duration: float, sr: int) -> np.nda
         path = tmp.name
     try:
         subprocess.run(
-            ["ffmpeg", "-y", "-v", "error", "-ss", str(start), "-i", video,
+            [ffmpeg_bin(), "-y", "-v", "error", "-ss", str(start), "-i", video,
              "-t", str(duration), "-vn", "-ac", "1", "-ar", str(sr), "-f", "wav", path],
             check=True,
         )

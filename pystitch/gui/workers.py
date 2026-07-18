@@ -13,7 +13,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from ..core.align import Alignment, estimate_alignment
 from ..core.chapters import ChapteredVideo
-from ..core.encoders import encoder_args
+from ..core.encoders import encoder_args, ffmpeg_bin
 from ..core.lens import LensProfile
 from ..core.render import Renderer
 from ..core.sync import estimate_offset
@@ -214,7 +214,7 @@ class ExportWorker(QThread):
             concat_list = tf.name
 
         duration = total / fps
-        cmd = (["ffmpeg", "-y", "-v", "error",
+        cmd = ([ffmpeg_bin(), "-y", "-v", "error",
                 "-f", "rawvideo", "-pix_fmt", "bgr24",
                 "-s", f"{out_w}x{out_h}", "-r", f"{fps}", "-i", "-",
                 "-f", "concat", "-safe", "0", "-ss", f"{self.t_start}",
