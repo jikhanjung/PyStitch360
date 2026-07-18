@@ -165,11 +165,23 @@ class PtzTab(QWidget):
     def _open_pano(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "완성 파노라마 영상", self._video_dir(), "영상 (*.mp4 *.MP4 *.mkv)")
-        if not path:
-            return
+        if path:
+            self.open_path(path)
+
+    def open_path(self, path: str, quiet: bool = False):
+        """파노라마 열기 (프로젝트 복원 경로 포함). 분석/키프레임 사이드카 자동 로드."""
+        if not Path(path).exists():
+            from ..core.project import _cross_platform_candidates
+            for cand in _cross_platform_candidates(path):
+                if Path(cand).exists():
+                    path = cand
+                    break
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
-            QMessageBox.warning(self, "열기 실패", path)
+            if not quiet:
+                QMessageBox.warning(self, "열기 실패", path)
+            else:
+                self.log(f"[ptz] 파노라마 없음 — 건너뜀: {path}")
             return
         if self.cap is not None:
             self.cap.release()

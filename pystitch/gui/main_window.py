@@ -175,6 +175,10 @@ class MainWindow(QMainWindow):
                     "m": self.spin_persp_m.value(),
                 },
             },
+            # PTZ 분석/키프레임 자체는 파노라마 옆 사이드카에 저장되고,
+            # 프로젝트는 어떤 파노라마를 열어놨는지만 기억한다
+            "ptz": {"pano": str(self.ptz_tab.pano_path)
+                    if self.ptz_tab.pano_path else None},
         }
 
     def _save_project(self, as_new=False):
@@ -224,6 +228,9 @@ class MainWindow(QMainWindow):
         self.check_persp.setChecked(bool(persp.get("enabled", False)))
         self.spin_persp_k.setValue(float(persp.get("k", 0.3)))
         self.spin_persp_m.setValue(float(persp.get("m", 1.3)))
+        pano = d.get("ptz", {}).get("pano")
+        if pano:
+            self.ptz_tab.open_path(pano, quiet=True)
         self.segments = d.get("segments", [])
         self._refresh_segment_list()
         self._update_auto_labels()
