@@ -123,13 +123,15 @@ class AnalyzeWorker(QThread):
     log = pyqtSignal(str)
     failed = pyqtSignal(str)
 
-    def __init__(self, video_path: str):
+    def __init__(self, video_path: str, weights=None):
         super().__init__()
         self.video_path = video_path
+        self.weights = weights
 
     def run(self):
         try:
-            d = analyze_video(self.video_path, log=lambda s: self.log.emit(s))
+            d = analyze_video(self.video_path, weights=self.weights,
+                              log=lambda s: self.log.emit(s))
             self.done.emit(d)
         except Exception as e:  # noqa: BLE001
             self.failed.emit(str(e))
@@ -354,6 +356,18 @@ class PtzTab(QWidget):
         self.btn_proxy.clicked.connect(self._make_proxy)
         top.addWidget(self.btn_open)
         top.addWidget(self.lbl_file, 1)
+        top.addWidget(QLabel("모델"))
+        self.combo_model = QComboBox()
+        self.combo_model.addItems(["yolov8n (기본·빠름)", "yolov8s", "yolov8m",
+                                   "yolo11n", "yolo11s", "yolo11m (정확)",
+                                   "사용자 .pt 파일..."])
+        self.combo_model.setToolTip(
+            "공/선수 검출 모델. GPU 추론이라 큰 모델도 부담 적음 —\n"
+            "정확도가 아쉬우면 yolo11s/m 권장. 이름 모델은 최초 1회 자동 다운로드.")
+        saved_model = QSettings("PyStitch360", "PyStitch360").value("ptz_model", 0)
+        self.combo_model.setCurrentIndex(int(saved_model))
+        self.combo_model.currentIndexChanged.connect(self._model_changed)
+        top.addWidget(self.combo_model)
         top.addWidget(self.btn_proxy)
         top.addWidget(self.btn_analyze)
         v.addLayout(top)
@@ -596,6 +610,32 @@ class PtzTab(QWidget):
             except Exception as e:  # noqa: BLE001
                 self.log(f"[ptz] 분석 캐시 무시: {e}")
 
+    _MODEL_NAMES = ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt",
+                    "yolo11n.pt", "yolo11s.pt", "yolo11m.pt", None]
+
+    def _model_changed(self, i):
+        st = QSettings("PyStitch360", "PyStitch360")
+        if self._MODEL_NAMES[i] is None:      # 사용자 .pt
+            path, _ = QFileDialog.getOpenFileName(
+                self, "YOLO 가중치 (.pt)", "", "PyTorch 가중치 (*.pt)")
+            if path:
+                st.setValue("ptz_model_custom", path)
+            else:
+                self.combo_model.setCurrentIndex(0)
+                return
+        st.setValue("ptz_model", i)
+
+    def _model_weights(self):
+        """선택된 모델의 가중치 경로/이름 (None=내장 기본 yolov8n)."""
+        name = self._MODEL_NAMES[self.combo_model.currentIndex()]
+        if name is None:
+            custom = QSettings("PyStitch360", "PyStitch360").value("ptz_model_custom", "")
+            return str(custom) if custom else None
+        if name == "yolov8n.pt":
+            return None                        # presets/yolov8n.pt (내장)
+        local = Path(__file__).resolve().parents[2] / "presets" / name
+        return str(local) if local.exists() else name   # 없으면 자동 다운로드
+
     def _run_analyze(self):
         if self.pano_path is None or self._analyze_worker is not None \
                 and self._analyze_worker.isRunning():
@@ -603,8 +643,10 @@ class PtzTab(QWidget):
         self.btn_analyze.setEnabled(False)
         self.progress.setRange(0, 0)
         self.progress.setFormat("분석 중... (로그 참조)")
-        self.log("[ptz] 자동 분석 시작 — 완주 기준 ~20분, 진행은 로그에 표시")
-        w = AnalyzeWorker(str(self.pano_path))
+        weights = self._model_weights()
+        self.log(f"[ptz] 자동 분석 시작 (모델: {weights or 'yolov8n(내장)'}) — "
+                 "진행은 로그에 표시")
+        w = AnalyzeWorker(str(self.pano_path), weights=weights)
         w.log.connect(self.log)
         w.done.connect(self._analyze_done)
         w.failed.connect(self._analyze_failed)
