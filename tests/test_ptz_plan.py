@@ -158,6 +158,25 @@ def test_ignore_ranges_kill_track():
     assert spans2 == [] and np.all(np.isnan(ball2[:, 0]))   # 한 트랙 전체 기각
 
 
+def test_force_ranges_promote_rejected_track():
+    """승격(무시의 반대): 자동이 기각한 정지·고립 트랙도 되살린다. 무시 우선."""
+    from pystitch.core.ptz import accept_ball_tracks
+    frames = list(range(0, 900, 3))
+    balls = [[4900.0, 1350.0, 0.6] for _ in frames]        # 정지+고립 → 자동 기각
+    players = [[[float(x), 800.0] for x in np.linspace(1200, 4100, 8)]
+               for _ in frames]
+    a = _analysis(frames, balls, players)
+    _, _, spans0 = accept_ball_tracks(a)
+    assert spans0 == []                                    # 기본은 기각
+    _, ball1, spans1 = accept_ball_tracks(
+        a, force_ranges=[(450, 4900.0, 1350.0)])           # 그 자리 승격
+    assert len(spans1) == 1 and not np.isnan(ball1[50, 0])
+    _, _, spans2 = accept_ball_tracks(                      # 무시가 승격보다 우선
+        a, force_ranges=[(450, 4900.0, 1350.0)],
+        ignore_ranges=[(0, 897, 4900.0, 1350.0)])
+    assert spans2 == []
+
+
 def test_near_ball_widens_crop():
     """근경(화면 아래) 공은 크롭을 넓게, 원경 공은 타이트하게."""
     frames = list(range(0, 900, 3))

@@ -553,14 +553,17 @@ def _track_iso_frac(analysis, t, iso_px):
 
 def accept_ball_tracks(analysis, ball_conf=0.25, max_jump_per_frame=120.0,
                        decoy_static_px=30.0, decoy_iso_px=700.0,
-                       decoy_win_sec=3.0, ignore_ranges=None, linked=None,
-                       spot_radius=60.0, log=None):
+                       decoy_win_sec=3.0, ignore_ranges=None, force_ranges=None,
+                       linked=None, spot_radius=60.0, log=None):
     """공 트랙 수락/기각 (트랙 단위 오검출 처리).
 
     트랙 통계(정지/고립/중복)로 통째로 기각 — 정지 낙엽, 장외에서 움직이는
     다른 공, 순간 오검출. ignore_ranges 와 겹치는 트랙은 사용자 지정
-    오인식 — 무조건 기각. linked 에 link_ball_tracks 결과를 주면 연결
-    단계를 건너뛴다 (GUI 즉각 반응용).
+    오인식 — 무조건 기각. force_ranges (승격) 는 그 반대 — 자동 필터가
+    기각했더라도 그 (시각,자리) 를 지나는 트랙을 무조건 수락한다 (사용자가
+    회색 공을 클릭해 트랙으로 올린 경우). 무시가 승격보다 우선한다.
+    linked 에 link_ball_tracks 결과를 주면 연결 단계를 건너뛴다
+    (GUI 즉각 반응용).
 
     반환: (idx, ball(n,2), spans) — spans 는 수락 트랙의 (시작,끝) 프레임.
     """
@@ -599,14 +602,34 @@ def accept_ball_tracks(analysis, ball_conf=0.25, max_jump_per_frame=120.0,
             return True
         return False
 
+    def _forced(t):
+        # 승격 항목 (f, x, y): 그 시각(±0.5s) 부근에서 그 자리(spot_radius)
+        # 를 지나는 트랙이면 자동 필터를 우회해 수락.
+        if not force_ranges:
+            return False
+        for rng in force_ranges:
+            ff, fx, fy = rng[0], rng[1], rng[2]
+            for k, i in enumerate(t["i"]):
+                if abs(idx[i] - ff) <= 0.5 * fps and \
+                        np.hypot(t["pts"][k][0] - fx,
+                                 t["pts"][k][1] - fy) <= spot_radius:
+                    return True
+        return False
+
     accepted: list[dict] = []
     covered = np.zeros(n, bool)
     rej = {"static": 0, "isolated": 0, "overlap": 0, "user": 0}
     # 점수: 길이 + 선수 근접 가점 (경기 공은 선수 곁에 오래 머문다)
     order = sorted(tracks, key=lambda t: -(len(t["i"]) * (2.0 - _track_stats(t)[2])))
+    # 승격 트랙을 먼저 처리해 커버리지를 선점 (사용자 의도 우선). stable sort.
+    order = sorted(order, key=lambda t: 0 if _forced(t) else 1)
     for t in order:
         if _ignored(t):
             rej["user"] += 1            # 사용자 지정 오인식 구간
+            continue
+        if _forced(t):                  # 사용자 승격 — 자동 필터 우회
+            accepted.append(t)
+            covered[t["i"][0]:t["i"][-1] + 1] = True
             continue
         r80, dur, iso_frac = _track_stats(t)
         if r80 <= decoy_static_px and iso_frac > 0.5 and dur >= decoy_win_sec:
@@ -656,7 +679,8 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
                far_zoom=1.0,
                decoy_static_px=30.0, decoy_iso_px=700.0, decoy_win_sec=3.0,
                keyframes=None, kf_suppress_sec=1.5, kf_bridge_sec=8.0,
-               wide=False, ignore_ranges=None, linked=None, log=print):
+               wide=False, ignore_ranges=None, force_ranges=None,
+               linked=None, log=print):
     """검출 궤적 → 프레임별 (cx, cy, crop_w) 계획.
 
     - 공: conf 게이팅 + 점프 게이팅, gap_fill_sec 까지 선형 보간.
@@ -693,7 +717,7 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
         analysis, ball_conf=ball_conf, max_jump_per_frame=max_jump_per_frame,
         decoy_static_px=decoy_static_px, decoy_iso_px=decoy_iso_px,
         decoy_win_sec=decoy_win_sec, ignore_ranges=ignore_ranges,
-        linked=linked, log=log)
+        force_ranges=force_ranges, linked=linked, log=log)
 
     # --- 1.5 사용자 키프레임 병합 (자동보다 우선) -----------------------
     kf_idx = []
