@@ -259,6 +259,7 @@ class ExportWorker(QThread):
         t_writer.start()
 
         t0 = time.perf_counter()
+        last_log = t0
         done = 0
         try:
             while True:
@@ -282,7 +283,15 @@ class ExportWorker(QThread):
                 q_out.put(frame.tobytes())
                 done += 1
                 if done % 30 == 0:
-                    self.progress.emit(done, total, done / (time.perf_counter() - t0))
+                    now = time.perf_counter()
+                    fps_now = done / (now - t0)
+                    self.progress.emit(done, total, fps_now)
+                    if now - last_log >= 15:   # 로그 창에도 주기적으로 생존 신고
+                        last_log = now
+                        remain = (total - done) / max(fps_now, 1e-9) / 60
+                        self.log.emit(
+                            f"[export] {done}/{total} ({done/total:.0%}) "
+                            f"{fps_now:.1f}fps, 남은 시간 {remain:.0f}분")
         finally:
             # reader 가 가득 찬 큐에 막혀 있지 않도록 비운 뒤 종료 대기
             while not q_in.empty():
