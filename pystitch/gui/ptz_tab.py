@@ -404,14 +404,15 @@ class PtzTab(QWidget):
         # 하단 스트립: 공 목록 | 오인식 목록 | 레이더 (로그 위 공간 활용)
         strip = QHBoxLayout()
         col_ball = QVBoxLayout()
-        col_ball.addWidget(QLabel("공 — 자동 트랙 + 수동 지정 (↑↓=이동, →=오인식으로)"))
+        col_ball.addWidget(QLabel("공 — 자동 트랙 + 수동 지정 (↑↓=이동, →/Del=오인식으로)"))
         self.track_list = QListWidget()
         self.track_list.setMaximumHeight(150)
         # 클릭·키보드 화살표 선택 모두에서 이동 (currentRowChanged 는 둘 다 발생)
         self.track_list.currentRowChanged.connect(lambda _: self._goto_track())
-        QShortcut(QKeySequence(Qt.Key.Key_Right), self.track_list,
-                  activated=self._ignore_selected_track,
-                  context=Qt.ShortcutContext.WidgetShortcut)
+        for key in (Qt.Key.Key_Right, Qt.Key.Key_Delete):   # → 또는 Del = 오인식
+            QShortcut(QKeySequence(key), self.track_list,
+                      activated=self._ignore_selected_track,
+                      context=Qt.ShortcutContext.WidgetShortcut)
         col_ball.addWidget(self.track_list, 1)
         self.btn_ignore = QPushButton("현재 공 트랙 무시 (오인식)")
         self.btn_ignore.clicked.connect(self._ignore_current_track)
