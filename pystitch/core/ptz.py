@@ -186,13 +186,18 @@ def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
                             persist=True, verbose=False)[0]
             far_balls = []
             if model_far is not None:
+                # 정사각형 타일: 학습 크기(~640) 분포에 맞고 네이티브 해상도 유지
                 y0b, y1b = int(field_top), int(pano_h * far_band_frac)
                 strip = frame[y0b:y1b]
-                half = strip.shape[1] // 2
-                for x_off in (0, half - 100):          # 100px 겹침
-                    tile = strip[:, x_off:x_off + half + 100]
-                    r2 = model_far.predict(tile, imgsz=det_w, conf=0.15,
-                                           classes=[_CLS_BALL], verbose=False)[0]
+                th = strip.shape[0]
+                step = max(1, int(th * 0.85))          # 15% 겹침
+                offs = list(range(0, max(strip.shape[1] - th, 1), step))
+                offs.append(strip.shape[1] - th)       # 우측 끝 보장
+                tiles = [strip[:, x:x + th] for x in offs]
+                imgsz_t = (th + 31) // 32 * 32
+                results = model_far.predict(tiles, imgsz=imgsz_t, conf=0.15,
+                                            classes=[_CLS_BALL], verbose=False)
+                for x_off, r2 in zip(offs, results):
                     for b2 in r2.boxes:
                         bx1, by1, bx2, by2 = b2.xyxy[0].tolist()
                         far_balls.append([
