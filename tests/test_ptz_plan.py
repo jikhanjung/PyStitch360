@@ -311,3 +311,26 @@ def test_ignored_spot_samples_removed_from_accepted_tracks():
     # 그 앞뒤 진짜 궤적은 유지
     keep = (idx >= 200) & (idx < 430)
     assert np.isfinite(ball[keep, 0]).mean() > 0.9
+
+
+def test_multi_candidate_ball_survives_decoy_ignore():
+    """미끼가 conf 로 이겨도 진짜 공이 후보로 보존되고, 위치 지정 무시는
+    같은 시간대의 진짜 공 트랙을 살린다 (다중 후보의 핵심 가치)."""
+    from pystitch.core.ptz import accept_ball_tracks
+    frames = list(range(0, 900, 3))
+    cands, balls = [], []
+    for f in frames:
+        leaf = [4900.0, 1350.0, 0.6, 14.0, 14.0]        # 미끼: conf 우위
+        real = [1500.0 + 2.0 * f, 900.0, 0.4, 14.0, 14.0]
+        cands.append([leaf, real])
+        balls.append(leaf)                               # 구형 필드 = 최고 conf
+    a = _analysis(frames, balls)
+    a["ball_cands"] = cands
+    # 위치 지정 무시 (낙엽 자리) → 낙엽 트랙만 기각
+    _, ball, spans = accept_ball_tracks(
+        a, ignore_ranges=[(0, 897, 4900.0, 1350.0)])
+    assert len(spans) == 1
+    idx = np.array(a["frames"])
+    known = np.isfinite(ball[:, 0])
+    assert known.mean() > 0.9                            # 진짜 공 궤적 생존
+    assert np.all(np.abs(ball[known, 1] - 900.0) < 1)    # 낙엽(1350) 아님

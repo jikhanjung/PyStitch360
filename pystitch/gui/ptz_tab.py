@@ -106,7 +106,8 @@ class TrackBar(QWidget):
         for f0, f1 in self.spans:
             p.fillRect(self._x(f0), 2, max(1, self._x(f1) - self._x(f0)), h - 4,
                        QColor(70, 200, 90))
-        for f0, f1 in self.ignores:
+        for r in self.ignores:
+            f0, f1 = r[0], r[1]
             p.fillRect(self._x(f0), 2, max(1, self._x(f1) - self._x(f0)), h - 4,
                        QColor(220, 70, 60))
         for kf in self.kfs:
@@ -765,8 +766,11 @@ class PtzTab(QWidget):
         b = self._current_auto_ball()
         if b is not None:
             p = (int(b[0] * sc), int(b[1] * sc))
-            in_ignore = any(f0 <= f <= f1 for f0, f1 in
-                            ((r[0], r[1]) for r in self.ignores))
+            in_ignore = any(
+                r[0] <= f <= r[1] and (len(r) < 4 or
+                                       ((r[2] - b[0]) ** 2 + (r[3] - b[1]) ** 2)
+                                       ** 0.5 <= 150)
+                for r in self.ignores)
             in_track = any(f0 <= f <= f1 for f0, f1 in self.track_spans)
             if in_ignore:
                 # 사용자가 취소한 검출: 빨간 X + 라벨
@@ -861,10 +865,12 @@ class PtzTab(QWidget):
         self.track_list.blockSignals(False)
         # 아래 목록 — 오인식만
         self.kf_list.clear()
-        for f0, f1 in self.ignores:
+        for r in self.ignores:
+            f0, f1 = r[0], r[1]
+            pos = f"  @({r[2]:.0f},{r[3]:.0f})" if len(r) >= 4 else ""
             self.kf_list.addItem(
                 f"{int(f0/self.fps//60):02d}:{f0/self.fps%60:04.1f}~"
-                f"{int(f1/self.fps//60):02d}:{f1/self.fps%60:04.1f}  공 아님")
+                f"{int(f1/self.fps//60):02d}:{f1/self.fps%60:04.1f}  공 아님{pos}")
 
     # 기존 호출부 호환 별칭
     _refresh_kf_list = _refresh_lists
@@ -1017,13 +1023,15 @@ class PtzTab(QWidget):
                 try:
                     spans = [(int(f0), int(f1))]
                     if self._linked is not None:
-                        # 같은 자리 반복 정적 트랙 일괄 수집 (낙엽·마킹)
+                        # 같은 자리 반복 정적 트랙 일괄 수집 (낙엽·마킹).
+                        # 위치 포함 4-요소 — 같은 시간대의 진짜 공 트랙은 보호
                         spans = same_spot_spans(self._linked, f0, f1) or spans
                     added = 0
-                    for lo, hi in spans:
+                    for sp in spans:
+                        lo, hi = sp[0], sp[1]
                         if not any(a <= lo and hi <= b for a, b in
                                    ((r[0], r[1]) for r in self.ignores)):
-                            self.ignores.append([lo, hi])
+                            self.ignores.append(list(sp))
                             added += 1
                     self.ignores.sort()
                     self._save_keyframes()

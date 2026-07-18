@@ -167,6 +167,7 @@ def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
     pano_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     field_top = field_top_frac * pano_h
     frames_idx, balls, players = [], [], []
+    ball_cands = []
     import time
     t0 = time.perf_counter()
     i = 0
@@ -206,7 +207,7 @@ def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
                             round(float(b2.conf[0]), 3),
                             round(bx2 - bx1, 1), round(by2 - by1, 1)])
             hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-            best, best_conf = None, -1.0
+            bcands = []                            # 이 샘플의 공 후보들
             prow = []
             for b_ in r.boxes:
                 x1, y1, x2, y2 = b_.xyxy[0].tolist()
@@ -215,11 +216,9 @@ def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
                 if cys < field_top:
                     continue                       # 장외 (원경 트랙·관중석)
                 if int(b_.cls[0]) == _CLS_BALL:
-                    if conf > best_conf:
-                        best, best_conf = [round(cxs, 1), round(cys, 1),
-                                           round(conf, 3),
-                                           round((x2 - x1) / scale, 1),
-                                           round((y2 - y1) / scale, 1)], conf
+                    bcands.append([round(cxs, 1), round(cys, 1), round(conf, 3),
+                                   round((x2 - x1) / scale, 1),
+                                   round((y2 - y1) / scale, 1)])
                     continue
                 tid = int(b_.id[0]) if b_.id is not None else -1
                 # 유니폼 색: 박스 상반신(위 절반, 가로 중앙 60%) HSV 평균
@@ -231,11 +230,20 @@ def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
                 prow.append([round(cxs, 1), round(cys, 1),
                              round((x2 - x1) / scale, 1), round((y2 - y1) / scale, 1),
                              tid, round(hm, 1), round(sm, 1), round(vm, 1)])
-            for fb in far_balls:                   # 원경 네이티브 검출과 병합
-                if fb[2] > best_conf:
-                    best, best_conf = fb, fb[2]
+            # 원경 네이티브 검출 병합 → 근접 중복 제거 후 상위 3개 저장.
+            # 후보 다수 보존: 미끼가 conf 를 이겨도 진짜 공이 살아남아
+            # 트랙 연결 단계에서 별도 트랙으로 경쟁할 수 있다.
+            bcands += far_balls
+            bcands.sort(key=lambda b: -b[2])
+            kept = []
+            for b in bcands:
+                if all(np.hypot(b[0] - k[0], b[1] - k[1]) > 30 for k in kept):
+                    kept.append(b)
+                if len(kept) == 3:
+                    break
             frames_idx.append(i)
-            balls.append(best)
+            balls.append(kept[0] if kept else None)
+            ball_cands.append(kept)
             players.append(prow)
             if len(frames_idx) % 300 == 0:
                 el = time.perf_counter() - t0
@@ -248,7 +256,8 @@ def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
             "pano_w": pano_w, "pano_h": pano_h,
             "detect_every": detect_every, "det_w": det_w,
             "field_top_frac": field_top_frac,
-            "frames": frames_idx, "balls": balls, "players": players}
+            "frames": frames_idx, "balls": balls, "ball_cands": ball_cands,
+            "players": players}
 
 
 def classify_teams(analysis, k=3):
@@ -331,20 +340,21 @@ def same_spot_spans(linked, f0, f1, radius=60.0, static_r80=40.0):
     자체 요동(r80)이 static_r80 이하인 트랙을 모두 모아, 한 번의 무시로
     일괄 처리할 수 있게 한다. 반환: [(시작, 끝) 프레임, ...] (기준 포함).
     """
-    idx, cand, tracks = linked["idx"], linked["cand"], linked["tracks"]
-    ref = [t for t in tracks if idx[t[0]] <= f1 and f0 <= idx[t[-1]]]
+    idx, tracks = linked["idx"], linked["tracks"]
+    ref = [t for t in tracks if idx[t["i"][0]] <= f1 and f0 <= idx[t["i"][-1]]]
     if not ref:
         return []
-    ref_med = np.median(cand[np.concatenate(ref)], axis=0)
+    ref_med = np.median(np.vstack([t["pts"] for t in ref]), axis=0)
     out = []
     for t in tracks:
-        pts = cand[t]
-        med = np.median(pts, axis=0)
+        med = np.median(t["pts"], axis=0)
         if np.hypot(*(med - ref_med)) > radius:
             continue
-        r80 = float(np.percentile(np.hypot(*(pts - med).T), 80)) if len(t) > 1 else 0.0
+        r80 = (float(np.percentile(np.hypot(*(t["pts"] - med).T), 80))
+               if len(t["i"]) > 1 else 0.0)
         if r80 <= static_r80:
-            out.append((int(idx[t[0]]), int(idx[t[-1]])))
+            out.append((int(idx[t["i"][0]]), int(idx[t["i"][-1]]),
+                        round(float(med[0]), 1), round(float(med[1]), 1)))
     return sorted(out)
 
 
@@ -361,7 +371,7 @@ def export_training_labels(analysis, keyframes=None, ignore_ranges=None,
     """
     idx, _, spans = accept_ball_tracks(analysis, ignore_ranges=ignore_ranges,
                                        linked=linked, log=None)
-    ig = [tuple(r) for r in (ignore_ranges or [])]
+    ig = [(r[0], r[1]) for r in (ignore_ranges or [])]
     out = []
     for i, b in enumerate(analysis["balls"]):
         if b is None:
@@ -397,48 +407,64 @@ def _gaussian1d(x, sigma):
     return np.convolve(pad, k, "valid")
 
 
+def _ball_candidates(analysis, ball_conf):
+    """샘플별 공 후보 [(x, y, conf), ...] — 신형 ball_cands 우선, 구형은 balls."""
+    bc = analysis.get("ball_cands")
+    if bc is not None:
+        return [[(p[0], p[1], p[2]) for p in row if p[2] >= ball_conf]
+                for row in bc]
+    return [[(b[0], b[1], b[2])] if b is not None and b[2] >= ball_conf else []
+            for b in analysis["balls"]]
+
+
 def link_ball_tracks(analysis, ball_conf=0.25, max_jump_per_frame=120.0):
     """공 후보 트랙 연결 (느린 단계 — 분석에만 의존하므로 캐시 가능).
 
-    반환 dict {idx, cand, iso, tracks} 를 accept_ball_tracks(linked=...) 에
-    넘기면 무시 구간 변경 시 수락 단계만 다시 돌면 된다 (즉각 반응).
+    샘플당 후보가 여러 개면 conf 순으로 각자 가장 가까운 트랙에 배정
+    (트랙당 샘플당 1개). 남는 후보는 새 트랙 — 미끼와 진짜 공이 같은
+    시간대에 별도 트랙으로 공존하고, 수락/무시가 트랙 단위로 고른다.
+    반환 dict 를 accept_ball_tracks(linked=...) 에 넘기면 수락 단계만
+    다시 돌면 된다 (즉각 반응).
     """
     fps = analysis["fps"]
     idx = np.array(analysis["frames"])
     n = len(idx)
-    cand = np.array([b[:2] if b is not None and b[2] >= ball_conf else (np.nan, np.nan)
-                     for b in analysis["balls"]])
-    # 고립도: 선수 검출이 있는 샘플에서만 판정 가능 (없으면 0 = 보수적 유지)
-    iso = np.zeros(n)
-    for i in range(n):
-        if not np.isnan(cand[i, 0]) and analysis["players"][i]:
-            pl = np.asarray(analysis["players"][i], dtype=float)[:, :2]
-            iso[i] = np.hypot(*(pl - cand[i]).T).min()
+    cands = _ball_candidates(analysis, ball_conf)
 
     assoc_gap = 2.5 * fps               # 이 이상 끊기면 새 트랙
-    tracks: list[list[int]] = []        # 샘플 인덱스 목록
+    tracks: list[dict] = []             # {"i": [샘플], "x": [], "y": []}
     for i in range(n):
-        if np.isnan(cand[i, 0]):
-            continue
-        best, best_d = None, None
-        for t in tracks:
-            gap = idx[i] - idx[t[-1]]
-            if not 0 < gap <= assoc_gap:
-                continue
-            # 최근 5점 평균 기준 — 검출 노이즈로 트랙이 갈라지지 않게.
-            # +150px 은 빠른 이동 시 평균이 뒤처지는 지연 보상.
-            # 거리 상한 700px: 긴 공백 뒤 원거리 오브젝트(낙엽 등)가 공 트랙에
-            # 흡수되는 것을 차단 — 장거리 패스는 새 트랙으로 갈라져도
-            # 시간 중복이 없으면 그대로 수락되므로 손실이 없다.
-            ref = cand[t[-5:]].mean(axis=0)
-            d = float(np.hypot(*(cand[i] - ref)))
-            if (d <= min(max_jump_per_frame * gap, 700) + 150
-                    and (best_d is None or d < best_d)):
-                best, best_d = t, d
-        if best is None:
-            tracks.append([i])
-        else:
-            best.append(i)
+        used = set()
+        for x, y, c in sorted(cands[i], key=lambda p: -p[2]):
+            best, best_d = None, None
+            for ti, t in enumerate(tracks):
+                if ti in used:
+                    continue
+                gap = idx[i] - idx[t["i"][-1]]
+                if not 0 < gap <= assoc_gap:
+                    continue
+                # 최근 5점 평균 기준 — 검출 노이즈로 트랙이 갈라지지 않게.
+                # +150px 은 빠른 이동 시 평균 지연 보상. 거리 상한 700px:
+                # 긴 공백 뒤 원거리 오브젝트가 흡수되는 것을 차단.
+                rx = sum(t["x"][-5:]) / len(t["x"][-5:])
+                ry = sum(t["y"][-5:]) / len(t["y"][-5:])
+                d = float(np.hypot(x - rx, y - ry))
+                if (d <= min(max_jump_per_frame * gap, 700) + 150
+                        and (best_d is None or d < best_d)):
+                    best, best_d = ti, d
+            if best is None:
+                tracks.append({"i": [i], "x": [x], "y": [y]})
+                used.add(len(tracks) - 1)
+            else:
+                t = tracks[best]
+                t["i"].append(i)
+                t["x"].append(x)
+                t["y"].append(y)
+                used.add(best)
+    for t in tracks:
+        t["i"] = np.array(t["i"])
+        t["pts"] = np.column_stack([t["x"], t["y"]]).astype(float)
+        del t["x"], t["y"]
 
     # 샘플별 선수 통계 프리컴퓨트 (공 부재 시 목표/줌 계산용 — 캐시 대상)
     p_cnt = np.zeros(n, int)
@@ -454,8 +480,21 @@ def link_ball_tracks(analysis, ball_conf=0.25, max_jump_per_frame=120.0):
             keep = pl[np.abs(pl[:, 0] - med) < analysis.get("pano_w", 5906) * 0.25]
             p_tx[i], p_ty[i] = keep[:, 0].mean(), keep[:, 1].mean()
             p_span[i] = np.percentile(pl[:, 0], 90) - np.percentile(pl[:, 0], 10)
-    return {"idx": idx, "cand": cand, "iso": iso, "tracks": tracks, "fps": fps,
+    return {"idx": idx, "tracks": tracks, "fps": fps,
             "p_cnt": p_cnt, "p_tx": p_tx, "p_ty": p_ty, "p_span": p_span}
+
+
+def _track_iso_frac(analysis, t, iso_px):
+    """트랙 점별 최근접 선수 거리 > iso_px 비율 (선수 없으면 0=근접 취급)."""
+    far = 0
+    for k, i in enumerate(t["i"]):
+        prow = analysis["players"][int(i)]
+        if not prow:
+            continue
+        pl = np.asarray(prow, dtype=float)[:, :2]
+        if np.hypot(*(pl - t["pts"][k]).T).min() > iso_px:
+            far += 1
+    return far / max(len(t["i"]), 1)
 
 
 def accept_ball_tracks(analysis, ball_conf=0.25, max_jump_per_frame=120.0,
@@ -473,30 +512,44 @@ def accept_ball_tracks(analysis, ball_conf=0.25, max_jump_per_frame=120.0,
     """
     if linked is None:
         linked = link_ball_tracks(analysis, ball_conf, max_jump_per_frame)
-    idx, cand, iso = linked["idx"], linked["cand"], linked["iso"]
-    tracks, fps = linked["tracks"], linked["fps"]
+    idx, tracks, fps = linked["idx"], linked["tracks"], linked["fps"]
     n = len(idx)
 
     def _track_stats(t):
-        pts = cand[t]
-        # 정지 판정은 중앙값 기준 80% 반경 — 트랙이 흡수한 이탈 샘플에 강건
+        pts = t["pts"]
+        # 정지 판정은 중앙값 기준 80% 반경 — 흡수된 이탈 샘플에 강건
         med = np.median(pts, axis=0)
         r80 = float(np.percentile(np.hypot(*(pts - med).T), 80))
-        dur = (idx[t[-1]] - idx[t[0]]) / fps
-        iso_frac = float(np.mean(iso[t] > decoy_iso_px))
-        return r80, dur, iso_frac
+        dur = (idx[t["i"][-1]] - idx[t["i"][0]]) / fps
+        if "iso_frac" not in t:
+            t["iso_frac"] = _track_iso_frac(analysis, t, decoy_iso_px)
+        return r80, dur, t["iso_frac"]
 
     def _ignored(t):
+        # 항목: (f0, f1) = 시간만 (구형), (f0, f1, x, y) = 시간+자리.
+        # 다중 후보에서는 같은 시간대에 미끼/진짜 공 트랙이 공존하므로
+        # 위치가 있으면 그 자리(150px)의 트랙만 기각한다.
         if not ignore_ranges:
             return False
-        f0, f1 = idx[t[0]], idx[t[-1]]
-        return any(f0 <= hi and lo <= f1 for lo, hi in ignore_ranges)
+        f0, f1 = idx[t["i"][0]], idx[t["i"][-1]]
+        med = None
+        for rng in ignore_ranges:
+            lo, hi = rng[0], rng[1]
+            if not (f0 <= hi and lo <= f1):
+                continue
+            if len(rng) >= 4:
+                if med is None:
+                    med = np.median(t["pts"], axis=0)
+                if np.hypot(med[0] - rng[2], med[1] - rng[3]) > 150:
+                    continue
+            return True
+        return False
 
-    accepted: list[list[int]] = []
+    accepted: list[dict] = []
     covered = np.zeros(n, bool)
     rej = {"static": 0, "isolated": 0, "overlap": 0, "user": 0}
     # 점수: 길이 + 선수 근접 가점 (경기 공은 선수 곁에 오래 머문다)
-    order = sorted(tracks, key=lambda t: -(len(t) * (2.0 - _track_stats(t)[2])))
+    order = sorted(tracks, key=lambda t: -(len(t["i"]) * (2.0 - _track_stats(t)[2])))
     for t in order:
         if _ignored(t):
             rej["user"] += 1            # 사용자 지정 오인식 구간
@@ -510,7 +563,7 @@ def accept_ball_tracks(analysis, ball_conf=0.25, max_jump_per_frame=120.0,
         if dur >= 5.0 and iso_frac > 0.5:
             rej["isolated"] += 1        # 선수와 무관한 물체 (낙엽·장외 공)
             continue
-        lo, hi = t[0], t[-1]
+        lo, hi = t["i"][0], t["i"][-1]
         if covered[lo:hi + 1].mean() > 0.5:
             rej["overlap"] += 1         # 이미 수락된 트랙과 시간 중복 (경합 오검출)
             continue
@@ -519,24 +572,26 @@ def accept_ball_tracks(analysis, ball_conf=0.25, max_jump_per_frame=120.0,
 
     # 무시된 트랙들의 위치(스팟): 수락 트랙에 흡수된 같은 자리 샘플도
     # 제거해, 크롭이 오인식 지점으로 끌려가는 것을 막는다 (시간+공간 무시)
-    spots = [np.median(cand[t], axis=0) for t in tracks
-             if _ignored(t) and len(t) >= 2]
+    spots = [np.median(t["pts"], axis=0) for t in tracks
+             if _ignored(t) and len(t["i"]) >= 2]
     ball = np.full((n, 2), np.nan)
     dropped_spot = 0
-    for t in accepted:
-        for i in t:
-            if spots and min(float(np.hypot(*(cand[i] - sp)))
+    for t in accepted:                  # 점수 순 — 먼저 수락된 트랙이 우선
+        for k, i in enumerate(t["i"]):
+            if not np.isnan(ball[i, 0]):
+                continue
+            if spots and min(float(np.hypot(*(t["pts"][k] - sp)))
                              for sp in spots) <= spot_radius:
                 dropped_spot += 1
                 continue
-            ball[i] = cand[i]
+            ball[i] = t["pts"][k]
     if log and dropped_spot:
         log(f"[plan] 무시 지점 근처 샘플 {dropped_spot}개 추가 제거")
     if log and (tracks or accepted):
         log(f"[plan] 공 트랙 {len(tracks)}개 → 수락 {len(accepted)}개 "
             f"(기각: 정지미끼 {rej['static']}, 장외고립 {rej['isolated']}, "
             f"중복 {rej['overlap']}, 사용자무시 {rej['user']})")
-    spans = sorted((int(idx[t[0]]), int(idx[t[-1]])) for t in accepted)
+    spans = sorted((int(idx[t["i"][0]]), int(idx[t["i"][-1]])) for t in accepted)
     return idx, ball, spans
 
 
