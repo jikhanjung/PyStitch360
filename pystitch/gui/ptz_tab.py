@@ -24,6 +24,7 @@ from ..core.encoders import available_encoders
 from ..core.ptz import (
     accept_ball_tracks, analyze_video, build_plan, classify_teams,
     ground_positions, link_ball_tracks, ptz_available, render_plan,
+    same_spot_spans,
 )
 from .widgets import FramePane
 
@@ -923,14 +924,26 @@ class PtzTab(QWidget):
             if f0 <= f <= f1:
                 QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
                 try:
-                    self.ignores.append([int(f0), int(f1)])
+                    spans = [(int(f0), int(f1))]
+                    if self._linked is not None:
+                        # 같은 자리 반복 정적 트랙 일괄 수집 (낙엽·마킹)
+                        spans = same_spot_spans(self._linked, f0, f1) or spans
+                    added = 0
+                    for lo, hi in spans:
+                        if not any(a <= lo and hi <= b for a, b in
+                                   ((r[0], r[1]) for r in self.ignores)):
+                            self.ignores.append([lo, hi])
+                            added += 1
+                    self.ignores.sort()
                     self._save_keyframes()
                     self._recompute_tracks()
                     self._refresh_kf_list()
                     self._redraw()
                 finally:
                     QApplication.restoreOverrideCursor()
-                self.log(f"[ptz] 트랙 무시: {f0/self.fps:.1f}s ~ {f1/self.fps:.1f}s")
+                extra = f" (같은 자리 반복 포함 {added}개 구간)" if added > 1 else ""
+                self.log(f"[ptz] 트랙 무시: {f0/self.fps:.1f}s ~ "
+                         f"{f1/self.fps:.1f}s{extra}")
                 # 검수 흐름: 다음 트랙 자동 선택 + 이동
                 nxt = [i for i, sp in enumerate(self.track_spans) if sp[0] > f0]
                 row = nxt[0] if nxt else len(self.track_spans) - 1

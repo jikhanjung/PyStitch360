@@ -294,6 +294,31 @@ def ground_positions(players_row, pano_w, pano_h, cam_height=4.0,
     return out
 
 
+def same_spot_spans(linked, f0, f1, radius=60.0, static_r80=40.0):
+    """기준 트랙(f0~f1 구간)과 '같은 자리'의 정적 트랙 구간 전부 반환.
+
+    낙엽·마킹 같은 오브젝트는 한 위치에서 시간대만 다른 여러 트랙으로
+    쪼개져 반복 검출된다. 기준 트랙의 중앙 위치에서 radius 이내이고
+    자체 요동(r80)이 static_r80 이하인 트랙을 모두 모아, 한 번의 무시로
+    일괄 처리할 수 있게 한다. 반환: [(시작, 끝) 프레임, ...] (기준 포함).
+    """
+    idx, cand, tracks = linked["idx"], linked["cand"], linked["tracks"]
+    ref = [t for t in tracks if idx[t[0]] <= f1 and f0 <= idx[t[-1]]]
+    if not ref:
+        return []
+    ref_med = np.median(cand[np.concatenate(ref)], axis=0)
+    out = []
+    for t in tracks:
+        pts = cand[t]
+        med = np.median(pts, axis=0)
+        if np.hypot(*(med - ref_med)) > radius:
+            continue
+        r80 = float(np.percentile(np.hypot(*(pts - med).T), 80)) if len(t) > 1 else 0.0
+        if r80 <= static_r80:
+            out.append((int(idx[t[0]]), int(idx[t[-1]])))
+    return sorted(out)
+
+
 def export_training_labels(analysis, keyframes=None, ignore_ranges=None,
                            linked=None):
     """사용자 마킹을 커스텀 공 검출 모델 학습 라벨로 변환.
