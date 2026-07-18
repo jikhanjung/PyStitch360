@@ -931,6 +931,12 @@ class PtzTab(QWidget):
                 finally:
                     QApplication.restoreOverrideCursor()
                 self.log(f"[ptz] 트랙 무시: {f0/self.fps:.1f}s ~ {f1/self.fps:.1f}s")
+                # 검수 흐름: 다음 트랙 자동 선택 + 이동
+                nxt = [i for i, sp in enumerate(self.track_spans) if sp[0] > f0]
+                row = nxt[0] if nxt else len(self.track_spans) - 1
+                if row >= 0:
+                    self.track_list.setCurrentRow(row)
+                    self.slider.setValue(int(self.track_spans[row][0]))
                 return
         QMessageBox.information(self, "무시", "현재 시각을 덮는 공 트랙이 없습니다.")
 
