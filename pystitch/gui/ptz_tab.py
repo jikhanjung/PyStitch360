@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QCheckBox
-from PyQt6.QtGui import QColor, QPainter
+from PyQt6.QtGui import QColor, QKeySequence, QPainter, QShortcut
 from PyQt6.QtWidgets import (
     QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout, QLabel, QListWidget,
     QMessageBox, QProgressBar, QPushButton, QSlider, QSpinBox, QVBoxLayout,
@@ -371,6 +371,9 @@ class PtzTab(QWidget):
         self.track_list.setMaximumWidth(240)
         # 클릭·키보드 화살표 선택 모두에서 이동 (currentRowChanged 는 둘 다 발생)
         self.track_list.currentRowChanged.connect(lambda _: self._goto_track())
+        QShortcut(QKeySequence(Qt.Key.Key_Delete), self.track_list,
+                  activated=self._ignore_selected_track,
+                  context=Qt.ShortcutContext.WidgetShortcut)
         side.addWidget(self.track_list, 1)
         side.addWidget(QLabel("키프레임·무시 구간 (더블클릭=이동)"))
         self.kf_list = QListWidget()
@@ -917,6 +920,13 @@ class PtzTab(QWidget):
             prv = [sp for sp in self.track_spans if sp[0] < f - 1]
             if prv:
                 self.slider.setValue(int(prv[-1][0]))
+
+    def _ignore_selected_track(self):
+        """트랙 목록에서 Del — 선택된 트랙을 무시로 보냄."""
+        row = self.track_list.currentRow()
+        if 0 <= row < len(self.track_spans):
+            self.slider.setValue(int(self.track_spans[row][0]))
+            self._ignore_current_track()
 
     def _ignore_current_track(self):
         """현재 시각을 덮는 수락 트랙을 통째로 무시 목록에 추가."""
