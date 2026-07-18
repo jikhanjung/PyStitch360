@@ -16,8 +16,8 @@ from PyQt6.QtWidgets import QApplication, QCheckBox
 from PyQt6.QtGui import QColor, QKeySequence, QPainter, QShortcut
 from PyQt6.QtWidgets import (
     QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout, QLabel, QListWidget,
-    QMessageBox, QProgressBar, QPushButton, QSlider, QSpinBox, QVBoxLayout,
-    QWidget,
+    QMenu, QMessageBox, QProgressBar, QPushButton, QSlider, QSpinBox,
+    QVBoxLayout, QWidget,
 )
 
 from ..core.encoders import available_encoders
@@ -171,17 +171,19 @@ class PlanWorker(QThread):
     done = pyqtSignal(dict, tuple)   # plan, (out_w, out_h)
 
     def __init__(self, analysis, keyframes, ignores, wide, linked=None,
-                 far_zoom=1.0):
+                 far_zoom=1.0, promotes=None):
         super().__init__()
-        self.args = (analysis, keyframes, ignores, wide, linked, far_zoom)
+        self.args = (analysis, keyframes, ignores, wide, linked, far_zoom,
+                     promotes or [])
 
     def run(self):
-        analysis, kfs, ignores, wide, linked, far_zoom = self.args
+        analysis, kfs, ignores, wide, linked, far_zoom, promotes = self.args
         try:
             out_w, out_h = (2560, 1080) if wide else (1920, 1080)
             plan = build_plan(analysis, analysis["pano_w"], analysis["pano_h"],
                               out_w=out_w, out_h=out_h, keyframes=kfs,
-                              wide=wide, ignore_ranges=ignores, linked=linked,
+                              wide=wide, ignore_ranges=ignores,
+                              force_ranges=promotes, linked=linked,
                               far_zoom=far_zoom,
                               sigma_slow=3.0 if wide else 1.2,
                               fast_err_px=800.0 if wide else 400.0, log=None)
@@ -286,22 +288,24 @@ class PtzRenderWorker(QThread):
     failed = pyqtSignal(str)
 
     def __init__(self, pano_path, out_path, analysis, keyframes, codec, crf,
-                 wide=False, ignores=None, far_zoom=1.0):
+                 wide=False, ignores=None, far_zoom=1.0, promotes=None):
         super().__init__()
         self.args = (pano_path, out_path, analysis, keyframes, codec, crf, wide,
-                     ignores or [], far_zoom)
+                     ignores or [], far_zoom, promotes or [])
         self._cancel = False
 
     def cancel(self):
         self._cancel = True
 
     def run(self):
-        pano, out, analysis, kfs, codec, crf, wide, ignores, far_zoom = self.args
+        (pano, out, analysis, kfs, codec, crf, wide, ignores, far_zoom,
+         promotes) = self.args
         try:
             out_w, out_h = (2560, 1080) if wide else (1920, 1080)
             plan = build_plan(analysis, analysis["pano_w"], analysis["pano_h"],
                               out_w=out_w, out_h=out_h, keyframes=kfs,
                               wide=wide, ignore_ranges=ignores,
+                              force_ranges=promotes,
                               far_zoom=far_zoom,
                               sigma_slow=3.0 if wide else 1.2,
                               fast_err_px=800.0 if wide else 400.0,
@@ -335,7 +339,11 @@ class PtzTab(QWidget):
         self.analysis: dict | None = None
         self.keyframes: list[list] = []   # [frame, x, y]
         self.ignores: list[list] = []     # [f0, f1] 사용자 지정 오인식 구간
+        self.promotes: list[list] = []    # [f, x, y] 회색 공 → 트랙 강제 수락
         self.track_spans: list = []
+        self._accepted_ball = None        # accept_ball_tracks 의 샘플별 수락 공
+        self._hover = None                # 커서가 가리키는 오브젝트
+        self._hover_key = None            # hover 변경 감지 키
         self._analyze_worker = None
         self._render_worker = None
         self._plan_worker = None
@@ -388,8 +396,11 @@ class PtzTab(QWidget):
         v.addLayout(top)
 
         # 영상은 전체 폭 사용, 목록·레이더는 하단 스트립으로
-        self.pane = FramePane("클릭 = 현재 시각의 공 위치 키프레임", interactive=True)
+        self.pane = FramePane("클릭 = 오브젝트 조작 / 빈 곳 = 키프레임, 우클릭 = 메뉴",
+                              interactive=True)
         self.pane.clicked.connect(self._pane_clicked)
+        self.pane.context_requested.connect(self._pane_context)
+        self.pane.hover.connect(self._pane_hover)
         v.addWidget(self.pane, 1)
 
         tl = QHBoxLayout()
@@ -630,7 +641,8 @@ class PtzTab(QWidget):
         구형 .analysis.json 이 통합본보다 새로우면(외부에서 분석을 돌린 경우)
         그쪽 분석을 채택한다.
         """
-        self.keyframes, self.ignores, self.analysis = [], [], None
+        self.keyframes, self.ignores, self.promotes, self.analysis = \
+            [], [], [], None
         sp = self._sidecar_path()
         doc = None
         if sp.exists():
@@ -641,6 +653,7 @@ class PtzTab(QWidget):
         if doc is not None:
             self.keyframes = [list(k) for k in doc.get("keyframes", [])]
             self.ignores = [list(r) for r in doc.get("ignores", [])]
+            self.promotes = [list(p) for p in doc.get("promotes", [])]
             self.analysis = doc.get("analysis")
         migrated = False
         la = self._legacy_analysis_path()
@@ -685,7 +698,8 @@ class PtzTab(QWidget):
         tmp = sp.with_suffix(".ptz.json.tmp")
         tmp.write_text(json.dumps({"analysis": self.analysis,
                                    "keyframes": self.keyframes,
-                                   "ignores": self.ignores}))
+                                   "ignores": self.ignores,
+                                   "promotes": self.promotes}))
         tmp.replace(sp)
 
     _MODEL_NAMES = ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt",
@@ -825,6 +839,195 @@ class PtzTab(QWidget):
         i = self._current_sample()
         return None if i is None else self.analysis["balls"][i]
 
+    def _ball_in_ignore(self, f, bx, by):
+        """(f, bx, by) 공이 어떤 무시 구간에 걸리는가 (자리 있으면 150px)."""
+        return any(
+            r[0] <= f <= r[1] and (len(r) < 4 or
+                                   ((r[2] - bx) ** 2 + (r[3] - by) ** 2)
+                                   ** 0.5 <= 150)
+            for r in self.ignores)
+
+    def _promote_near(self, f, bx, by):
+        """(f, bx, by) 부근(±0.5s, 150px)에 걸린 승격 항목들 (토글/표시용)."""
+        return [p for p in self.promotes
+                if abs(p[0] - f) <= 0.5 * self.fps
+                and (p[1] - bx) ** 2 + (p[2] - by) ** 2 <= 150 ** 2]
+
+    # ---------------------------------------------------- 오브젝트 질의/조작
+    def _candidates_at(self, si):
+        """샘플 si 의 공 후보 [(x, y, conf), ...] (신형 ball_cands 우선)."""
+        if self.analysis is None or si is None:
+            return []
+        bc = self.analysis.get("ball_cands")
+        if bc is not None and si < len(bc):
+            return [(float(p[0]), float(p[1]), float(p[2])) for p in bc[si]]
+        b = self.analysis["balls"][si]
+        return [(float(b[0]), float(b[1]), float(b[2]))] if b else []
+
+    def _track_for(self, si, x, y):
+        """샘플 si 에서 (x, y) 를 지나는 링크 트랙 (없으면 None)."""
+        if self._linked is None or si is None:
+            return None
+        best, bestd = None, 80.0 ** 2
+        for t in self._linked["tracks"]:
+            hits = np.where(t["i"] == si)[0]
+            if len(hits) == 0:
+                continue
+            k = int(hits[0])
+            d = (t["pts"][k][0] - x) ** 2 + (t["pts"][k][1] - y) ** 2
+            if d <= bestd:
+                best, bestd = t, d
+        return best
+
+    def _track_span(self, t):
+        idx = self._linked["idx"]
+        return int(idx[t["i"][0]]), int(idx[t["i"][-1]])
+
+    def _cand_state(self, f, si, x, y):
+        """공 후보 상태: 'ignored' | 'promoted' | 'accepted' | 'rejected'."""
+        if self._ball_in_ignore(f, x, y):
+            return "ignored"
+        if self._promote_near(f, x, y):
+            return "promoted"
+        ab = self._accepted_ball
+        if (ab is not None and si is not None and si < len(ab)
+                and not np.isnan(ab[si, 0])
+                and (ab[si, 0] - x) ** 2 + (ab[si, 1] - y) ** 2 <= 60.0 ** 2):
+            return "accepted"
+        return "rejected"
+
+    def _objects_at(self):
+        """현재 프레임의 조작 가능한 오브젝트 (공 후보 + 근처 키프레임)."""
+        f = getattr(self, "_cur_frame_idx", self.slider.value())
+        si = self._current_sample()
+        objs = []
+        for (x, y, conf) in self._candidates_at(si):
+            objs.append({"kind": "ball", "x": x, "y": y, "conf": conf,
+                         "state": self._cand_state(f, si, x, y), "si": si})
+        for i, k in enumerate(self.keyframes):
+            if abs(k[0] - f) <= 1.0 * self.fps:
+                objs.append({"kind": "kf", "x": float(k[1]), "y": float(k[2]),
+                             "i": i})
+        return objs
+
+    def _hit(self, x, y, r=80.0):
+        """(x, y) 파노라마 좌표에서 반경 r 안 가장 가까운 오브젝트 (없으면 None)."""
+        best, bestd = None, r * r
+        for o in self._objects_at():
+            d = (o["x"] - x) ** 2 + (o["y"] - y) ** 2
+            if d <= bestd:
+                best, bestd = o, d
+        return best
+
+    def _ignore_covers(self, entry):
+        """entry(=[f0,f1,x,y]) 와 사실상 동일한 무시가 이미 있는가."""
+        f0, f1 = entry[0], entry[1]
+        for r in self.ignores:
+            if r[0] <= f0 and f1 <= r[1] and (
+                    len(r) < 4 or ((r[2] - entry[2]) ** 2
+                                   + (r[3] - entry[3]) ** 2) ** 0.5 <= 150):
+                return True
+        return False
+
+    def _mark_dirty_and_redraw(self):
+        self._save_keyframes()
+        self._recompute_tracks()
+        self._redraw()
+
+    def _promote_ball(self, f, si, x, y):
+        """(x,y) 공을 경기 공으로 승격 + 같은 프레임 다른 후보 트랙 자동 무시."""
+        if not self._promote_near(f, x, y):
+            self.promotes.append([f, round(x, 1), round(y, 1)])
+            self.promotes.sort()
+        auto = 0
+        for (cx, cy, cc) in self._candidates_at(si):
+            if (cx - x) ** 2 + (cy - y) ** 2 <= 60.0 ** 2:
+                continue                       # 승격 대상 자신
+            t = self._track_for(si, cx, cy)
+            if t is None:
+                continue
+            f0, f1 = self._track_span(t)
+            med = np.median(t["pts"], axis=0)
+            entry = [f0, f1, round(float(med[0]), 1), round(float(med[1]), 1)]
+            # 승격한 공을 함께 잡을 수 있는 무시는 건너뜀 (자기 트랙 보호)
+            if (f0 <= f <= f1 and
+                    ((med[0] - x) ** 2 + (med[1] - y) ** 2) ** 0.5 <= 150):
+                continue
+            if not self._ignore_covers(entry):
+                self.ignores.append(entry)
+                auto += 1
+        self.ignores.sort()
+        self._mark_dirty_and_redraw()
+        extra = f", 경쟁 후보 {auto}개 자동 무시" if auto else ""
+        self.log(f"[ptz] 경기 공 승격 {f/self.fps:.1f}s "
+                 f"→ ({x:.0f}, {y:.0f}){extra}")
+
+    def _unpromote_at(self, f, x, y):
+        near = self._promote_near(f, x, y)
+        if not near:
+            return
+        for p in near:
+            self.promotes.remove(p)
+        self._mark_dirty_and_redraw()
+        self.log(f"[ptz] 승격 취소 {f/self.fps:.1f}s")
+
+    def _ignore_track_at(self, f, si, x, y):
+        """(x,y) 후보의 트랙을 오인식으로 무시 (링크 없으면 그 시점만)."""
+        t = self._track_for(si, x, y)
+        if t is not None:
+            f0, f1 = self._track_span(t)
+            med = np.median(t["pts"], axis=0)
+            entry = [f0, f1, round(float(med[0]), 1), round(float(med[1]), 1)]
+        else:
+            entry = [int(f), int(f), round(x, 1), round(y, 1)]
+        for p in self._promote_near(f, x, y):    # 무시가 승격보다 우선
+            self.promotes.remove(p)
+        if not self._ignore_covers(entry):
+            self.ignores.append(entry)
+            self.ignores.sort()
+        self._mark_dirty_and_redraw()
+        self.log(f"[ptz] 검출 무시 {f/self.fps:.1f}s → ({x:.0f}, {y:.0f})")
+
+    def _restore_at(self, f, x, y):
+        """(x,y) 위치에 걸린 무시 구간을 해제 (복원)."""
+        keep, removed = [], 0
+        for r in self.ignores:
+            if (r[0] <= f <= r[1] and
+                    (len(r) < 4 or ((r[2] - x) ** 2 + (r[3] - y) ** 2)
+                     ** 0.5 <= 150)):
+                removed += 1
+            else:
+                keep.append(r)
+        if removed:
+            self.ignores = keep
+            self._mark_dirty_and_redraw()
+            self.log(f"[ptz] 무시 해제 {f/self.fps:.1f}s ({removed}개 구간)")
+
+    def _add_keyframe(self, f, x, y):
+        self.keyframes = [k for k in self.keyframes
+                          if abs(k[0] - f) > 0.5 * self.fps]
+        self.keyframes.append([f, round(x, 1), round(y, 1)])
+        self.keyframes.sort()
+        self._save_keyframes()
+        self._refresh_kf_list()
+        self.trackbar.set_data(self.total, self.track_spans,
+                               self.ignores, self.keyframes)
+        self._plan_dirty()
+        self._redraw()
+        self.log(f"[ptz] 키프레임 {f/self.fps:.1f}s → ({x:.0f}, {y:.0f})")
+
+    def _delete_keyframe_idx(self, i):
+        if 0 <= i < len(self.keyframes):
+            k = self.keyframes[i]
+            del self.keyframes[i]
+            self._save_keyframes()
+            self._refresh_kf_list()
+            self.trackbar.set_data(self.total, self.track_spans,
+                                   self.ignores, self.keyframes)
+            self._plan_dirty()
+            self._redraw()
+            self.log(f"[ptz] 키프레임 삭제 {k[0]/self.fps:.1f}s")
+
     def _show_frame(self):
         """현재 프레임 디코딩 + 오버레이. 디코딩 결과는 캐시된다."""
         if self.cap is None or self._playing:
@@ -858,35 +1061,43 @@ class PtzTab(QWidget):
             cv2.rectangle(frame, (int(x0 * sc), int(y0 * sc)),
                           (int((x0 + w) * sc), int((y0 + h) * sc)),
                           (255, 200, 0), max(2, int(6 * sc)))
-        b = self._current_auto_ball()
-        if b is not None:
-            p = (int(b[0] * sc), int(b[1] * sc))
-            in_ignore = any(
-                r[0] <= f <= r[1] and (len(r) < 4 or
-                                       ((r[2] - b[0]) ** 2 + (r[3] - b[1]) ** 2)
-                                       ** 0.5 <= 150)
-                for r in self.ignores)
-            in_track = any(f0 <= f <= f1 for f0, f1 in self.track_spans)
-            if in_ignore:
-                # 사용자가 취소한 검출: 빨간 X + 라벨
-                cv2.circle(frame, p, max(10, int(28 * sc)), (60, 60, 200), 4)
+        # 공 후보 전부 표시 — 상태별 색: 초록=수락, 자홍=승격, 빨강X=무시,
+        # 회색=자동 기각. 커서가 가리키는 오브젝트는 노란 링으로 하이라이트.
+        si = self._current_sample()
+        hv = self._hover_key
+
+        def _is_hover(kind, ox, oy):
+            return hv is not None and hv == (kind, round(ox), round(oy))
+
+        rad = max(10, int(28 * sc))
+        for (bx, by, conf) in self._candidates_at(si):
+            p = (int(bx * sc), int(by * sc))
+            st = self._cand_state(f, si, bx, by)
+            if st == "ignored":
+                cv2.circle(frame, p, rad, (60, 60, 200), 4)
                 cv2.line(frame, (p[0] - 24, p[1] - 24), (p[0] + 24, p[1] + 24),
                          (60, 60, 200), 6)
                 cv2.line(frame, (p[0] - 24, p[1] + 24), (p[0] + 24, p[1] - 24),
                          (60, 60, 200), 6)
                 cv2.putText(frame, "IGNORED", (p[0] + 36, p[1] + 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.4, (60, 60, 200), 4)
-            elif in_track:
-                cv2.circle(frame, p, max(10, int(28 * sc)), (0, 220, 0), 6)     # 수락 트랙의 공
+            elif st == "promoted":
+                cv2.circle(frame, p, rad, (200, 0, 255), 6)
+            elif st == "accepted":
+                cv2.circle(frame, p, rad, (0, 220, 0), 6)
             else:
-                cv2.circle(frame, p, max(10, int(28 * sc)), (150, 150, 150), 4)  # 자동 기각된 검출
-        for kf, kx, ky in self.keyframes:
-            if abs(kf - f) <= 1.0 * self.fps:
+                cv2.circle(frame, p, rad, (150, 150, 150), 4)
+            if _is_hover("ball", bx, by):
+                cv2.circle(frame, p, rad + max(6, int(12 * sc)), (0, 255, 255), 3)
+        for k in self.keyframes:
+            if abs(k[0] - f) <= 1.0 * self.fps:
+                kx, ky = float(k[1]), float(k[2])
                 p = (int(kx * sc), int(ky * sc))
                 cv2.drawMarker(frame, p, (0, 0, 255), cv2.MARKER_CROSS,
                                max(20, int(60 * sc)), max(3, int(8 * sc)))
+                if _is_hover("kf", kx, ky):
+                    cv2.circle(frame, p, max(16, int(34 * sc)), (0, 255, 255), 3)
         # 선수 박스(팀 색) + 레이더
-        si = self._current_sample()
         radar_pts = []
         if si is not None:
             prow = self.analysis["players"][si]
@@ -915,26 +1126,76 @@ class PtzTab(QWidget):
             self.radar.set_data([], None)
         self.pane.set_frame(frame)
 
-    # ------------------------------------------------------------ 키프레임
+    # ------------------------------------------------------ 화면 오브젝트 조작
     def _pane_clicked(self, fx, fy):
+        """좌클릭: 오브젝트 상태별 기본 동작 / 빈 곳은 키프레임 추가."""
         if self.cap is None:
             return
         if self._playing:
             self._stop_play()
         f = getattr(self, "_cur_frame_idx", self.slider.value())
         x, y = fx * self.pano_w, fy * self.pano_h
-        # 같은 시각(±0.5s) 클릭은 교체
-        self.keyframes = [k for k in self.keyframes
-                          if abs(k[0] - f) > 0.5 * self.fps]
-        self.keyframes.append([f, round(x, 1), round(y, 1)])
-        self.keyframes.sort()
-        self._save_keyframes()
-        self._refresh_kf_list()
-        self.trackbar.set_data(self.total, self.track_spans,
-                               self.ignores, self.keyframes)
-        self._plan_dirty()
-        self._redraw()
-        self.log(f"[ptz] 키프레임 {f/self.fps:.1f}s → ({x:.0f}, {y:.0f})")
+        o = self._hit(x, y)
+        if o is None:                       # 빈 곳 = 키프레임 추가
+            self._add_keyframe(f, x, y)
+            return
+        if o["kind"] == "kf":               # 키프레임 = 삭제
+            self._delete_keyframe_idx(o["i"])
+            return
+        st = o["state"]                     # 공 후보 = 상태별 기본 동작
+        if st == "promoted":
+            self._unpromote_at(f, o["x"], o["y"])
+        elif st == "ignored":
+            self._restore_at(f, o["x"], o["y"])
+        else:                               # gray/green → 경기 공 승격
+            self._promote_ball(f, o["si"], o["x"], o["y"])
+
+    def _pane_context(self, fx, fy, gpos):
+        """우클릭: 오브젝트별 전체 동작 메뉴."""
+        if self.cap is None or self.analysis is None:
+            return
+        if self._playing:
+            self._stop_play()
+        f = getattr(self, "_cur_frame_idx", self.slider.value())
+        x, y = fx * self.pano_w, fy * self.pano_h
+        o = self._hit(x, y)
+        menu = QMenu(self)
+        if o is None:
+            menu.addAction("여기 키프레임 추가",
+                           lambda: self._add_keyframe(f, x, y))
+        elif o["kind"] == "kf":
+            menu.addAction("키프레임 삭제",
+                           lambda: self._delete_keyframe_idx(o["i"]))
+        else:
+            st, ox, oy, si = o["state"], o["x"], o["y"], o["si"]
+            if st == "promoted":
+                menu.addAction("승격 취소",
+                               lambda: self._unpromote_at(f, ox, oy))
+            else:
+                menu.addAction("이 공을 경기 공으로 승격",
+                               lambda: self._promote_ball(f, si, ox, oy))
+            if st == "ignored":
+                menu.addAction("무시 해제(복원)",
+                               lambda: self._restore_at(f, ox, oy))
+            else:
+                menu.addAction("이 검출 무시(오인식)",
+                               lambda: self._ignore_track_at(f, si, ox, oy))
+            menu.addSeparator()
+            menu.addAction("여기 키프레임 추가",
+                           lambda: self._add_keyframe(f, x, y))
+        menu.exec(gpos)
+
+    def _pane_hover(self, fx, fy):
+        """커서 근처 오브젝트를 하이라이트 (바뀔 때만 리드로우)."""
+        if self.analysis is None or getattr(self, "_cur_frame", None) is None:
+            return
+        x, y = fx * self.pano_w, fy * self.pano_h
+        o = self._hit(x, y)
+        key = None if o is None else (o["kind"], round(o["x"]), round(o["y"]))
+        if key != self._hover_key:
+            self._hover_key = key
+            self._hover = o
+            self._redraw()
 
     def _refresh_lists(self):
         """위: 공(자동 트랙+수동 키프레임) / 아래: 오인식(무시 구간)."""
@@ -953,7 +1214,8 @@ class PtzTab(QWidget):
                     f"{int(t0//60):02d}:{t0%60:04.1f} ~ "
                     f"{int(t1//60):02d}:{t1%60:04.1f}  ({t1-t0:.1f}s) 자동")
             else:
-                kf, kx, ky = self.keyframes[i]
+                k = self.keyframes[i]
+                kf, kx, ky = k[0], k[1], k[2]
                 t = kf / self.fps
                 self.track_list.addItem(
                     f"{int(t//60):02d}:{t%60:04.1f}  ● 수동 ({kx:.0f}, {ky:.0f})")
@@ -1007,7 +1269,8 @@ class PtzTab(QWidget):
         w = PlanWorker(self.analysis, [tuple(k) for k in self.keyframes],
                        [tuple(r) for r in self.ignores],
                        self.combo_mode.currentIndex() == 1, linked=self._linked,
-                       far_zoom=self.spin_far_zoom.value())
+                       far_zoom=self.spin_far_zoom.value(),
+                       promotes=[tuple(p) for p in self.promotes])
         w.done.connect(self._plan_done)
         self._plan_worker = w
         w.start()
@@ -1044,9 +1307,11 @@ class PtzTab(QWidget):
         """
         if self.analysis is None:
             self.track_spans = []
+            self._accepted_ball = None
         else:
-            _, _, self.track_spans = accept_ball_tracks(
+            _, self._accepted_ball, self.track_spans = accept_ball_tracks(
                 self.analysis, ignore_ranges=[tuple(r) for r in self.ignores],
+                force_ranges=[tuple(p) for p in self.promotes],
                 linked=self._linked, log=self.log)
         self.trackbar.set_data(self.total, self.track_spans,
                                self.ignores, self.keyframes)
@@ -1161,7 +1426,8 @@ class PtzTab(QWidget):
         w = PtzRenderWorker(str(self.pano_path), out, self.analysis, kfs,
                             codec, self.spin_crf.value(), wide=wide,
                             ignores=[tuple(r) for r in self.ignores],
-                            far_zoom=self.spin_far_zoom.value())
+                            far_zoom=self.spin_far_zoom.value(),
+                            promotes=[tuple(p) for p in self.promotes])
         w.log.connect(self.log)
         w.progress.connect(self._render_progress)
         w.finished_ok.connect(self._render_done)

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QPoint, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QLabel, QSizePolicy
 
@@ -13,10 +13,13 @@ class FramePane(QLabel):
 
     interactive=True 면 드래그를 dragged(dx, dy, shift) 로 방출한다
     (dx/dy 는 표시된 픽스맵 좌표계 픽셀, shift 는 Shift 키 여부).
+    좌표 비율(0~1)로 clicked / context_requested(우클릭) / hover 도 방출한다.
     """
 
     dragged = pyqtSignal(float, float, bool)
     clicked = pyqtSignal(float, float)   # 표시 픽스맵 기준 좌표 비율 (0~1)
+    context_requested = pyqtSignal(float, float, QPoint)   # fx, fy, 전역좌표
+    hover = pyqtSignal(float, float)     # 버튼 안 눌린 이동 시 커서 위치 비율
 
     def __init__(self, placeholder="영상 없음", interactive=False):
         super().__init__(placeholder)
@@ -30,6 +33,20 @@ class FramePane(QLabel):
         self._grid = False
         if interactive:
             self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self.setMouseTracking(True)   # 버튼 없이도 hover 위치 추적
+
+    def _frac_at(self, pos):
+        """위젯 좌표 → 표시 픽스맵 기준 비율 (0~1). 밖이면 None."""
+        p = self.pixmap()
+        if p is None or p.isNull():
+            return None
+        x0 = (self.width() - p.width()) / 2
+        y0 = (self.height() - p.height()) / 2
+        fx = (pos.x() - x0) / p.width()
+        fy = (pos.y() - y0) / p.height()
+        if 0.0 <= fx <= 1.0 and 0.0 <= fy <= 1.0:
+            return fx, fy
+        return None
 
     def set_grid(self, on: bool):
         """정렬 가이드라인 그리드 표시 (중앙 세로선 강조 — 하프라인 맞춤용)."""
@@ -66,6 +83,12 @@ class FramePane(QLabel):
         return p.height() if p is not None and not p.isNull() else 0
 
     def mousePressEvent(self, ev):
+        if self._interactive and ev.button() == Qt.MouseButton.RightButton:
+            fr = self._frac_at(ev.position())
+            if fr is not None:
+                self.context_requested.emit(
+                    fr[0], fr[1], ev.globalPosition().toPoint())
+            return
         if self._interactive and ev.button() == Qt.MouseButton.LeftButton:
             self._drag_pos = ev.position()
             self._press_pos = ev.position()
@@ -80,19 +103,18 @@ class FramePane(QLabel):
             self._moved += abs(d.x()) + abs(d.y())
             shift = bool(ev.modifiers() & Qt.KeyboardModifier.ShiftModifier)
             self.dragged.emit(d.x(), d.y(), shift)
+        elif self._interactive:              # 버튼 없이 이동 = hover
+            fr = self._frac_at(ev.position())
+            if fr is not None:
+                self.hover.emit(fr[0], fr[1])
         super().mouseMoveEvent(ev)
 
     def mouseReleaseEvent(self, ev):
         if self._drag_pos is not None:
             if self._moved < 4.0:        # 이동 없는 프레스+릴리스 = 클릭
-                p = self.pixmap()
-                if p is not None and not p.isNull():
-                    x0 = (self.width() - p.width()) / 2
-                    y0 = (self.height() - p.height()) / 2
-                    fx = (self._press_pos.x() - x0) / p.width()
-                    fy = (self._press_pos.y() - y0) / p.height()
-                    if 0.0 <= fx <= 1.0 and 0.0 <= fy <= 1.0:
-                        self.clicked.emit(fx, fy)
+                fr = self._frac_at(self._press_pos)
+                if fr is not None:
+                    self.clicked.emit(fr[0], fr[1])
             self._drag_pos = None
             self.setCursor(Qt.CursorShape.OpenHandCursor)
         super().mouseReleaseEvent(ev)
