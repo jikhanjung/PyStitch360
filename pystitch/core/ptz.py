@@ -211,7 +211,7 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
                zoom_margin=260.0, top_margin=160,
                decoy_static_px=30.0, decoy_iso_px=700.0, decoy_win_sec=3.0,
                keyframes=None, kf_suppress_sec=1.5, kf_bridge_sec=8.0,
-               log=print):
+               wide=False, log=print):
     """검출 궤적 → 프레임별 (cx, cy, crop_w) 계획.
 
     - 공: conf 게이팅 + 점프 게이팅, gap_fill_sec 까지 선형 보간.
@@ -227,6 +227,9 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
       이동)만 sigma_fast 추종으로 크로스페이드 — "평상시 최대한 부드럽게".
     - top_margin: 파노라마 상단 검은 스티칭 경계를 크롭에 넣지 않기 위한
       상단 여백(px). 최대 줌아웃 높이도 이만큼 줄어든다.
+    - wide=True: 감상용 와이드 모드 — 크롭 폭을 항상 최대(세로 꽉 채움)로
+      고정하고 가로만 완만하게 팬. out_w/out_h 를 21:9 등으로 주고
+      sigma_slow 를 크게(권장 3.0) 주면 방송 와이드샷처럼 움직인다.
     """
     fps = analysis["fps"]
     total = analysis["total_frames"]
@@ -363,6 +366,8 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
         prev = (tx[i], ty[i])
 
     # --- 4. 프레임별 업샘플 + 적응 스무딩 -------------------------------
+    if wide:
+        zw[:] = max_crop_w              # 항상 최대 폭 (줌 변동 없음)
     fr = np.arange(total)
     fx = np.interp(fr, idx, tx)
     fy = np.interp(fr, idx, ty)

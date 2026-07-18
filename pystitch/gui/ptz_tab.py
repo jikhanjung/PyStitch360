@@ -46,20 +46,27 @@ class PtzRenderWorker(QThread):
     finished_ok = pyqtSignal(str)
     failed = pyqtSignal(str)
 
-    def __init__(self, pano_path, out_path, analysis, keyframes, codec, crf):
+    def __init__(self, pano_path, out_path, analysis, keyframes, codec, crf,
+                 wide=False):
         super().__init__()
-        self.args = (pano_path, out_path, analysis, keyframes, codec, crf)
+        self.args = (pano_path, out_path, analysis, keyframes, codec, crf, wide)
         self._cancel = False
 
     def cancel(self):
         self._cancel = True
 
     def run(self):
-        pano, out, analysis, kfs, codec, crf = self.args
+        pano, out, analysis, kfs, codec, crf, wide = self.args
         try:
+            out_w, out_h = (2560, 1080) if wide else (1920, 1080)
             plan = build_plan(analysis, analysis["pano_w"], analysis["pano_h"],
-                              keyframes=kfs, log=lambda s: self.log.emit(s))
-            render_plan(pano, out, plan, codec=codec, crf=crf,
+                              out_w=out_w, out_h=out_h, keyframes=kfs,
+                              wide=wide,
+                              sigma_slow=3.0 if wide else 1.2,
+                              fast_err_px=800.0 if wide else 400.0,
+                              log=lambda s: self.log.emit(s))
+            render_plan(pano, out, plan, out_w=out_w, out_h=out_h,
+                        codec=codec, crf=crf,
                         log=lambda s: self.log.emit(s),
                         progress=lambda d, t, f: self.progress.emit(d, t, f),
                         cancel=lambda: self._cancel)
@@ -140,6 +147,11 @@ class PtzTab(QWidget):
         self._slider_timer.timeout.connect(self._show_frame)
 
         bottom = QHBoxLayout()
+        bottom.addWidget(QLabel("출력"))
+        self.combo_mode = QComboBox()
+        self.combo_mode.addItems(["공 추적 PTZ (1920×1080)",
+                                  "와이드 감상 (2560×1080, 완만한 팬)"])
+        bottom.addWidget(self.combo_mode)
         bottom.addWidget(QLabel("코덱"))
         self.combo_codec = QComboBox()
         self.encoders = available_encoders()
@@ -355,16 +367,19 @@ class PtzTab(QWidget):
     def _start_render(self):
         if self.analysis is None or self.pano_path is None:
             return
-        default = str(self.pano_path.with_name(self.pano_path.stem + "_ptz.mp4"))
+        wide = self.combo_mode.currentIndex() == 1
+        suffix = "_wide.mp4" if wide else "_ptz.mp4"
+        default = str(self.pano_path.with_name(self.pano_path.stem + suffix))
         out, _ = QFileDialog.getSaveFileName(self, "PTZ 출력 파일", default,
                                              "MP4 (*.mp4)")
         if not out:
             return
         codec = self.encoders[self.combo_codec.currentText()]
         kfs = [tuple(k) for k in self.keyframes]
-        self.log(f"[ptz] 내보내기 시작: 키프레임 {len(kfs)}개 반영")
+        self.log(f"[ptz] 내보내기 시작: {'와이드' if wide else 'PTZ'} 모드, "
+                 f"키프레임 {len(kfs)}개 반영")
         w = PtzRenderWorker(str(self.pano_path), out, self.analysis, kfs,
-                            codec, self.spin_crf.value())
+                            codec, self.spin_crf.value(), wide=wide)
         w.log.connect(self.log)
         w.progress.connect(self._render_progress)
         w.finished_ok.connect(self._render_done)

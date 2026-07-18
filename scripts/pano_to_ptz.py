@@ -34,6 +34,8 @@ def main():
     ap.add_argument("--sigma-fast", type=float, default=0.35)
     ap.add_argument("--fast-err", type=float, default=400.0)
     ap.add_argument("--reanalyze", action="store_true", help="분석 캐시 무시")
+    ap.add_argument("--wide", action="store_true",
+                    help="와이드 감상 모드 (2560x1080, 줌 고정 + 완만한 팬)")
     args = ap.parse_args()
 
     cache = Path(args.out).with_suffix(".analysis.json")
@@ -53,11 +55,15 @@ def main():
         cache.write_text(json.dumps(analysis))
         print(f"분석 완료 ({time.perf_counter()-t0:.0f}s) → {cache}", flush=True)
 
+    out_w, out_h = (2560, 1080) if args.wide else (1920, 1080)
     plan = build_plan(analysis, analysis["pano_w"], analysis["pano_h"],
-                      sigma_slow=args.sigma_slow, sigma_fast=args.sigma_fast,
-                      fast_err_px=args.fast_err)
+                      out_w=out_w, out_h=out_h, wide=args.wide,
+                      sigma_slow=3.0 if args.wide else args.sigma_slow,
+                      sigma_fast=args.sigma_fast,
+                      fast_err_px=800.0 if args.wide else args.fast_err)
     print("2패스: 크롭·인코딩 중...", flush=True)
-    fps = render_plan(args.pano, args.out, plan, codec=args.codec, crf=args.crf)
+    fps = render_plan(args.pano, args.out, plan, out_w=out_w, out_h=out_h,
+                      codec=args.codec, crf=args.crf)
     print(f"PTZ_OK: {fps:.2f}fps → {args.out}", flush=True)
 
 

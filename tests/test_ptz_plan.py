@@ -127,3 +127,18 @@ def test_keyframe_pair_bridges_detection_gap():
     mid = plan["cx"][390]                           # 중간 지점 ≈ 평균
     assert abs(mid - 2250) < 300
     assert np.all(plan["crop_w"][360:420] < 1920 * 1.25)  # 구간 중앙: 줌인 유지
+
+
+def test_wide_mode_fixed_zoom_gentle_pan():
+    """와이드 모드: 크롭 폭 고정(최대), 가로 팬은 완만."""
+    frames = list(range(0, 2700, 3))
+    rng = np.random.default_rng(9)
+    balls = [[2000.0 + 1.0 * f + rng.normal(0, 60), 900.0, 0.5]
+             for f in frames]                       # 완만 이동 + 노이즈
+    plan = build_plan(_analysis(frames, balls), PANO_W, PANO_H,
+                      out_w=2560, out_h=1080, wide=True, sigma_slow=3.0,
+                      fast_err_px=800.0, log=None)
+    max_w = min(PANO_W, (PANO_H - 160) * 2560 / 1080)
+    assert np.allclose(plan["crop_w"], max_w, atol=1.0)   # 줌 변동 없음
+    step = np.abs(np.diff(plan["cx"][90:-90]))
+    assert step.max() < 3.0                               # 완만한 팬
