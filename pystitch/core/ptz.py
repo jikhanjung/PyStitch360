@@ -192,7 +192,9 @@ def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
                 if int(b_.cls[0]) == _CLS_BALL:
                     if conf > best_conf:
                         best, best_conf = [round(cxs, 1), round(cys, 1),
-                                           round(conf, 3)], conf
+                                           round(conf, 3),
+                                           round((x2 - x1) / scale, 1),
+                                           round((y2 - y1) / scale, 1)], conf
                     continue
                 tid = int(b_.id[0]) if b_.id is not None else -1
                 # 유니폼 색: 박스 상반신(위 절반, 가로 중앙 60%) HSV 평균
@@ -289,6 +291,43 @@ def ground_positions(players_row, pano_w, pano_h, cam_height=4.0,
         d = cam_height / (-t)
         tid = int(p[4]) if len(p) >= 5 else -1
         out.append((d * np.sin(phi), d * np.cos(phi), tid, j))
+    return out
+
+
+def export_training_labels(analysis, keyframes=None, ignore_ranges=None,
+                           linked=None):
+    """사용자 마킹을 커스텀 공 검출 모델 학습 라벨로 변환.
+
+    - 무시 구간 안의 공 검출 → "not_ball" (하드 네거티브 — 낙엽 등)
+    - 수락 트랙의 공 검출   → "ball" (자동 양성, 약한 라벨)
+    - 사용자 키프레임       → "ball_manual" (사람이 확인한 양성, 박스 없음)
+
+    반환: [{"frame", "x", "y", "w", "h", "conf", "label"}, ...]
+    원본 분석은 수정하지 않는다 (마킹은 비파괴).
+    """
+    idx, _, spans = accept_ball_tracks(analysis, ignore_ranges=ignore_ranges,
+                                       linked=linked, log=None)
+    ig = [tuple(r) for r in (ignore_ranges or [])]
+    out = []
+    for i, b in enumerate(analysis["balls"]):
+        if b is None:
+            continue
+        f = int(idx[i])
+        w = float(b[3]) if len(b) >= 5 else 0.0
+        h = float(b[4]) if len(b) >= 5 else 0.0
+        rec = {"frame": f, "x": float(b[0]), "y": float(b[1]),
+               "w": w, "h": h, "conf": float(b[2])}
+        if any(lo <= f <= hi for lo, hi in ig):
+            rec["label"] = "not_ball"
+        elif any(f0 <= f <= f1 for f0, f1 in spans):
+            rec["label"] = "ball"
+        else:
+            continue                      # 자동 기각(불확실) — 라벨로 안 씀
+        out.append(rec)
+    for kf, kx, ky in (keyframes or []):
+        out.append({"frame": int(kf), "x": float(kx), "y": float(ky),
+                    "w": 0.0, "h": 0.0, "conf": 1.0, "label": "ball_manual"})
+    out.sort(key=lambda r: r["frame"])
     return out
 
 

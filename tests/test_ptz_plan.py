@@ -224,3 +224,25 @@ def test_ground_positions_geometry():
     assert abs(pl[0][0] + pr[0][0]) < 1e-6 and abs(pl[0][1] - pr[0][1]) < 1e-6
     # 수평선 근처는 제외
     assert ground_positions([[cx, 300.0, 40.0, 0.0]], W, H) == []
+
+
+def test_export_training_labels():
+    """무시=하드네거티브, 수락=양성, 키프레임=수동 양성 — 원본 비파괴."""
+    from pystitch.core.ptz import export_training_labels
+    frames = list(range(0, 600, 3))
+    # 진짜 공 트랙(이동) + 300~420 구간의 정지 오인식(낙엽형, 별도 트랙)
+    balls = [[5000.0, 1400.0, 0.5, 14.0, 14.0] if 300 <= f <= 420
+             else [2000.0 + f, 900.0, 0.5, 14.0, 14.0] for f in frames]
+    a = _analysis(frames, balls)
+    import copy
+    a0 = copy.deepcopy(a)
+    labels = export_training_labels(a, keyframes=[(150, 3333.0, 800.0)],
+                                    ignore_ranges=[(300, 420)])
+    assert a == a0                                        # 분석 원본 불변
+    by = {}
+    for r in labels:
+        by.setdefault(r["label"], []).append(r)
+    assert all(300 <= r["frame"] <= 420 for r in by["not_ball"])
+    assert len(by["not_ball"]) > 0 and len(by["ball"]) > 0
+    assert by["ball_manual"][0]["x"] == 3333.0
+    assert by["ball"][0]["w"] == 14.0                     # 박스 크기 보존
