@@ -208,9 +208,6 @@ class PtzTab(QWidget):
         mid.addLayout(side)
         v.addLayout(mid, 1)
 
-        self.trackbar = TrackBar()
-        self.trackbar.seek.connect(lambda f: self.slider.setValue(f))
-        v.addWidget(self.trackbar)
         tl = QHBoxLayout()
         for text, d in [("-10s", -300), ("-1s", -30), ("-1", -1),
                         ("+1", 1), ("+1s", 30), ("+10s", 300)]:
@@ -218,10 +215,17 @@ class PtzTab(QWidget):
             b.setMaximumWidth(52)
             b.clicked.connect(lambda _, dd=d: self._step(dd))
             tl.addWidget(b)
+        # 트랙바는 슬라이더 바로 위, 같은 폭 — 위치가 1:1 로 대응
+        self.trackbar = TrackBar()
+        self.trackbar.seek.connect(lambda f: self.slider.setValue(f))
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setEnabled(False)
         self.slider.valueChanged.connect(self._on_slider)
-        tl.addWidget(self.slider, 1)
+        bar_col = QVBoxLayout()
+        bar_col.setSpacing(1)
+        bar_col.addWidget(self.trackbar)
+        bar_col.addWidget(self.slider)
+        tl.addLayout(bar_col, 1)
         self.lbl_time = QLabel("--:--.-")
         self.lbl_time.setMinimumWidth(90)
         tl.addWidget(self.lbl_time)
