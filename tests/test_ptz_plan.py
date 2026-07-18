@@ -30,7 +30,9 @@ def test_follows_ball_and_fills_gap():
     # 갭 구간 포함 전 구간에서 공 근처 (스무딩 지연 고려 넉넉히)
     err = np.abs(plan["cx"][150:850] - (1500 + 3.0 * np.arange(150, 850)))
     assert err.max() < 120
-    assert np.all(plan["crop_w"][150:850] < 1920 * 1.05)  # 공이 있으니 줌인 유지
+    # y=900(중거리) 공: 근경 가변 줌 반영폭 안에서 안정적으로 유지
+    assert np.all(plan["crop_w"][150:850] < 1920 * 1.35)
+    assert plan["crop_w"][150:850].std() < 40
 
 
 def test_rejects_teleporting_low_conf_ball():
@@ -154,3 +156,15 @@ def test_ignore_ranges_kill_track():
     assert len(spans) == 1 and not np.isnan(ball[50, 0])
     _, ball2, spans2 = accept_ball_tracks(a, ignore_ranges=[(400, 500)])
     assert spans2 == [] and np.all(np.isnan(ball2[:, 0]))   # 한 트랙 전체 기각
+
+
+def test_near_ball_widens_crop():
+    """근경(화면 아래) 공은 크롭을 넓게, 원경 공은 타이트하게."""
+    frames = list(range(0, 900, 3))
+    far = build_plan(_analysis(frames, [[2800.0, 550.0, 0.5] for _ in frames]),
+                     PANO_W, PANO_H, log=None)
+    near = build_plan(_analysis(frames, [[2800.0, 1600.0, 0.5] for _ in frames]),
+                      PANO_W, PANO_H, log=None)
+    mid = slice(200, 700)
+    assert far["crop_w"][mid].mean() < 2100          # 원경: 1.1배 이하
+    assert near["crop_w"][mid].mean() > 2700         # 최하단: ~1.6배

@@ -309,7 +309,7 @@ def accept_ball_tracks(analysis, ball_conf=0.25, max_jump_per_frame=120.0,
 def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
                ball_conf=0.25, max_jump_per_frame=120.0, gap_fill_sec=2.0,
                sigma_slow=1.2, sigma_fast=0.35, fast_err_px=400.0,
-               zoom_margin=260.0, top_margin=160,
+               zoom_margin=260.0, top_margin=160, near_widen=1.6,
                decoy_static_px=30.0, decoy_iso_px=700.0, decoy_win_sec=3.0,
                keyframes=None, kf_suppress_sec=1.5, kf_bridge_sec=8.0,
                wide=False, ignore_ranges=None, log=print):
@@ -328,6 +328,8 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
       이동)만 sigma_fast 추종으로 크로스페이드 — "평상시 최대한 부드럽게".
     - top_margin: 파노라마 상단 검은 스티칭 경계를 크롭에 넣지 않기 위한
       상단 여백(px). 최대 줌아웃 높이도 이만큼 줄어든다.
+    - near_widen: 공이 화면 아래(근경)일수록 크롭을 넓힘 — 가까운 선수는
+      크게 보이므로 타이트한 줌인이 불필요. 원경 1.0배 → 최하단 near_widen배.
     - wide=True: 감상용 와이드 모드 — 크롭 폭을 항상 최대(세로 꽉 채움)로
       고정하고 가로만 완만하게 팬. out_w/out_h 를 21:9 등으로 주고
       sigma_slow 를 크게(권장 3.0) 주면 방송 와이드샷처럼 움직인다.
@@ -377,9 +379,13 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
     ty = np.empty(n)
     zw = np.full(n, float(out_w))
     prev = (pano_w / 2, pano_h * 0.55)
+    field_top = analysis.get("field_top_frac", 0.26) * pano_h
     for i in range(n):
         if known[i]:
             tx[i], ty[i] = filled[i]
+            # 근경 공은 넓게: 원경(경기장 상단) 1.0배 → 최하단 near_widen배
+            depth_t = np.clip((ty[i] - field_top) / max(pano_h - field_top, 1), 0, 1)
+            zw[i] = min(out_w * (1 + (near_widen - 1) * depth_t), max_crop_w)
         else:
             pl = np.array(analysis["players"][i], dtype=float).reshape(-1, 2)
             if len(pl) >= 3:
