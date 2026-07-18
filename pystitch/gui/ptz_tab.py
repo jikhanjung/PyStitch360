@@ -859,7 +859,7 @@ class PtzTab(QWidget):
         self.progress.setRange(0, total)
         self.progress.setValue(done)
         remain = (total - done) / fps / 60 if fps > 0 else 0
-        self.progress.setFormat(f"%p%  ({done}/{total}, {fps:.1f}fps, 남은 {remain:.0f}분)")
+        self.progress.setFormat(f"%p%  ({done}/{total}, {fps:.1f}fps, 남은 시간 {remain:.0f}분)")
 
     def _render_done(self, path):
         self.btn_export.setEnabled(True)
