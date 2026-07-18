@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -53,6 +54,19 @@ def alignment_from_dict(d: dict) -> Alignment:
         el0=float(d.get("el0", EL0_RAD)),
         el1=float(d.get("el1", EL1_RAD)),
     )
+
+
+def _cross_platform_candidates(p: str) -> list[str]:
+    """WSL(/mnt/x/...) ↔ Windows(X:/...) 경로 후보 — 같은 프로젝트 파일을
+    양쪽 환경에서 열 수 있게 한다 (내보내기는 Windows 네이티브 NVENC 등)."""
+    out = []
+    m = re.match(r"^/mnt/([a-zA-Z])/(.*)$", p)
+    if m:
+        out.append(f"{m.group(1).upper()}:/{m.group(2)}")
+    m = re.match(r"^([a-zA-Z]):[\\/](.*)$", p)
+    if m:
+        out.append(f"/mnt/{m.group(1).lower()}/" + m.group(2).replace("\\", "/"))
+    return out
 
 
 def save_project(path: str | Path, data: dict):
@@ -93,6 +107,11 @@ def load_project(path: str | Path) -> dict:
             p = Path(f)
             if not p.exists() and i < len(names) and (base / names[i]).exists():
                 p = base / names[i]   # 프로젝트 폴더 기준 상대경로로 복구
+            if not p.exists():
+                for cand in _cross_platform_candidates(str(f)):
+                    if Path(cand).exists():   # WSL ↔ Windows 드라이브 경로 변환
+                        p = Path(cand)
+                        break
             resolved.append(str(p))
         d[f"{side}_files"] = resolved
     d["segments"] = [

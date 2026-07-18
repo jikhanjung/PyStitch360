@@ -198,3 +198,19 @@ def test_worker_attrs_do_not_shadow_qthread_api():
     assert callable(w.start) and callable(w.run)
     p = PlaybackWorker(None, None, [], [], 0.0, 0)
     assert callable(p.start) and callable(p.run)
+
+
+def test_project_resolves_cross_platform_paths(tmp_path):
+    """Windows 식 경로(D:\\...)로 저장된 프로젝트를 WSL 에서 열면 /mnt/d 로 복구."""
+    from pystitch.core.align import Alignment
+    from pystitch.core.project import load_project, save_project
+
+    real = Path("/mnt/d/projects/PyStitch360/README.md")   # WSL 에 존재하는 파일
+    win_style = "D:\\projects\\PyStitch360\\README.md"
+    a = Alignment(Rh=np.eye(3), yaw_split_deg=40.0,
+                  pitch_auto=0.0, roll_auto=0.0, yaw_auto=0.0)
+    proj = tmp_path / "p.json"
+    save_project(proj, {"left_files": [win_style], "right_files": [win_style],
+                        "segments": [{"start_sec": 0.0, "alignment": a}]})
+    d = load_project(proj)
+    assert d["left_files"][0] == str(real)
