@@ -124,6 +124,41 @@ class PlanWorker(QThread):
             pass
 
 
+class ProxyWorker(QThread):
+    """스크럽 프록시 생성: 1920px, 키프레임 0.5s 간격 → 즉시 탐색용."""
+
+    finished_ok = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, pano_path, proxy_path):
+        super().__init__()
+        self.pano_path, self.proxy_path = str(pano_path), str(proxy_path)
+
+    def run(self):
+        import subprocess
+
+        from ..core.encoders import available_encoders, ffmpeg_bin
+        encs = available_encoders().values()
+        if "h264_nvenc" in encs:
+            venc = ["-c:v", "h264_nvenc", "-preset", "p1", "-rc", "vbr",
+                    "-cq", "27", "-b:v", "0"]
+        else:
+            venc = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "24"]
+        tmp = self.proxy_path + ".part.mp4"
+        cmd = ([ffmpeg_bin(), "-y", "-v", "error", "-i", self.pano_path,
+                "-vf", "scale=1920:-2"] + venc
+               + ["-g", "15", "-an", tmp])
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RuntimeError(r.stderr.strip()[-300:] or "ffmpeg 실패")
+            Path(tmp).rename(self.proxy_path)
+            self.finished_ok.emit(self.proxy_path)
+        except Exception as e:  # noqa: BLE001
+            Path(tmp).unlink(missing_ok=True)
+            self.failed.emit(str(e))
+
+
 class PtzPlayWorker(QThread):
     """파노라마 순차 재생 (자체 디코더) — 오버레이는 GUI 쪽 _redraw 가 담당."""
 
@@ -226,6 +261,9 @@ class PtzTab(QWidget):
         self._linked = None
         self._play_worker = None
         self._playing = False
+        self._proxy_worker = None
+        self.disp_path = None
+        self.disp_scale = 1.0
         self.plan = None
         self.plan_out = (1920, 1080)
         self._build_ui()
@@ -242,8 +280,13 @@ class PtzTab(QWidget):
         self.btn_analyze = QPushButton("자동 공/선수 분석")
         self.btn_analyze.setEnabled(False)
         self.btn_analyze.clicked.connect(self._run_analyze)
+        self.btn_proxy = QPushButton("스크럽 프록시 생성")
+        self.btn_proxy.setEnabled(False)
+        self.btn_proxy.setToolTip("1920px·조밀 키프레임 사본 — 타임라인 클릭 즉시 표시")
+        self.btn_proxy.clicked.connect(self._make_proxy)
         top.addWidget(self.btn_open)
         top.addWidget(self.lbl_file, 1)
+        top.addWidget(self.btn_proxy)
         top.addWidget(self.btn_analyze)
         v.addLayout(top)
 
@@ -373,6 +416,7 @@ class PtzTab(QWidget):
         self.slider.setEnabled(True)
         self.slider.setRange(0, max(0, self.total - 1))
         self.slider.setValue(0)
+        self._use_display_source()
         self.btn_analyze.setEnabled(ptz_available())
         if not ptz_available():
             self.btn_analyze.setToolTip("ultralytics 미설치 (pip install ultralytics)")
@@ -381,6 +425,46 @@ class PtzTab(QWidget):
         self._load_cached_analysis()
         self._show_frame()
         self._update_export_enabled()
+
+    def _proxy_path(self) -> Path:
+        return self.pano_path.with_suffix(".scrub.mp4")
+
+    def _use_display_source(self):
+        """표시/재생용 소스 선택: 프록시가 있으면 프록시 (즉시 탐색)."""
+        proxy = self._proxy_path()
+        if proxy.exists():
+            cap = cv2.VideoCapture(str(proxy))
+            if cap.isOpened():
+                if self.cap is not None:
+                    self.cap.release()
+                self.cap = cap
+                self.disp_path = proxy
+                pw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                self.disp_scale = pw / max(self.pano_w, 1)
+                self.btn_proxy.setText("프록시 사용 중")
+                self.btn_proxy.setEnabled(False)
+                self.log(f"[ptz] 스크럽 프록시 사용: {proxy.name} (즉시 탐색)")
+                return
+        self.disp_path = self.pano_path
+        self.disp_scale = 1.0
+        self.btn_proxy.setText("스크럽 프록시 생성")
+        self.btn_proxy.setEnabled(True)
+
+    def _make_proxy(self):
+        if self.pano_path is None:
+            return
+        self.btn_proxy.setEnabled(False)
+        self.btn_proxy.setText("프록시 생성 중...")
+        self.log("[ptz] 스크럽 프록시 생성 중 (NVENC 가용 시 수 분)...")
+        w = ProxyWorker(self.pano_path, self._proxy_path())
+        w.finished_ok.connect(lambda _: (self.log("[ptz] 프록시 완료"),
+                                         self._use_display_source(),
+                                         self._show_frame()))
+        w.failed.connect(lambda m: (self.log(f"[오류] 프록시: {m}"),
+                                    self.btn_proxy.setText("스크럽 프록시 생성"),
+                                    self.btn_proxy.setEnabled(True)))
+        self._proxy_worker = w
+        w.start()
 
     def _analysis_cache(self) -> Path:
         return self.pano_path.with_suffix(".analysis.json")
@@ -456,7 +540,9 @@ class PtzTab(QWidget):
             return
         if self.cap is None:
             return
-        w = PtzPlayWorker(self.pano_path, self.slider.value(), self.fps)
+        w = PtzPlayWorker(self.disp_path or self.pano_path,
+                          self.slider.value(), self.fps,
+                          display_fps=30.0 if self.disp_scale < 1.0 else 15.0)
         w.frame_ready.connect(self._play_frame)
         w.finished.connect(self._play_finished)
         self._play_worker = w
@@ -505,6 +591,7 @@ class PtzTab(QWidget):
             return
         frame = self._cur_frame.copy()
         f = self._cur_frame_idx
+        sc = self.disp_scale                 # 프록시 표시 시 좌표 축소
         # 계획된 크롭 창 (render_plan 과 동일한 클램프) — 결과 미리보기
         if self.plan is not None and f < len(self.plan["cx"]):
             ow, oh = self.plan_out
@@ -516,16 +603,18 @@ class PtzTab(QWidget):
             y0 = int(round(self.plan["cy"][f] - h / 2))
             x0 = max(0, min(x0, self.pano_w - w))
             y0 = max(min(top, self.pano_h - h), min(y0, self.pano_h - h))
-            cv2.rectangle(frame, (x0, y0), (x0 + w, y0 + h), (255, 200, 0), 6)
+            cv2.rectangle(frame, (int(x0 * sc), int(y0 * sc)),
+                          (int((x0 + w) * sc), int((y0 + h) * sc)),
+                          (255, 200, 0), max(2, int(6 * sc)))
         b = self._current_auto_ball()
         if b is not None:
-            p = (int(b[0]), int(b[1]))
+            p = (int(b[0] * sc), int(b[1] * sc))
             in_ignore = any(f0 <= f <= f1 for f0, f1 in
                             ((r[0], r[1]) for r in self.ignores))
             in_track = any(f0 <= f <= f1 for f0, f1 in self.track_spans)
             if in_ignore:
                 # 사용자가 취소한 검출: 빨간 X + 라벨
-                cv2.circle(frame, p, 28, (60, 60, 200), 4)
+                cv2.circle(frame, p, max(10, int(28 * sc)), (60, 60, 200), 4)
                 cv2.line(frame, (p[0] - 24, p[1] - 24), (p[0] + 24, p[1] + 24),
                          (60, 60, 200), 6)
                 cv2.line(frame, (p[0] - 24, p[1] + 24), (p[0] + 24, p[1] - 24),
@@ -533,13 +622,14 @@ class PtzTab(QWidget):
                 cv2.putText(frame, "IGNORED", (p[0] + 36, p[1] + 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.4, (60, 60, 200), 4)
             elif in_track:
-                cv2.circle(frame, p, 28, (0, 220, 0), 6)     # 수락 트랙의 공
+                cv2.circle(frame, p, max(10, int(28 * sc)), (0, 220, 0), 6)     # 수락 트랙의 공
             else:
-                cv2.circle(frame, p, 28, (150, 150, 150), 4)  # 자동 기각된 검출
+                cv2.circle(frame, p, max(10, int(28 * sc)), (150, 150, 150), 4)  # 자동 기각된 검출
         for kf, kx, ky in self.keyframes:
             if abs(kf - f) <= 1.0 * self.fps:
-                p = (int(kx), int(ky))
-                cv2.drawMarker(frame, p, (0, 0, 255), cv2.MARKER_CROSS, 60, 8)
+                p = (int(kx * sc), int(ky * sc))
+                cv2.drawMarker(frame, p, (0, 0, 255), cv2.MARKER_CROSS,
+                               max(20, int(60 * sc)), max(3, int(8 * sc)))
         self.pane.set_frame(frame)
 
     # ------------------------------------------------------------ 키프레임
