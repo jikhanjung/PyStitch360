@@ -205,17 +205,11 @@ def _gaussian1d(x, sigma):
     return np.convolve(pad, k, "valid")
 
 
-def accept_ball_tracks(analysis, ball_conf=0.25, max_jump_per_frame=120.0,
-                       decoy_static_px=30.0, decoy_iso_px=700.0,
-                       decoy_win_sec=3.0, ignore_ranges=None, log=None):
-    """공 후보를 트랙으로 묶고 트랙 단위로 수락/기각.
+def link_ball_tracks(analysis, ball_conf=0.25, max_jump_per_frame=120.0):
+    """공 후보 트랙 연결 (느린 단계 — 분석에만 의존하므로 캐시 가능).
 
-    오검출은 프레임이 아니라 트랙 단위로 다룬다: 시간 연속으로 연결한 뒤
-    트랙 통계(정지/고립/중복)로 통째로 기각 — 정지 낙엽, 장외에서 움직이는
-    다른 공, 순간 오검출이 여기서 걸러진다. ignore_ranges([(f0,f1),...])와
-    겹치는 트랙은 사용자가 오인식으로 지정한 것 — 무조건 기각.
-
-    반환: (idx, ball(n,2), spans) — spans 는 수락 트랙의 (시작,끝) 프레임.
+    반환 dict {idx, cand, iso, tracks} 를 accept_ball_tracks(linked=...) 에
+    넘기면 무시 구간 변경 시 수락 단계만 다시 돌면 된다 (즉각 반응).
     """
     fps = analysis["fps"]
     idx = np.array(analysis["frames"])
@@ -253,6 +247,42 @@ def accept_ball_tracks(analysis, ball_conf=0.25, max_jump_per_frame=120.0,
             tracks.append([i])
         else:
             best.append(i)
+
+    # 샘플별 선수 통계 프리컴퓨트 (공 부재 시 목표/줌 계산용 — 캐시 대상)
+    p_cnt = np.zeros(n, int)
+    p_tx = np.full(n, np.nan)
+    p_ty = np.full(n, np.nan)
+    p_span = np.zeros(n)
+    for i in range(n):
+        pl = np.asarray(analysis["players"][i], dtype=float).reshape(-1, 2)
+        p_cnt[i] = len(pl)
+        if len(pl) >= 3:
+            med = np.median(pl[:, 0])
+            keep = pl[np.abs(pl[:, 0] - med) < analysis.get("pano_w", 5906) * 0.25]
+            p_tx[i], p_ty[i] = keep[:, 0].mean(), keep[:, 1].mean()
+            p_span[i] = np.percentile(pl[:, 0], 90) - np.percentile(pl[:, 0], 10)
+    return {"idx": idx, "cand": cand, "iso": iso, "tracks": tracks, "fps": fps,
+            "p_cnt": p_cnt, "p_tx": p_tx, "p_ty": p_ty, "p_span": p_span}
+
+
+def accept_ball_tracks(analysis, ball_conf=0.25, max_jump_per_frame=120.0,
+                       decoy_static_px=30.0, decoy_iso_px=700.0,
+                       decoy_win_sec=3.0, ignore_ranges=None, linked=None,
+                       log=None):
+    """공 트랙 수락/기각 (트랙 단위 오검출 처리).
+
+    트랙 통계(정지/고립/중복)로 통째로 기각 — 정지 낙엽, 장외에서 움직이는
+    다른 공, 순간 오검출. ignore_ranges 와 겹치는 트랙은 사용자 지정
+    오인식 — 무조건 기각. linked 에 link_ball_tracks 결과를 주면 연결
+    단계를 건너뛴다 (GUI 즉각 반응용).
+
+    반환: (idx, ball(n,2), spans) — spans 는 수락 트랙의 (시작,끝) 프레임.
+    """
+    if linked is None:
+        linked = link_ball_tracks(analysis, ball_conf, max_jump_per_frame)
+    idx, cand, iso = linked["idx"], linked["cand"], linked["iso"]
+    tracks, fps = linked["tracks"], linked["fps"]
+    n = len(idx)
 
     def _track_stats(t):
         pts = cand[t]
@@ -312,7 +342,7 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
                zoom_margin=260.0, top_margin=160, near_widen=1.6,
                decoy_static_px=30.0, decoy_iso_px=700.0, decoy_win_sec=3.0,
                keyframes=None, kf_suppress_sec=1.5, kf_bridge_sec=8.0,
-               wide=False, ignore_ranges=None, log=print):
+               wide=False, ignore_ranges=None, linked=None, log=print):
     """검출 궤적 → 프레임별 (cx, cy, crop_w) 계획.
 
     - 공: conf 게이팅 + 점프 게이팅, gap_fill_sec 까지 선형 보간.
@@ -340,10 +370,13 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
     n = len(idx)
 
     # --- 0~1. 공 트랙 수락 (accept_ball_tracks 참조) --------------------
+    if linked is None:
+        linked = link_ball_tracks(analysis, ball_conf, max_jump_per_frame)
     _, ball, _ = accept_ball_tracks(
         analysis, ball_conf=ball_conf, max_jump_per_frame=max_jump_per_frame,
         decoy_static_px=decoy_static_px, decoy_iso_px=decoy_iso_px,
-        decoy_win_sec=decoy_win_sec, ignore_ranges=ignore_ranges, log=log)
+        decoy_win_sec=decoy_win_sec, ignore_ranges=ignore_ranges,
+        linked=linked, log=log)
 
     # --- 1.5 사용자 키프레임 병합 (자동보다 우선) -----------------------
     kf_idx = []
@@ -380,24 +413,20 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
     zw = np.full(n, float(out_w))
     prev = (pano_w / 2, pano_h * 0.55)
     field_top = analysis.get("field_top_frac", 0.26) * pano_h
-    for i in range(n):
+    p_cnt, p_tx = linked["p_cnt"], linked["p_tx"]
+    p_ty, p_span = linked["p_ty"], linked["p_span"]
+    for i in range(n):                      # 프리컴퓨트 덕에 경량 루프
         if known[i]:
             tx[i], ty[i] = filled[i]
             # 근경 공은 넓게: 원경(경기장 상단) 1.0배 → 최하단 near_widen배
-            depth_t = np.clip((ty[i] - field_top) / max(pano_h - field_top, 1), 0, 1)
+            depth_t = min(max((ty[i] - field_top) / max(pano_h - field_top, 1), 0.0), 1.0)
             zw[i] = min(out_w * (1 + (near_widen - 1) * depth_t), max_crop_w)
+        elif p_cnt[i] >= 3:
+            tx[i], ty[i] = p_tx[i], p_ty[i]
+            zw[i] = min(max(p_span[i] + 2 * zoom_margin, out_w), max_crop_w)
         else:
-            pl = np.array(analysis["players"][i], dtype=float).reshape(-1, 2)
-            if len(pl) >= 3:
-                med = np.median(pl[:, 0])
-                keep = pl[np.abs(pl[:, 0] - med) < pano_w * 0.25]
-                tx[i], ty[i] = keep[:, 0].mean(), keep[:, 1].mean()
-                span = (np.percentile(pl[:, 0], 90) - np.percentile(pl[:, 0], 10)
-                        + 2 * zoom_margin)
-                zw[i] = np.clip(span, out_w, max_crop_w)
-            else:
-                tx[i], ty[i] = prev
-                zw[i] = max_crop_w   # 정보 부족 — 최대한 넓게
+            tx[i], ty[i] = prev
+            zw[i] = max_crop_w   # 정보 부족 — 최대한 넓게
         prev = (tx[i], ty[i])
 
     # --- 4. 프레임별 업샘플 + 적응 스무딩 -------------------------------

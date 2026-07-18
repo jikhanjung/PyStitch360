@@ -12,6 +12,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QColor, QPainter
 from PyQt6.QtWidgets import (
     QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout, QLabel, QListWidget,
@@ -21,7 +22,8 @@ from PyQt6.QtWidgets import (
 
 from ..core.encoders import available_encoders
 from ..core.ptz import (
-    accept_ball_tracks, analyze_video, build_plan, ptz_available, render_plan,
+    accept_ball_tracks, analyze_video, build_plan, link_ball_tracks,
+    ptz_available, render_plan,
 )
 from .widgets import FramePane
 
@@ -86,22 +88,35 @@ class AnalyzeWorker(QThread):
             self.failed.emit(str(e))
 
 
+class LinkWorker(QThread):
+    """트랙 연결(느린 단계) 백그라운드 계산 — 분석에만 의존하므로 1회면 됨."""
+
+    done = pyqtSignal(dict)
+
+    def __init__(self, analysis):
+        super().__init__()
+        self.analysis = analysis
+
+    def run(self):
+        self.done.emit(link_ball_tracks(self.analysis))
+
+
 class PlanWorker(QThread):
     """크롭 계획 미리보기 재계산 (키프레임/무시 변경 시 백그라운드)."""
 
     done = pyqtSignal(dict, tuple)   # plan, (out_w, out_h)
 
-    def __init__(self, analysis, keyframes, ignores, wide):
+    def __init__(self, analysis, keyframes, ignores, wide, linked=None):
         super().__init__()
-        self.args = (analysis, keyframes, ignores, wide)
+        self.args = (analysis, keyframes, ignores, wide, linked)
 
     def run(self):
-        analysis, kfs, ignores, wide = self.args
+        analysis, kfs, ignores, wide, linked = self.args
         try:
             out_w, out_h = (2560, 1080) if wide else (1920, 1080)
             plan = build_plan(analysis, analysis["pano_w"], analysis["pano_h"],
                               out_w=out_w, out_h=out_h, keyframes=kfs,
-                              wide=wide, ignore_ranges=ignores,
+                              wide=wide, ignore_ranges=ignores, linked=linked,
                               sigma_slow=3.0 if wide else 1.2,
                               fast_err_px=800.0 if wide else 400.0, log=None)
             self.done.emit(plan, (out_w, out_h))
@@ -168,10 +183,12 @@ class PtzTab(QWidget):
         self._analyze_worker = None
         self._render_worker = None
         self._plan_worker = None
+        self._link_worker = None
+        self._linked = None
         self.plan = None
         self.plan_out = (1920, 1080)
         self._build_ui()
-        self._plan_timer = QTimer(singleShot=True, interval=600)
+        self._plan_timer = QTimer(singleShot=True, interval=150)
         self._plan_timer.timeout.connect(self._run_plan)
 
     # ------------------------------------------------------------ UI
@@ -322,7 +339,7 @@ class PtzTab(QWidget):
                     self.analysis = d
                     self.log(f"[ptz] 분석 캐시 불러옴: {c.name} "
                              f"(검출 샘플 {len(d['frames'])}개)")
-                    self._recompute_tracks()
+                    self._start_link()
             except Exception as e:  # noqa: BLE001
                 self.log(f"[ptz] 분석 캐시 무시: {e}")
 
@@ -352,7 +369,7 @@ class PtzTab(QWidget):
         self.log(f"[ptz] 분석 완료: 샘플 {len(d['frames'])}개, "
                  f"공 검출 {n_ball}개 ({n_ball/max(len(d['frames']),1):.0%}) → 캐시 저장")
         self._update_export_enabled()
-        self._recompute_tracks()
+        self._start_link()
         self._show_frame()
 
     def _analyze_failed(self, msg):
@@ -384,6 +401,7 @@ class PtzTab(QWidget):
         return self.analysis["balls"][i]
 
     def _show_frame(self):
+        """현재 프레임 디코딩 + 오버레이. 디코딩 결과는 캐시된다."""
         if self.cap is None:
             return
         f = self.slider.value()
@@ -391,6 +409,15 @@ class PtzTab(QWidget):
         ok, frame = self.cap.read()
         if not ok:
             return
+        self._cur_frame, self._cur_frame_idx = frame, f
+        self._redraw()
+
+    def _redraw(self):
+        """오버레이만 다시 그림 — 키프레임/무시/계획 변경 시 디코딩 없이 즉시."""
+        if getattr(self, "_cur_frame", None) is None:
+            return
+        frame = self._cur_frame.copy()
+        f = self._cur_frame_idx
         # 계획된 크롭 창 (render_plan 과 동일한 클램프) — 결과 미리보기
         if self.plan is not None and f < len(self.plan["cx"]):
             ow, oh = self.plan_out
@@ -405,7 +432,23 @@ class PtzTab(QWidget):
             cv2.rectangle(frame, (x0, y0), (x0 + w, y0 + h), (255, 200, 0), 6)
         b = self._current_auto_ball()
         if b is not None:
-            cv2.circle(frame, (int(b[0]), int(b[1])), 28, (0, 220, 0), 6)
+            p = (int(b[0]), int(b[1]))
+            in_ignore = any(f0 <= f <= f1 for f0, f1 in
+                            ((r[0], r[1]) for r in self.ignores))
+            in_track = any(f0 <= f <= f1 for f0, f1 in self.track_spans)
+            if in_ignore:
+                # 사용자가 취소한 검출: 빨간 X + 라벨
+                cv2.circle(frame, p, 28, (60, 60, 200), 4)
+                cv2.line(frame, (p[0] - 24, p[1] - 24), (p[0] + 24, p[1] + 24),
+                         (60, 60, 200), 6)
+                cv2.line(frame, (p[0] - 24, p[1] + 24), (p[0] + 24, p[1] - 24),
+                         (60, 60, 200), 6)
+                cv2.putText(frame, "IGNORED", (p[0] + 36, p[1] + 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.4, (60, 60, 200), 4)
+            elif in_track:
+                cv2.circle(frame, p, 28, (0, 220, 0), 6)     # 수락 트랙의 공
+            else:
+                cv2.circle(frame, p, 28, (150, 150, 150), 4)  # 자동 기각된 검출
         for kf, kx, ky in self.keyframes:
             if abs(kf - f) <= 1.0 * self.fps:
                 p = (int(kx), int(ky))
@@ -428,7 +471,7 @@ class PtzTab(QWidget):
         self.trackbar.set_data(self.total, self.track_spans,
                                self.ignores, self.keyframes)
         self._plan_dirty()
-        self._show_frame()
+        self._redraw()
         self.log(f"[ptz] 키프레임 {f/self.fps:.1f}s → ({x:.0f}, {y:.0f})")
 
     def _refresh_kf_list(self):
@@ -474,7 +517,7 @@ class PtzTab(QWidget):
             self._recompute_tracks()
         self._save_keyframes()
         self._refresh_kf_list()
-        self._show_frame()
+        self._redraw()
 
     def _save_keyframes(self):
         if self.pano_path is not None:
@@ -510,7 +553,7 @@ class PtzTab(QWidget):
             return
         w = PlanWorker(self.analysis, [tuple(k) for k in self.keyframes],
                        [tuple(r) for r in self.ignores],
-                       self.combo_mode.currentIndex() == 1)
+                       self.combo_mode.currentIndex() == 1, linked=self._linked)
         w.done.connect(self._plan_done)
         self._plan_worker = w
         w.start()
@@ -518,16 +561,35 @@ class PtzTab(QWidget):
     def _plan_done(self, plan, out):
         self.plan = plan
         self.plan_out = out
-        self._show_frame()
+        self._redraw()
+
+    def _start_link(self):
+        """트랙 연결(느린 단계)을 백그라운드로 1회 계산."""
+        if self.analysis is None:
+            return
+        w = LinkWorker(self.analysis)
+        w.done.connect(self._link_done)
+        self._link_worker = w
+        self.log("[ptz] 트랙 연결 계산 중... (완료 후 클릭 반응이 빨라짐)")
+        w.start()
+
+    def _link_done(self, linked):
+        self._linked = linked
+        self.log(f"[ptz] 트랙 연결 완료: {len(linked['tracks'])}개")
+        self._recompute_tracks()
+        self._plan_dirty()
 
     def _recompute_tracks(self):
-        """수락 트랙 구간 재계산 → 트랙바 갱신 (분석/무시 구간 변경 시)."""
+        """수락 트랙 구간 재계산 → 트랙바 갱신 (분석/무시 구간 변경 시).
+
+        linked 캐시가 있으면 수락 단계만 돌아 즉각 반응한다.
+        """
         if self.analysis is None:
             self.track_spans = []
         else:
             _, _, self.track_spans = accept_ball_tracks(
                 self.analysis, ignore_ranges=[tuple(r) for r in self.ignores],
-                log=self.log)
+                linked=self._linked, log=self.log)
         self.trackbar.set_data(self.total, self.track_spans,
                                self.ignores, self.keyframes)
         self._plan_dirty()
@@ -537,11 +599,15 @@ class PtzTab(QWidget):
         f = self.slider.value()
         for f0, f1 in self.track_spans:
             if f0 <= f <= f1:
-                self.ignores.append([int(f0), int(f1)])
-                self._save_keyframes()
-                self._recompute_tracks()
-                self._refresh_kf_list()
-                self._show_frame()
+                QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+                try:
+                    self.ignores.append([int(f0), int(f1)])
+                    self._save_keyframes()
+                    self._recompute_tracks()
+                    self._refresh_kf_list()
+                    self._redraw()
+                finally:
+                    QApplication.restoreOverrideCursor()
                 self.log(f"[ptz] 트랙 무시: {f0/self.fps:.1f}s ~ {f1/self.fps:.1f}s")
                 return
         QMessageBox.information(self, "무시", "현재 시각을 덮는 공 트랙이 없습니다.")
