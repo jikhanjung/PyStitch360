@@ -147,13 +147,17 @@ def detect_raw(model, frame, det_w=2944, conf=0.2):
 
 
 def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
-                  weights=None, log=print):
+                  weights=None, far_boost=True, far_band_frac=0.58, log=print):
     """1패스: 프레임 샘플마다 공/선수 검출. 반환 dict 는 JSON 직렬화 가능.
 
     field_top_frac 위(원경 트랙·관중석)의 공/선수는 장외로 버린다.
+    far_boost: 원경 밴드(field_top~far_band_frac)를 원본 해상도 타일 2장으로
+    잘라 공 전용 추가 검출 — 전체 프레임은 ~50% 축소라 원경 공(~10px)이
+    뭉개지는 문제를 보완한다. 트래커 상태 보호를 위해 별도 모델 인스턴스 사용.
     """
     from ultralytics import YOLO
     model = YOLO(str(weights or _DEFAULT_WEIGHTS))
+    model_far = YOLO(str(weights or _DEFAULT_WEIGHTS)) if far_boost else None
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         raise RuntimeError(f"열 수 없음: {path}")
@@ -180,6 +184,22 @@ def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
             r = model.track(small, imgsz=det_w, conf=0.2,
                             classes=[_CLS_PERSON, _CLS_BALL],
                             persist=True, verbose=False)[0]
+            far_balls = []
+            if model_far is not None:
+                y0b, y1b = int(field_top), int(pano_h * far_band_frac)
+                strip = frame[y0b:y1b]
+                half = strip.shape[1] // 2
+                for x_off in (0, half - 100):          # 100px 겹침
+                    tile = strip[:, x_off:x_off + half + 100]
+                    r2 = model_far.predict(tile, imgsz=det_w, conf=0.15,
+                                           classes=[_CLS_BALL], verbose=False)[0]
+                    for b2 in r2.boxes:
+                        bx1, by1, bx2, by2 = b2.xyxy[0].tolist()
+                        far_balls.append([
+                            round((bx1 + bx2) / 2 + x_off, 1),
+                            round((by1 + by2) / 2 + y0b, 1),
+                            round(float(b2.conf[0]), 3),
+                            round(bx2 - bx1, 1), round(by2 - by1, 1)])
             hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
             best, best_conf = None, -1.0
             prow = []
@@ -206,6 +226,9 @@ def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
                 prow.append([round(cxs, 1), round(cys, 1),
                              round((x2 - x1) / scale, 1), round((y2 - y1) / scale, 1),
                              tid, round(hm, 1), round(sm, 1), round(vm, 1)])
+            for fb in far_balls:                   # 원경 네이티브 검출과 병합
+                if fb[2] > best_conf:
+                    best, best_conf = fb, fb[2]
             frames_idx.append(i)
             balls.append(best)
             players.append(prow)
@@ -216,6 +239,7 @@ def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
     cap.release()
     return {"video": str(path), "total_frames": i, "fps": fps,
             "players_fmt": "cxcywh_id_hsv",   # 구캐시(2/4열)와 소비부 호환
+            "far_boost": bool(far_boost),
             "pano_w": pano_w, "pano_h": pano_h,
             "detect_every": detect_every, "det_w": det_w,
             "field_top_frac": field_top_frac,
