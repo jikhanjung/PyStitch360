@@ -443,10 +443,23 @@ class PtzTab(QWidget):
                       activated=self._ignore_selected_track,
                       context=Qt.ShortcutContext.WidgetShortcut)
         col_ball.addWidget(self.track_list, 1)
-        self.btn_ignore = QPushButton("현재 공 트랙 무시 (오인식)")
-        self.btn_ignore.clicked.connect(self._ignore_current_track)
-        col_ball.addWidget(self.btn_ignore)
         strip.addLayout(col_ball, 2)
+
+        # 두 목록 사이 이동 버튼: >> = 오인식으로, << = 복원
+        col_move = QVBoxLayout()
+        col_move.addStretch(1)
+        self.btn_ignore = QPushButton("≫")
+        self.btn_ignore.setMaximumWidth(44)
+        self.btn_ignore.setToolTip("선택한 공 트랙을 오인식으로 (→/Del)")
+        self.btn_ignore.clicked.connect(self._to_ignore)
+        col_move.addWidget(self.btn_ignore)
+        self.btn_restore = QPushButton("≪")
+        self.btn_restore.setMaximumWidth(44)
+        self.btn_restore.setToolTip("선택한 오인식을 복원 (←)")
+        self.btn_restore.clicked.connect(self._delete_kf)
+        col_move.addWidget(self.btn_restore)
+        col_move.addStretch(1)
+        strip.addLayout(col_move)
 
         col_ig = QVBoxLayout()
         col_ig.addWidget(QLabel("오인식 — 공 아님 (더블클릭=이동, ←=복원)"))
@@ -457,9 +470,6 @@ class PtzTab(QWidget):
                   activated=self._delete_kf,
                   context=Qt.ShortcutContext.WidgetShortcut)
         col_ig.addWidget(self.kf_list, 1)
-        btn_del = QPushButton("선택 복원 (오인식 취소)")
-        btn_del.clicked.connect(self._delete_kf)
-        col_ig.addWidget(btn_del)
         strip.addLayout(col_ig, 2)
 
         col_radar = QVBoxLayout()
@@ -1063,6 +1073,13 @@ class PtzTab(QWidget):
             prv = [sp for sp in self.track_spans if sp[0] < f - 1]
             if prv:
                 self.slider.setValue(int(prv[-1][0]))
+
+    def _to_ignore(self):
+        """≫ 버튼: 목록 선택이 있으면 그 항목, 없으면 현재 시각 트랙."""
+        if 0 <= self.track_list.currentRow() < len(getattr(self, "_top", [])):
+            self._ignore_selected_track()
+        else:
+            self._ignore_current_track()
 
     def _ignore_selected_track(self):
         """위 목록에서 Del — 자동 트랙은 오인식으로, 수동 지정은 삭제."""
