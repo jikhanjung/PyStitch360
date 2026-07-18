@@ -128,12 +128,20 @@ class AnalyzeWorker(QThread):
         super().__init__()
         self.video_path = video_path
         self.weights = weights
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
 
     def run(self):
         try:
             d = analyze_video(self.video_path, weights=self.weights,
+                              cancel=lambda: self._cancel,
                               log=lambda s: self.log.emit(s))
-            self.done.emit(d)
+            if d is None:
+                self.failed.emit("취소됨")
+            else:
+                self.done.emit(d)
         except Exception as e:  # noqa: BLE001
             self.failed.emit(str(e))
 
@@ -638,10 +646,13 @@ class PtzTab(QWidget):
         return str(local) if local.exists() else name   # 없으면 자동 다운로드
 
     def _run_analyze(self):
-        if self.pano_path is None or self._analyze_worker is not None \
-                and self._analyze_worker.isRunning():
+        if self._analyze_worker is not None and self._analyze_worker.isRunning():
+            self._analyze_worker.cancel()          # 버튼이 취소 역할
+            self.log("[ptz] 분석 취소 요청...")
             return
-        self.btn_analyze.setEnabled(False)
+        if self.pano_path is None:
+            return
+        self.btn_analyze.setText("분석 취소")
         self.progress.setRange(0, 0)
         self.progress.setFormat("분석 중... (로그 참조)")
         weights = self._model_weights()
@@ -657,6 +668,7 @@ class PtzTab(QWidget):
     def _analyze_done(self, d):
         self.analysis = d
         self._analysis_cache().write_text(json.dumps(d))
+        self.btn_analyze.setText("자동 공/선수 분석")
         self.btn_analyze.setEnabled(True)
         self.progress.setRange(0, 1)
         self.progress.setValue(1)
@@ -669,6 +681,7 @@ class PtzTab(QWidget):
         self._show_frame()
 
     def _analyze_failed(self, msg):
+        self.btn_analyze.setText("자동 공/선수 분석")
         self.btn_analyze.setEnabled(True)
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
