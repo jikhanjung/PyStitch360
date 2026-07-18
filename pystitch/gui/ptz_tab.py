@@ -127,12 +127,14 @@ class PlanWorker(QThread):
 class ProxyWorker(QThread):
     """스크럽 프록시 생성: 1920px, 키프레임 0.5s 간격 → 즉시 탐색용."""
 
+    progress = pyqtSignal(float)         # 0.0 ~ 1.0
     finished_ok = pyqtSignal(str)
     failed = pyqtSignal(str)
 
-    def __init__(self, pano_path, proxy_path):
+    def __init__(self, pano_path, proxy_path, duration_sec=0.0):
         super().__init__()
         self.pano_path, self.proxy_path = str(pano_path), str(proxy_path)
+        self.duration = duration_sec
 
     def run(self):
         import subprocess
@@ -145,13 +147,26 @@ class ProxyWorker(QThread):
         else:
             venc = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "24"]
         tmp = self.proxy_path + ".part.mp4"
-        cmd = ([ffmpeg_bin(), "-y", "-v", "error", "-i", self.pano_path,
-                "-vf", "scale=1920:-2"] + venc
-               + ["-g", "15", "-an", tmp])
+        cmd = ([ffmpeg_bin(), "-y", "-v", "error", "-nostats",
+                "-i", self.pano_path, "-vf", "scale=1920:-2"] + venc
+               + ["-g", "15", "-an", "-progress", "pipe:1", tmp])
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            if r.returncode != 0:
-                raise RuntimeError(r.stderr.strip()[-300:] or "ffmpeg 실패")
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True)
+            tail = []
+            for line in proc.stdout:
+                line = line.strip()
+                if line.startswith("out_time_ms=") and self.duration > 0:
+                    try:                     # ffmpeg 의 out_time_ms 는 마이크로초
+                        t = int(line.split("=", 1)[1]) / 1e6
+                        self.progress.emit(min(t / self.duration, 1.0))
+                    except ValueError:
+                        pass
+                elif line and "=" not in line:
+                    tail.append(line)        # 진행 키가 아닌 줄 = 오류 메시지 후보
+            proc.wait()
+            if proc.returncode != 0:
+                raise RuntimeError(" / ".join(tail[-3:]) or "ffmpeg 실패")
             Path(tmp).rename(self.proxy_path)
             self.finished_ok.emit(self.proxy_path)
         except Exception as e:  # noqa: BLE001
@@ -456,7 +471,9 @@ class PtzTab(QWidget):
         self.btn_proxy.setEnabled(False)
         self.btn_proxy.setText("프록시 생성 중...")
         self.log("[ptz] 스크럽 프록시 생성 중 (NVENC 가용 시 수 분)...")
-        w = ProxyWorker(self.pano_path, self._proxy_path())
+        w = ProxyWorker(self.pano_path, self._proxy_path(),
+                        duration_sec=self.total / max(self.fps, 1e-9))
+        w.progress.connect(self._proxy_progress)
         w.finished_ok.connect(lambda _: (self.log("[ptz] 프록시 완료"),
                                          self._use_display_source(),
                                          self._show_frame()))
@@ -465,6 +482,14 @@ class PtzTab(QWidget):
                                     self.btn_proxy.setEnabled(True)))
         self._proxy_worker = w
         w.start()
+
+    def _proxy_progress(self, p: float):
+        self.btn_proxy.setText(f"프록시 생성 {p:.0%}")
+        # 내보내기가 진행바를 쓰고 있지 않을 때만 진행바에도 표시
+        if self._render_worker is None or not self._render_worker.isRunning():
+            self.progress.setRange(0, 1000)
+            self.progress.setValue(int(p * 1000))
+            self.progress.setFormat(f"프록시 생성 %p%")
 
     def _analysis_cache(self) -> Path:
         return self.pano_path.with_suffix(".analysis.json")
