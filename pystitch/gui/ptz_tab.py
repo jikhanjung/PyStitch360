@@ -11,7 +11,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QSettings, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QCheckBox
 from PyQt6.QtGui import QColor, QKeySequence, QPainter, QShortcut
 from PyQt6.QtWidgets import (
@@ -155,17 +155,19 @@ class PlanWorker(QThread):
 
     done = pyqtSignal(dict, tuple)   # plan, (out_w, out_h)
 
-    def __init__(self, analysis, keyframes, ignores, wide, linked=None):
+    def __init__(self, analysis, keyframes, ignores, wide, linked=None,
+                 far_zoom=1.0):
         super().__init__()
-        self.args = (analysis, keyframes, ignores, wide, linked)
+        self.args = (analysis, keyframes, ignores, wide, linked, far_zoom)
 
     def run(self):
-        analysis, kfs, ignores, wide, linked = self.args
+        analysis, kfs, ignores, wide, linked, far_zoom = self.args
         try:
             out_w, out_h = (2560, 1080) if wide else (1920, 1080)
             plan = build_plan(analysis, analysis["pano_w"], analysis["pano_h"],
                               out_w=out_w, out_h=out_h, keyframes=kfs,
                               wide=wide, ignore_ranges=ignores, linked=linked,
+                              far_zoom=far_zoom,
                               sigma_slow=3.0 if wide else 1.2,
                               fast_err_px=800.0 if wide else 400.0, log=None)
             self.done.emit(plan, (out_w, out_h))
@@ -269,22 +271,23 @@ class PtzRenderWorker(QThread):
     failed = pyqtSignal(str)
 
     def __init__(self, pano_path, out_path, analysis, keyframes, codec, crf,
-                 wide=False, ignores=None):
+                 wide=False, ignores=None, far_zoom=1.0):
         super().__init__()
         self.args = (pano_path, out_path, analysis, keyframes, codec, crf, wide,
-                     ignores or [])
+                     ignores or [], far_zoom)
         self._cancel = False
 
     def cancel(self):
         self._cancel = True
 
     def run(self):
-        pano, out, analysis, kfs, codec, crf, wide, ignores = self.args
+        pano, out, analysis, kfs, codec, crf, wide, ignores, far_zoom = self.args
         try:
             out_w, out_h = (2560, 1080) if wide else (1920, 1080)
             plan = build_plan(analysis, analysis["pano_w"], analysis["pano_h"],
                               out_w=out_w, out_h=out_h, keyframes=kfs,
                               wide=wide, ignore_ranges=ignores,
+                              far_zoom=far_zoom,
                               sigma_slow=3.0 if wide else 1.2,
                               fast_err_px=800.0 if wide else 400.0,
                               log=lambda s: self.log.emit(s))
@@ -434,6 +437,15 @@ class PtzTab(QWidget):
                                   "와이드 감상 (2560×1080, 완만한 팬)"])
         self.combo_mode.currentIndexChanged.connect(lambda _: self._plan_dirty())
         bottom.addWidget(self.combo_mode)
+        lbl_fz = QLabel("원경 줌")
+        lbl_fz.setToolTip("공이 반대편(원경)에 있을 때 추가 줌인 배율 (1.0=없음)")
+        bottom.addWidget(lbl_fz)
+        self.spin_far_zoom = QDoubleSpinBox(decimals=2, minimum=1.0, maximum=1.5,
+                                            singleStep=0.05)
+        self.spin_far_zoom.setValue(float(QSettings("PyStitch360", "PyStitch360")
+                                          .value("ptz_far_zoom", 1.0)))
+        self.spin_far_zoom.valueChanged.connect(self._far_zoom_changed)
+        bottom.addWidget(self.spin_far_zoom)
         bottom.addWidget(QLabel("코덱"))
         self.combo_codec = QComboBox()
         self.encoders = available_encoders()
@@ -837,6 +849,10 @@ class PtzTab(QWidget):
                 self.log(f"[ptz] 키프레임 파일 무시: {e}")
         self._refresh_kf_list()
 
+    def _far_zoom_changed(self, v):
+        QSettings("PyStitch360", "PyStitch360").setValue("ptz_far_zoom", v)
+        self._plan_dirty()
+
     def _plan_dirty(self):
         if self.analysis is not None:
             self._plan_timer.start()
@@ -849,7 +865,8 @@ class PtzTab(QWidget):
             return
         w = PlanWorker(self.analysis, [tuple(k) for k in self.keyframes],
                        [tuple(r) for r in self.ignores],
-                       self.combo_mode.currentIndex() == 1, linked=self._linked)
+                       self.combo_mode.currentIndex() == 1, linked=self._linked,
+                       far_zoom=self.spin_far_zoom.value())
         w.done.connect(self._plan_done)
         self._plan_worker = w
         w.start()
@@ -985,7 +1002,8 @@ class PtzTab(QWidget):
                  f"키프레임 {len(kfs)}개 반영")
         w = PtzRenderWorker(str(self.pano_path), out, self.analysis, kfs,
                             codec, self.spin_crf.value(), wide=wide,
-                            ignores=[tuple(r) for r in self.ignores])
+                            ignores=[tuple(r) for r in self.ignores],
+                            far_zoom=self.spin_far_zoom.value())
         w.log.connect(self.log)
         w.progress.connect(self._render_progress)
         w.finished_ok.connect(self._render_done)

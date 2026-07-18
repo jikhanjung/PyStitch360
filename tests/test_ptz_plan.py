@@ -246,3 +246,40 @@ def test_export_training_labels():
     assert len(by["not_ball"]) > 0 and len(by["ball"]) > 0
     assert by["ball_manual"][0]["x"] == 3333.0
     assert by["ball"][0]["w"] == 14.0                     # 박스 크기 보존
+
+
+def test_same_spot_recurring_decoys_batched():
+    """같은 자리에서 시간대만 다른 정적 오인식 트랙들을 일괄 수집."""
+    from pystitch.core.ptz import link_ball_tracks, same_spot_spans
+    frames = list(range(0, 1800, 3))
+    balls = []
+    for f in frames:
+        if 0 <= f < 300 or 900 <= f < 1200:      # 같은 자리 정적 오인식 2회
+            balls.append([4900.0, 1350.0, 0.5, 14.0, 14.0])
+        elif 400 <= f < 800:                     # 진짜 공 (이동)
+            balls.append([1500.0 + f, 900.0, 0.5, 14.0, 14.0])
+        else:
+            balls.append(None)
+    linked = link_ball_tracks(_analysis(frames, balls))
+    spans = same_spot_spans(linked, 0, 297)
+    assert len(spans) == 2                       # 두 정적 트랙 모두
+    assert spans[0][0] == 0 and spans[1][0] == 900
+    # 이동하는 진짜 공 트랙은 포함되지 않음
+    assert all(not (400 <= s[0] < 800) for s in spans)
+
+
+def test_far_zoom_tightens_far_crop_only():
+    """far_zoom: 원경 공은 더 조이고(업스케일 줌), 근경은 기존과 동일."""
+    frames = list(range(0, 900, 3))
+    far_balls = [[2800.0, 550.0, 0.5] for _ in frames]
+    near_balls = [[2800.0, 1600.0, 0.5] for _ in frames]
+    mid = slice(200, 700)
+    a_far = build_plan(_analysis(frames, far_balls), PANO_W, PANO_H,
+                       far_zoom=1.2, log=None)
+    # y=550 은 field_top(437) 대비 depth 9% — 원경 조임과 근경 보간의 혼합값
+    assert 1920 / 1.3 < a_far["crop_w"][mid].mean() < 1920 / 1.05
+    base = build_plan(_analysis(frames, far_balls), PANO_W, PANO_H, log=None)
+    assert a_far["crop_w"][mid].mean() < base["crop_w"][mid].mean() - 100
+    a_near = build_plan(_analysis(frames, near_balls), PANO_W, PANO_H,
+                        far_zoom=1.2, log=None)
+    assert a_near["crop_w"][mid].mean() > 2700          # 근경 확장 유지

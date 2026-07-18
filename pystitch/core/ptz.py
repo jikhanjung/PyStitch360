@@ -504,6 +504,7 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
                ball_conf=0.25, max_jump_per_frame=120.0, gap_fill_sec=2.0,
                sigma_slow=1.2, sigma_fast=0.35, fast_err_px=400.0,
                zoom_margin=260.0, top_margin=160, near_widen=1.6,
+               far_zoom=1.0,
                decoy_static_px=30.0, decoy_iso_px=700.0, decoy_win_sec=3.0,
                keyframes=None, kf_suppress_sec=1.5, kf_bridge_sec=8.0,
                wide=False, ignore_ranges=None, linked=None, log=print):
@@ -524,6 +525,9 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
       상단 여백(px). 최대 줌아웃 높이도 이만큼 줄어든다.
     - near_widen: 공이 화면 아래(근경)일수록 크롭을 넓힘 — 가까운 선수는
       크게 보이므로 타이트한 줌인이 불필요. 원경 1.0배 → 최하단 near_widen배.
+    - far_zoom: 원경 공에 대한 추가 줌인 배율 (1.0=없음). 크롭 폭이
+      out_w/far_zoom 까지 줄어들며 출력 시 업스케일된다 (원경은 원본
+      디테일이 작아 체감 손실 미미).
     - wide=True: 감상용 와이드 모드 — 크롭 폭을 항상 최대(세로 꽉 채움)로
       고정하고 가로만 완만하게 팬. out_w/out_h 를 21:9 등으로 주고
       sigma_slow 를 크게(권장 3.0) 주면 방송 와이드샷처럼 움직인다.
@@ -582,9 +586,10 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
     for i in range(n):                      # 프리컴퓨트 덕에 경량 루프
         if known[i]:
             tx[i], ty[i] = filled[i]
-            # 근경 공은 넓게: 원경(경기장 상단) 1.0배 → 최하단 near_widen배
+            # 원경 out_w/far_zoom(추가 줌인) → 최하단 out_w*near_widen 선형 보간
             depth_t = min(max((ty[i] - field_top) / max(pano_h - field_top, 1), 0.0), 1.0)
-            zw[i] = min(out_w * (1 + (near_widen - 1) * depth_t), max_crop_w)
+            zw_far = out_w / max(far_zoom, 1.0)
+            zw[i] = min(zw_far + (out_w * near_widen - zw_far) * depth_t, max_crop_w)
         elif p_cnt[i] >= 3:
             tx[i], ty[i] = p_tx[i], p_ty[i]
             zw[i] = min(max(p_span[i] + 2 * zoom_margin, out_w), max_crop_w)
@@ -663,7 +668,8 @@ def render_plan(pano_path, out_path, plan, out_w=1920, out_h=1080,
             y0 = max(min(top_margin, pano_h - h), min(y0, pano_h - h))
             crop = frame[y0:y0 + h, x0:x0 + w]
             if w != out_w:
-                crop = cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_AREA)
+                interp = cv2.INTER_AREA if w > out_w else cv2.INTER_CUBIC
+                crop = cv2.resize(crop, (out_w, out_h), interpolation=interp)
             enc.stdin.write(np.ascontiguousarray(crop).tobytes())
             done += 1
             if done % 90 == 0 and progress is not None:
