@@ -467,7 +467,7 @@ def render_plan(pano_path, out_path, plan, out_w=1920, out_h=1080,
     import subprocess
     import time
 
-    from .encoders import encoder_args
+    from .encoders import encoder_args, ffmpeg_bin
     cap = cv2.VideoCapture(str(pano_path))
     pano_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     pano_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
