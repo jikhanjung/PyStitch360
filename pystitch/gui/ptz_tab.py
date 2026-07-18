@@ -632,20 +632,22 @@ class PtzTab(QWidget):
             self.progress.setFormat(f"프록시 생성 %p%")
 
     def _sidecar_path(self) -> Path:
-        """파노라마당 단일 사이드카: {analysis, keyframes, ignores}."""
+        """사용자 에디트 사이드카: {keyframes, ignores, promotes}."""
         return self.pano_path.with_suffix(".ptz.json")
 
-    def _legacy_analysis_path(self) -> Path:
+    def _analysis_path(self) -> Path:
+        """순수 분석 결과 (분석 완료 시 1회 기록, 검수로는 불변)."""
         return self.pano_path.with_suffix(".analysis.json")
 
     def _kf_path(self) -> Path:                 # 구버전 (마이그레이션용)
         return self.pano_path.with_suffix(".ptz_keyframes.json")
 
     def _load_sidecar(self):
-        """통합 사이드카 로드. 구버전 두 파일이 있으면 병합 후 이전.
+        """에디트(.ptz.json)와 순수 분석(.analysis.json)을 분리 로드.
 
-        구형 .analysis.json 이 통합본보다 새로우면(외부에서 분석을 돌린 경우)
-        그쪽 분석을 채택한다.
+        구 통합본(.ptz.json 안에 analysis 포함)은 두 파일로 쪼개 이전한다.
+        검수 마킹은 비파괴라 통합본의 analysis 키가 곧 순수 원본이다.
+        .analysis.json 이 사이드카보다 새로우면(외부 분석) 그쪽을 채택.
         """
         self.keyframes, self.ignores, self.promotes, self.analysis = \
             [], [], [], None
@@ -660,16 +662,15 @@ class PtzTab(QWidget):
             self.keyframes = [list(k) for k in doc.get("keyframes", [])]
             self.ignores = [list(r) for r in doc.get("ignores", [])]
             self.promotes = [list(p) for p in doc.get("promotes", [])]
-            self.analysis = doc.get("analysis")
-        migrated = False
-        la = self._legacy_analysis_path()
-        if la.exists() and (doc is None or
-                            la.stat().st_mtime > sp.stat().st_mtime):
+            self.analysis = doc.get("analysis")   # 구 통합본 (이전 대상)
+        migrated = self.analysis is not None
+        ap = self._analysis_path()
+        if ap.exists() and (self.analysis is None or
+                            ap.stat().st_mtime > sp.stat().st_mtime):
             try:
-                self.analysis = json.loads(la.read_text())
-                migrated = True
+                self.analysis = json.loads(ap.read_text())
             except Exception as e:  # noqa: BLE001
-                self.log(f"[ptz] 구형 분석 무시: {e}")
+                self.log(f"[ptz] 분석 파일 무시: {e}")
         if doc is None and self._kf_path().exists():
             try:
                 d = json.loads(self._kf_path().read_text())
@@ -688,8 +689,10 @@ class PtzTab(QWidget):
                 self.log("[ptz] 사이드카 분석이 다른 영상 기준 — 무시")
                 self.analysis = None
         if migrated:
+            self._write_analysis()
             self._write_sidecar()
-            self.log("[ptz] 구버전 사이드카를 통합본(.ptz.json)으로 이전")
+            self.log("[ptz] 사이드카 분리: 분석(.analysis.json) / "
+                     "에디트(.ptz.json)")
         if self.analysis is not None:
             self.log(f"[ptz] 분석 불러옴 (검출 샘플 "
                      f"{len(self.analysis['frames'])}개), 키프레임 "
@@ -698,15 +701,24 @@ class PtzTab(QWidget):
         self._refresh_lists()
 
     def _write_sidecar(self):
+        """사용자 에디트만 저장 — 분석과 분리돼 있어 작고 즉시 쓴다."""
         if self.pano_path is None:
             return
         sp = self._sidecar_path()
         tmp = sp.with_suffix(".ptz.json.tmp")
-        tmp.write_text(json.dumps({"analysis": self.analysis,
-                                   "keyframes": self.keyframes,
+        tmp.write_text(json.dumps({"keyframes": self.keyframes,
                                    "ignores": self.ignores,
                                    "promotes": self.promotes}))
         tmp.replace(sp)
+
+    def _write_analysis(self):
+        """순수 분석 결과 저장 — 분석 완료/이전 시에만, 검수로는 안 바뀜."""
+        if self.pano_path is None or self.analysis is None:
+            return
+        ap = self._analysis_path()
+        tmp = Path(str(ap) + ".tmp")
+        tmp.write_text(json.dumps(self.analysis))
+        tmp.replace(ap)
 
     _MODEL_NAMES = ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt",
                     "yolo11n.pt", "yolo11s.pt", "yolo11m.pt", None]
@@ -768,8 +780,7 @@ class PtzTab(QWidget):
 
     def _analyze_done(self, d):
         self.analysis = d
-        self._write_sidecar()
-        self._legacy_analysis_path().unlink(missing_ok=True)  # 구형 파일 정리
+        self._write_analysis()
         self.btn_analyze.setText("자동 공/선수 분석")
         self.btn_analyze.setEnabled(True)
         self.progress.setRange(0, 1)
