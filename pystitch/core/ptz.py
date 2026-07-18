@@ -148,14 +148,21 @@ def detect_raw(model, frame, det_w=2944, conf=0.2):
 
 def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
                   weights=None, far_boost=True, far_band_frac=0.58,
-                  cancel=None, progress=None, log=print):
+                  cancel=None, progress=None, checkpoint_path=None,
+                  checkpoint_every=1500, log=print):
     """1패스: 프레임 샘플마다 공/선수 검출. 반환 dict 는 JSON 직렬화 가능.
 
     field_top_frac 위(원경 트랙·관중석)의 공/선수는 장외로 버린다.
-    far_boost: 원경 밴드(field_top~far_band_frac)를 원본 해상도 타일 2장으로
+    far_boost: 원경 밴드(field_top~far_band_frac)를 원본 해상도 정사각 타일로
     잘라 공 전용 추가 검출 — 전체 프레임은 ~50% 축소라 원경 공(~10px)이
     뭉개지는 문제를 보완한다. 트래커 상태 보호를 위해 별도 모델 인스턴스 사용.
+
+    checkpoint_path 지정 시 checkpoint_every 샘플마다 부분 결과를 저장하고,
+    같은 조건(영상·파라미터·모델)의 체크포인트가 있으면 그 프레임부터 재개.
+    취소 시에도 그 지점까지 저장한다. (재개 시 ByteTrack 선수 ID 는 경계에서
+    새로 시작 — 팀 분류는 트랙릿 단위라 영향 미미.)
     """
+    import json as _json
     from ultralytics import YOLO
     model = YOLO(str(weights or _DEFAULT_WEIGHTS))
     model_far = YOLO(str(weights or _DEFAULT_WEIGHTS)) if far_boost else None
@@ -172,10 +179,38 @@ def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
     import time
     t0 = time.perf_counter()
     i = 0
+    ckpt_key = {"video": str(path), "detect_every": detect_every, "det_w": det_w,
+                "weights": str(weights or _DEFAULT_WEIGHTS),
+                "far_boost": bool(far_boost)}
+    if checkpoint_path is not None and Path(checkpoint_path).exists():
+        try:
+            ck = _json.loads(Path(checkpoint_path).read_text())
+            if all(ck.get(k) == v for k, v in ckpt_key.items()):
+                frames_idx = ck["frames"]
+                balls = ck["balls"]
+                ball_cands = ck["ball_cands"]
+                players = ck["players"]
+                i = int(ck["next_frame"])
+                cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+                log(f"[analyze] 체크포인트 재개: {i}/{total} 프레임부터")
+        except Exception as e:  # noqa: BLE001
+            log(f"[analyze] 체크포인트 무시: {e}")
+    resume_base = i
+
+    def _save_ckpt():
+        if checkpoint_path is None:
+            return
+        tmp = str(checkpoint_path) + ".tmp"
+        Path(tmp).write_text(_json.dumps(
+            ckpt_key | {"next_frame": i, "frames": frames_idx, "balls": balls,
+                        "ball_cands": ball_cands, "players": players}))
+        Path(tmp).replace(checkpoint_path)
     while True:
         if cancel is not None and cancel():
             cap.release()
-            log("[analyze] 사용자 취소")
+            _save_ckpt()
+            log(f"[analyze] 사용자 취소 — {i}프레임까지 체크포인트 저장"
+                if checkpoint_path else "[analyze] 사용자 취소")
             return None
         ok = cap.grab()
         if not ok:
@@ -250,14 +285,20 @@ def analyze_video(path, detect_every=3, det_w=2944, field_top_frac=0.26,
             balls.append(kept[0] if kept else None)
             ball_cands.append(kept)
             players.append(prow)
+            done_new = i - resume_base
             if len(frames_idx) % 30 == 0 and progress is not None:
                 el = time.perf_counter() - t0
-                progress(i, total, i / max(el, 1e-9))
+                progress(i, total, done_new / max(el, 1e-9))
             if len(frames_idx) % 300 == 0:
                 el = time.perf_counter() - t0
-                log(f"[analyze] {i}/{total} ({i/max(el,1e-9):.1f}fps)")
+                log(f"[analyze] {i}/{total} ({done_new/max(el,1e-9):.1f}fps)")
+            if checkpoint_path is not None and len(frames_idx) % checkpoint_every == 0:
+                _save_ckpt()
         i += 1
     cap.release()
+    if checkpoint_path is not None:
+        Path(checkpoint_path).unlink(missing_ok=True)   # 완료 — 체크포인트 정리
+        Path(str(checkpoint_path) + ".tmp").unlink(missing_ok=True)
     return {"video": str(path), "total_frames": i, "fps": fps,
             "players_fmt": "cxcywh_id_hsv",   # 구캐시(2/4열)와 소비부 호환
             "far_boost": bool(far_boost),

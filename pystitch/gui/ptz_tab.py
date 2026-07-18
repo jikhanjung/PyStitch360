@@ -125,10 +125,11 @@ class AnalyzeWorker(QThread):
     log = pyqtSignal(str)
     failed = pyqtSignal(str)
 
-    def __init__(self, video_path: str, weights=None):
+    def __init__(self, video_path: str, weights=None, checkpoint_path=None):
         super().__init__()
         self.video_path = video_path
         self.weights = weights
+        self.checkpoint_path = checkpoint_path
         self._cancel = False
 
     def cancel(self):
@@ -139,6 +140,7 @@ class AnalyzeWorker(QThread):
             d = analyze_video(self.video_path, weights=self.weights,
                               cancel=lambda: self._cancel,
                               progress=lambda i, t, f: self.progress.emit(i, t, f),
+                              checkpoint_path=self.checkpoint_path,
                               log=lambda s: self.log.emit(s))
             if d is None:
                 self.failed.emit("취소됨")
@@ -350,6 +352,8 @@ class PtzTab(QWidget):
         self._build_ui()
         self._plan_timer = QTimer(singleShot=True, interval=150)
         self._plan_timer.timeout.connect(self._run_plan)
+        self._save_timer = QTimer(singleShot=True, interval=1500)
+        self._save_timer.timeout.connect(self._write_sidecar)
 
     # ------------------------------------------------------------ UI
     def _build_ui(self):
@@ -546,8 +550,7 @@ class PtzTab(QWidget):
         if not ptz_available():
             self.btn_analyze.setToolTip("ultralytics 미설치 (pip install ultralytics)")
         self.analysis = None
-        self._load_keyframes()
-        self._load_cached_analysis()
+        self._load_sidecar()
         self._show_frame()
         self._update_export_enabled()
 
@@ -601,25 +604,79 @@ class PtzTab(QWidget):
             self.progress.setValue(int(p * 1000))
             self.progress.setFormat(f"프록시 생성 %p%")
 
-    def _analysis_cache(self) -> Path:
+    def _sidecar_path(self) -> Path:
+        """파노라마당 단일 사이드카: {analysis, keyframes, ignores}."""
+        return self.pano_path.with_suffix(".ptz.json")
+
+    def _legacy_analysis_path(self) -> Path:
         return self.pano_path.with_suffix(".analysis.json")
 
-    def _kf_path(self) -> Path:
+    def _kf_path(self) -> Path:                 # 구버전 (마이그레이션용)
         return self.pano_path.with_suffix(".ptz_keyframes.json")
 
-    def _load_cached_analysis(self):
-        c = self._analysis_cache()
-        if c.exists():
+    def _load_sidecar(self):
+        """통합 사이드카 로드. 구버전 두 파일이 있으면 병합 후 이전.
+
+        구형 .analysis.json 이 통합본보다 새로우면(외부에서 분석을 돌린 경우)
+        그쪽 분석을 채택한다.
+        """
+        self.keyframes, self.ignores, self.analysis = [], [], None
+        sp = self._sidecar_path()
+        doc = None
+        if sp.exists():
             try:
-                d = json.loads(c.read_text())
-                # 컨테이너 메타데이터와 실제 디코딩 프레임 수는 약간 다를 수 있음
-                if abs(d.get("total_frames", 0) - self.total) <= max(60, self.total // 100):
-                    self.analysis = d
-                    self.log(f"[ptz] 분석 캐시 불러옴: {c.name} "
-                             f"(검출 샘플 {len(d['frames'])}개)")
-                    self._start_link()
+                doc = json.loads(sp.read_text())
             except Exception as e:  # noqa: BLE001
-                self.log(f"[ptz] 분석 캐시 무시: {e}")
+                self.log(f"[ptz] 사이드카 무시: {e}")
+        if doc is not None:
+            self.keyframes = [list(k) for k in doc.get("keyframes", [])]
+            self.ignores = [list(r) for r in doc.get("ignores", [])]
+            self.analysis = doc.get("analysis")
+        migrated = False
+        la = self._legacy_analysis_path()
+        if la.exists() and (doc is None or
+                            la.stat().st_mtime > sp.stat().st_mtime):
+            try:
+                self.analysis = json.loads(la.read_text())
+                migrated = True
+            except Exception as e:  # noqa: BLE001
+                self.log(f"[ptz] 구형 분석 무시: {e}")
+        if doc is None and self._kf_path().exists():
+            try:
+                d = json.loads(self._kf_path().read_text())
+                if isinstance(d, list):
+                    self.keyframes = [list(k) for k in d]
+                else:
+                    self.keyframes = [list(k) for k in d.get("keyframes", [])]
+                    self.ignores = [list(r) for r in d.get("ignores", [])]
+                migrated = True
+            except Exception as e:  # noqa: BLE001
+                self.log(f"[ptz] 구형 키프레임 무시: {e}")
+        # 분석 유효성 (프레임 수 허용 오차)
+        if self.analysis is not None:
+            if abs(self.analysis.get("total_frames", 0) - self.total) \
+                    > max(60, self.total // 100):
+                self.log("[ptz] 사이드카 분석이 다른 영상 기준 — 무시")
+                self.analysis = None
+        if migrated:
+            self._write_sidecar()
+            self.log("[ptz] 구버전 사이드카를 통합본(.ptz.json)으로 이전")
+        if self.analysis is not None:
+            self.log(f"[ptz] 분석 불러옴 (검출 샘플 "
+                     f"{len(self.analysis['frames'])}개), 키프레임 "
+                     f"{len(self.keyframes)}개, 무시 {len(self.ignores)}개")
+            self._start_link()
+        self._refresh_lists()
+
+    def _write_sidecar(self):
+        if self.pano_path is None:
+            return
+        sp = self._sidecar_path()
+        tmp = sp.with_suffix(".ptz.json.tmp")
+        tmp.write_text(json.dumps({"analysis": self.analysis,
+                                   "keyframes": self.keyframes,
+                                   "ignores": self.ignores}))
+        tmp.replace(sp)
 
     _MODEL_NAMES = ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt",
                     "yolo11n.pt", "yolo11s.pt", "yolo11m.pt", None]
@@ -660,7 +717,9 @@ class PtzTab(QWidget):
         weights = self._model_weights()
         self.log(f"[ptz] 자동 분석 시작 (모델: {weights or 'yolov8n(내장)'}) — "
                  "진행은 로그에 표시")
-        w = AnalyzeWorker(str(self.pano_path), weights=weights)
+        ckpt = str(self.pano_path.with_suffix(".analysis.part.json"))
+        w = AnalyzeWorker(str(self.pano_path), weights=weights,
+                          checkpoint_path=ckpt)
         w.progress.connect(self._analyze_progress)
         w.log.connect(self.log)
         w.done.connect(self._analyze_done)
@@ -679,7 +738,8 @@ class PtzTab(QWidget):
 
     def _analyze_done(self, d):
         self.analysis = d
-        self._analysis_cache().write_text(json.dumps(d))
+        self._write_sidecar()
+        self._legacy_analysis_path().unlink(missing_ok=True)  # 구형 파일 정리
         self.btn_analyze.setText("자동 공/선수 분석")
         self.btn_analyze.setEnabled(True)
         self.progress.setRange(0, 1)
@@ -916,26 +976,9 @@ class PtzTab(QWidget):
             self._redraw()
 
     def _save_keyframes(self):
-        if self.pano_path is not None:
-            self._kf_path().write_text(json.dumps(
-                {"keyframes": self.keyframes, "ignores": self.ignores}))
+        """마킹 변경 저장 (1.5s 디바운스 — 분석 포함 파일이라 통으로 씀)."""
+        self._save_timer.start()
 
-    def _load_keyframes(self):
-        self.keyframes, self.ignores = [], []
-        p = self._kf_path()
-        if p.exists():
-            try:
-                d = json.loads(p.read_text())
-                if isinstance(d, list):          # 구버전: 키프레임 목록만
-                    self.keyframes = [list(k) for k in d]
-                else:
-                    self.keyframes = [list(k) for k in d.get("keyframes", [])]
-                    self.ignores = [list(r) for r in d.get("ignores", [])]
-                self.log(f"[ptz] 키프레임 {len(self.keyframes)}개, "
-                         f"무시 구간 {len(self.ignores)}개 불러옴")
-            except Exception as e:  # noqa: BLE001
-                self.log(f"[ptz] 키프레임 파일 무시: {e}")
-        self._refresh_kf_list()
 
     def _far_zoom_changed(self, v):
         QSettings("PyStitch360", "PyStitch360").setValue("ptz_far_zoom", v)
