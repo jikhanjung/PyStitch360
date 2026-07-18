@@ -358,39 +358,10 @@ class PtzTab(QWidget):
         top.addWidget(self.btn_analyze)
         v.addLayout(top)
 
-        mid = QHBoxLayout()
+        # 영상은 전체 폭 사용, 목록·레이더는 하단 스트립으로
         self.pane = FramePane("클릭 = 현재 시각의 공 위치 키프레임", interactive=True)
         self.pane.clicked.connect(self._pane_clicked)
-        mid.addWidget(self.pane, 1)
-        side = QVBoxLayout()
-        self.radar = RadarView()
-        side.addWidget(self.radar)
-        self.check_players = QCheckBox("선수 표시 (팀 색)")
-        self.check_players.setChecked(True)
-        self.check_players.toggled.connect(lambda _: self._redraw())
-        side.addWidget(self.check_players)
-        side.addWidget(QLabel("공 트랙 (선택=이동)"))
-        self.track_list = QListWidget()
-        self.track_list.setMaximumWidth(240)
-        # 클릭·키보드 화살표 선택 모두에서 이동 (currentRowChanged 는 둘 다 발생)
-        self.track_list.currentRowChanged.connect(lambda _: self._goto_track())
-        QShortcut(QKeySequence(Qt.Key.Key_Delete), self.track_list,
-                  activated=self._ignore_selected_track,
-                  context=Qt.ShortcutContext.WidgetShortcut)
-        side.addWidget(self.track_list, 1)
-        side.addWidget(QLabel("키프레임·무시 구간 (더블클릭=이동)"))
-        self.kf_list = QListWidget()
-        self.kf_list.setMaximumWidth(240)
-        self.kf_list.itemDoubleClicked.connect(self._goto_kf)
-        side.addWidget(self.kf_list, 1)
-        btn_del = QPushButton("선택 삭제")
-        btn_del.clicked.connect(self._delete_kf)
-        side.addWidget(btn_del)
-        self.btn_ignore = QPushButton("현재 공 트랙 무시 (오인식)")
-        self.btn_ignore.clicked.connect(self._ignore_current_track)
-        side.addWidget(self.btn_ignore)
-        mid.addLayout(side)
-        v.addLayout(mid, 1)
+        v.addWidget(self.pane, 1)
 
         tl = QHBoxLayout()
         self.btn_play = QPushButton("▶ 재생")
@@ -429,6 +400,47 @@ class PtzTab(QWidget):
         v.addLayout(tl)
         self._slider_timer = QTimer(singleShot=True, interval=120)
         self._slider_timer.timeout.connect(self._show_frame)
+
+        # 하단 스트립: 공 목록 | 오인식 목록 | 레이더 (로그 위 공간 활용)
+        strip = QHBoxLayout()
+        col_ball = QVBoxLayout()
+        col_ball.addWidget(QLabel("공 — 자동 트랙 + 수동 지정 (↑↓=이동, →=오인식으로)"))
+        self.track_list = QListWidget()
+        self.track_list.setMaximumHeight(150)
+        # 클릭·키보드 화살표 선택 모두에서 이동 (currentRowChanged 는 둘 다 발생)
+        self.track_list.currentRowChanged.connect(lambda _: self._goto_track())
+        QShortcut(QKeySequence(Qt.Key.Key_Right), self.track_list,
+                  activated=self._ignore_selected_track,
+                  context=Qt.ShortcutContext.WidgetShortcut)
+        col_ball.addWidget(self.track_list, 1)
+        self.btn_ignore = QPushButton("현재 공 트랙 무시 (오인식)")
+        self.btn_ignore.clicked.connect(self._ignore_current_track)
+        col_ball.addWidget(self.btn_ignore)
+        strip.addLayout(col_ball, 2)
+
+        col_ig = QVBoxLayout()
+        col_ig.addWidget(QLabel("오인식 — 공 아님 (더블클릭=이동, ←=복원)"))
+        self.kf_list = QListWidget()
+        self.kf_list.setMaximumHeight(150)
+        self.kf_list.itemDoubleClicked.connect(self._goto_kf)
+        QShortcut(QKeySequence(Qt.Key.Key_Left), self.kf_list,
+                  activated=self._delete_kf,
+                  context=Qt.ShortcutContext.WidgetShortcut)
+        col_ig.addWidget(self.kf_list, 1)
+        btn_del = QPushButton("선택 복원 (오인식 취소)")
+        btn_del.clicked.connect(self._delete_kf)
+        col_ig.addWidget(btn_del)
+        strip.addLayout(col_ig, 2)
+
+        col_radar = QVBoxLayout()
+        self.radar = RadarView()
+        col_radar.addWidget(self.radar)
+        self.check_players = QCheckBox("선수 표시 (팀 색)")
+        self.check_players.setChecked(True)
+        self.check_players.toggled.connect(lambda _: self._redraw())
+        col_radar.addWidget(self.check_players)
+        strip.addLayout(col_radar, 1)
+        v.addLayout(strip)
 
         bottom = QHBoxLayout()
         bottom.addWidget(QLabel("출력"))
@@ -782,50 +794,52 @@ class PtzTab(QWidget):
         self._redraw()
         self.log(f"[ptz] 키프레임 {f/self.fps:.1f}s → ({x:.0f}, {y:.0f})")
 
-    def _refresh_kf_list(self):
-        self.kf_list.clear()
-        self._entries = ([("kf", i) for i in range(len(self.keyframes))]
-                         + [("ig", i) for i in range(len(self.ignores))])
-        self._entries.sort(key=lambda e: (self.keyframes[e[1]][0] if e[0] == "kf"
-                                          else self.ignores[e[1]][0]))
-        for kind, i in self._entries:
-            if kind == "kf":
+    def _refresh_lists(self):
+        """위: 공(자동 트랙+수동 키프레임) / 아래: 오인식(무시 구간)."""
+        # 위 목록 — 시간순 병합
+        self._top = ([("track", i) for i in range(len(self.track_spans))]
+                     + [("kf", i) for i in range(len(self.keyframes))])
+        self._top.sort(key=lambda e: (self.track_spans[e[1]][0] if e[0] == "track"
+                                      else self.keyframes[e[1]][0]))
+        self.track_list.blockSignals(True)
+        self.track_list.clear()
+        for kind, i in self._top:
+            if kind == "track":
+                f0, f1 = self.track_spans[i]
+                t0, t1 = f0 / self.fps, f1 / self.fps
+                self.track_list.addItem(
+                    f"{int(t0//60):02d}:{t0%60:04.1f} ~ "
+                    f"{int(t1//60):02d}:{t1%60:04.1f}  ({t1-t0:.1f}s) 자동")
+            else:
                 kf, kx, ky = self.keyframes[i]
                 t = kf / self.fps
-                self.kf_list.addItem(
-                    f"{int(t//60):02d}:{t%60:04.1f}  공 ({kx:.0f}, {ky:.0f})")
-            else:
-                f0, f1 = self.ignores[i]
-                self.kf_list.addItem(
-                    f"{int(f0/self.fps//60):02d}:{f0/self.fps%60:04.1f}~"
-                    f"{int(f1/self.fps//60):02d}:{f1/self.fps%60:04.1f}  무시")
+                self.track_list.addItem(
+                    f"{int(t//60):02d}:{t%60:04.1f}  ● 수동 ({kx:.0f}, {ky:.0f})")
+        self.track_list.blockSignals(False)
+        # 아래 목록 — 오인식만
+        self.kf_list.clear()
+        for f0, f1 in self.ignores:
+            self.kf_list.addItem(
+                f"{int(f0/self.fps//60):02d}:{f0/self.fps%60:04.1f}~"
+                f"{int(f1/self.fps//60):02d}:{f1/self.fps%60:04.1f}  공 아님")
 
-    def _selected_entry(self):
-        row = self.kf_list.currentRow()
-        if 0 <= row < len(getattr(self, "_entries", [])):
-            return self._entries[row]
-        return None
+    # 기존 호출부 호환 별칭
+    _refresh_kf_list = _refresh_lists
+    _refresh_track_list = _refresh_lists
 
     def _goto_kf(self):
-        e = self._selected_entry()
-        if e is None:
-            return
-        f = self.keyframes[e[1]][0] if e[0] == "kf" else self.ignores[e[1]][0]
-        self.slider.setValue(int(f))
+        row = self.kf_list.currentRow()
+        if 0 <= row < len(self.ignores):
+            self.slider.setValue(int(self.ignores[row][0]))
 
     def _delete_kf(self):
-        e = self._selected_entry()
-        if e is None:
-            return
-        if e[0] == "kf":
-            del self.keyframes[e[1]]
-            self._plan_dirty()
-        else:
-            del self.ignores[e[1]]
+        """선택 복원 — 오인식 마킹을 철회해 트랙을 되살린다."""
+        row = self.kf_list.currentRow()
+        if 0 <= row < len(self.ignores):
+            del self.ignores[row]
+            self._save_keyframes()
             self._recompute_tracks()
-        self._save_keyframes()
-        self._refresh_kf_list()
-        self._redraw()
+            self._redraw()
 
     def _save_keyframes(self):
         if self.pano_path is not None:
@@ -912,18 +926,13 @@ class PtzTab(QWidget):
         self._refresh_track_list()
         self._plan_dirty()
 
-    def _refresh_track_list(self):
-        self.track_list.clear()
-        for f0, f1 in self.track_spans:
-            t0, t1 = f0 / self.fps, f1 / self.fps
-            self.track_list.addItem(
-                f"{int(t0//60):02d}:{t0%60:04.1f} ~ {int(t1//60):02d}:{t1%60:04.1f}"
-                f"  ({t1-t0:.1f}s)")
-
     def _goto_track(self):
         row = self.track_list.currentRow()
-        if 0 <= row < len(self.track_spans):
-            self.slider.setValue(int(self.track_spans[row][0]))
+        if 0 <= row < len(getattr(self, "_top", [])):
+            kind, i = self._top[row]
+            f = (self.track_spans[i][0] if kind == "track"
+                 else self.keyframes[i][0])
+            self.slider.setValue(int(f))
 
     def _jump_track(self, direction: int):
         """현재 위치 기준 이전(-1)/다음(+1) 수락 트랙 시작으로 이동."""
@@ -939,11 +948,22 @@ class PtzTab(QWidget):
                 self.slider.setValue(int(prv[-1][0]))
 
     def _ignore_selected_track(self):
-        """트랙 목록에서 Del — 선택된 트랙을 무시로 보냄."""
+        """위 목록에서 Del — 자동 트랙은 오인식으로, 수동 지정은 삭제."""
         row = self.track_list.currentRow()
-        if 0 <= row < len(self.track_spans):
-            self.slider.setValue(int(self.track_spans[row][0]))
+        if not (0 <= row < len(getattr(self, "_top", []))):
+            return
+        kind, i = self._top[row]
+        if kind == "track":
+            self.slider.setValue(int(self.track_spans[i][0]))
             self._ignore_current_track()
+        else:
+            del self.keyframes[i]
+            self._save_keyframes()
+            self._refresh_lists()
+            self.trackbar.set_data(self.total, self.track_spans,
+                                   self.ignores, self.keyframes)
+            self._plan_dirty()
+            self._redraw()
 
     def _ignore_current_track(self):
         """현재 시각을 덮는 수락 트랙을 통째로 무시 목록에 추가."""
@@ -972,12 +992,14 @@ class PtzTab(QWidget):
                 extra = f" (같은 자리 반복 포함 {added}개 구간)" if added > 1 else ""
                 self.log(f"[ptz] 트랙 무시: {f0/self.fps:.1f}s ~ "
                          f"{f1/self.fps:.1f}s{extra}")
-                # 검수 흐름: 다음 트랙 자동 선택 + 이동
-                nxt = [i for i, sp in enumerate(self.track_spans) if sp[0] > f0]
-                row = nxt[0] if nxt else len(self.track_spans) - 1
+                # 검수 흐름: 다음 항목 자동 선택 + 이동
+                def _start(e):
+                    return (self.track_spans[e[1]][0] if e[0] == "track"
+                            else self.keyframes[e[1]][0])
+                nxt = [r for r, e in enumerate(self._top) if _start(e) > f0]
+                row = nxt[0] if nxt else len(self._top) - 1
                 if row >= 0:
                     self.track_list.setCurrentRow(row)
-                    self.slider.setValue(int(self.track_spans[row][0]))
                 return
         QMessageBox.information(self, "무시", "현재 시각을 덮는 공 트랙이 없습니다.")
 

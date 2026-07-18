@@ -432,7 +432,7 @@ def link_ball_tracks(analysis, ball_conf=0.25, max_jump_per_frame=120.0):
 def accept_ball_tracks(analysis, ball_conf=0.25, max_jump_per_frame=120.0,
                        decoy_static_px=30.0, decoy_iso_px=700.0,
                        decoy_win_sec=3.0, ignore_ranges=None, linked=None,
-                       log=None):
+                       spot_radius=60.0, log=None):
     """공 트랙 수락/기각 (트랙 단위 오검출 처리).
 
     트랙 통계(정지/고립/중복)로 통째로 기각 — 정지 낙엽, 장외에서 움직이는
@@ -488,10 +488,21 @@ def accept_ball_tracks(analysis, ball_conf=0.25, max_jump_per_frame=120.0,
         accepted.append(t)
         covered[lo:hi + 1] = True
 
+    # 무시된 트랙들의 위치(스팟): 수락 트랙에 흡수된 같은 자리 샘플도
+    # 제거해, 크롭이 오인식 지점으로 끌려가는 것을 막는다 (시간+공간 무시)
+    spots = [np.median(cand[t], axis=0) for t in tracks
+             if _ignored(t) and len(t) >= 2]
     ball = np.full((n, 2), np.nan)
+    dropped_spot = 0
     for t in accepted:
         for i in t:
+            if spots and min(float(np.hypot(*(cand[i] - sp)))
+                             for sp in spots) <= spot_radius:
+                dropped_spot += 1
+                continue
             ball[i] = cand[i]
+    if log and dropped_spot:
+        log(f"[plan] 무시 지점 근처 샘플 {dropped_spot}개 추가 제거")
     if log and (tracks or accepted):
         log(f"[plan] 공 트랙 {len(tracks)}개 → 수락 {len(accepted)}개 "
             f"(기각: 정지미끼 {rej['static']}, 장외고립 {rej['isolated']}, "

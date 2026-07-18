@@ -283,3 +283,31 @@ def test_far_zoom_tightens_far_crop_only():
     a_near = build_plan(_analysis(frames, near_balls), PANO_W, PANO_H,
                         far_zoom=1.2, log=None)
     assert a_near["crop_w"][mid].mean() > 2700          # 근경 확장 유지
+
+
+def test_ignored_spot_samples_removed_from_accepted_tracks():
+    """무시 트랙의 '자리'에 흡수된 샘플은 수락 트랙 안이라도 제거."""
+    from pystitch.core.ptz import accept_ball_tracks
+    frames = list(range(0, 1200, 3))
+    balls = []
+    for f in frames:
+        if 600 <= f < 900:
+            balls.append([4900.0, 1350.0, 0.5])       # 순수 낙엽 트랙
+        elif 200 <= f < 500:
+            # 진짜 공이 낙엽 근처(30px)를 지남 — 트랙에 흡수될 샘플
+            x = 4400.0 + (f - 200) * 2.0
+            if 440 <= f < 470:
+                balls.append([4910.0, 1345.0, 0.5])   # 낙엽 위치로 튄 오검출
+            else:
+                balls.append([x, 1000.0, 0.5])
+        else:
+            balls.append(None)
+    a = _analysis(frames, balls)
+    _, ball, spans = accept_ball_tracks(a, ignore_ranges=[(600, 897)])
+    idx = np.array(a["frames"])
+    # 낙엽 위치로 튄 샘플(440~470)은 수락 트랙 소속이어도 NaN
+    m = (idx >= 440) & (idx < 470)
+    assert np.all(np.isnan(ball[m, 0]))
+    # 그 앞뒤 진짜 궤적은 유지
+    keep = (idx >= 200) & (idx < 430)
+    assert np.isfinite(ball[keep, 0]).mean() > 0.9
