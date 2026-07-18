@@ -119,7 +119,7 @@ class MainWindow(QMainWindow):
         self._rebuild_recent_menu()
 
     def _open_recent(self, path: str):
-        self._busy(True)
+        self._busy(True, flush=True)
         try:
             d = load_project(path)
             self._apply_project(d)
@@ -133,10 +133,17 @@ class MainWindow(QMainWindow):
         self.log(f"[project] 열기: {path}")
         self._remember_recent(path)
 
-    def _busy(self, on: bool):
-        """블로킹 작업/백그라운드 대기 중 wait cursor 표시 (스택 균형 유지할 것)."""
+    def _busy(self, on: bool, flush: bool = False):
+        """블로킹 작업/백그라운드 대기 중 wait cursor 표시 (스택 균형 유지할 것).
+
+        flush=True 면 커서 변경을 즉시 화면에 반영 — 이어서 GUI 스레드가
+        블로킹되는 경우(프로젝트/영상 열기) 필수. 단 이벤트 재진입 위험이
+        있으니 슬라이더 디바운스 같은 고빈도 경로에서는 쓰지 말 것.
+        """
         if on:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            if flush:
+                QApplication.processEvents()
         else:
             QApplication.restoreOverrideCursor()
 
@@ -333,7 +340,7 @@ class MainWindow(QMainWindow):
         self._load_side(side, find_chapters(path))
 
     def _load_side(self, side: str, files):
-        self._busy(True)
+        self._busy(True, flush=True)
         try:
             chapters = [Path(f) for f in files]
             vid = ChapteredVideo(chapters)

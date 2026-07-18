@@ -205,41 +205,21 @@ def _gaussian1d(x, sigma):
     return np.convolve(pad, k, "valid")
 
 
-def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
-               ball_conf=0.25, max_jump_per_frame=120.0, gap_fill_sec=2.0,
-               sigma_slow=1.2, sigma_fast=0.35, fast_err_px=400.0,
-               zoom_margin=260.0, top_margin=160,
-               decoy_static_px=30.0, decoy_iso_px=700.0, decoy_win_sec=3.0,
-               keyframes=None, kf_suppress_sec=1.5, kf_bridge_sec=8.0,
-               wide=False, log=print):
-    """검출 궤적 → 프레임별 (cx, cy, crop_w) 계획.
+def accept_ball_tracks(analysis, ball_conf=0.25, max_jump_per_frame=120.0,
+                       decoy_static_px=30.0, decoy_iso_px=700.0,
+                       decoy_win_sec=3.0, ignore_ranges=None, log=None):
+    """공 후보를 트랙으로 묶고 트랙 단위로 수락/기각.
 
-    - 공: conf 게이팅 + 점프 게이팅, gap_fill_sec 까지 선형 보간.
-    - 정적 미끼 필터: decoy_win_sec 창 내내 decoy_static_px 안에 정지해 있고
-      모든 선수로부터 decoy_iso_px 이상 고립된 '공'은 오검출(낙엽·마킹 등)로
-      기각. 실제 공은 경기 중 장시간 정지+고립 상태가 없다 (코너킥 준비 등
-      짧은 예외는 줌아웃으로 처리돼 해가 없음).
-    - keyframes: [(frame_idx, x, y), ...] 사용자 지정 공 위치. 자동 검출보다
-      우선한다 — 키프레임 ±kf_suppress_sec 의 자동 샘플은 버리고, 인접
-      키프레임끼리는 kf_bridge_sec 까지 직접 보간으로 잇는다.
-    - 공 없는 구간: 선수 중앙값 주변(트림 평균) 목표 + 줌아웃(선수 분포 커버).
-    - 스무딩: 기본 sigma_slow(초). 잔차가 fast_err_px 를 넘는 구간(공이 빠르게
-      이동)만 sigma_fast 추종으로 크로스페이드 — "평상시 최대한 부드럽게".
-    - top_margin: 파노라마 상단 검은 스티칭 경계를 크롭에 넣지 않기 위한
-      상단 여백(px). 최대 줌아웃 높이도 이만큼 줄어든다.
-    - wide=True: 감상용 와이드 모드 — 크롭 폭을 항상 최대(세로 꽉 채움)로
-      고정하고 가로만 완만하게 팬. out_w/out_h 를 21:9 등으로 주고
-      sigma_slow 를 크게(권장 3.0) 주면 방송 와이드샷처럼 움직인다.
+    오검출은 프레임이 아니라 트랙 단위로 다룬다: 시간 연속으로 연결한 뒤
+    트랙 통계(정지/고립/중복)로 통째로 기각 — 정지 낙엽, 장외에서 움직이는
+    다른 공, 순간 오검출이 여기서 걸러진다. ignore_ranges([(f0,f1),...])와
+    겹치는 트랙은 사용자가 오인식으로 지정한 것 — 무조건 기각.
+
+    반환: (idx, ball(n,2), spans) — spans 는 수락 트랙의 (시작,끝) 프레임.
     """
     fps = analysis["fps"]
-    total = analysis["total_frames"]
     idx = np.array(analysis["frames"])
     n = len(idx)
-
-    # --- 0. 공 후보 → 트랙 구성 -----------------------------------------
-    # 오검출은 프레임이 아니라 트랙 단위로 다룬다: 시간 연속으로 연결한 뒤
-    # 트랙 통계(정지/고립/중복)로 통째로 기각 — 정지 낙엽, 장외에서 움직이는
-    # 다른 공, 순간 오검출이 여기서 걸러진다.
     cand = np.array([b[:2] if b is not None and b[2] >= ball_conf else (np.nan, np.nan)
                      for b in analysis["balls"]])
     # 고립도: 선수 검출이 있는 샘플에서만 판정 가능 (없으면 0 = 보수적 유지)
@@ -283,12 +263,21 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
         iso_frac = float(np.mean(iso[t] > decoy_iso_px))
         return r80, dur, iso_frac
 
+    def _ignored(t):
+        if not ignore_ranges:
+            return False
+        f0, f1 = idx[t[0]], idx[t[-1]]
+        return any(f0 <= hi and lo <= f1 for lo, hi in ignore_ranges)
+
     accepted: list[list[int]] = []
     covered = np.zeros(n, bool)
-    rej = {"static": 0, "isolated": 0, "overlap": 0}
+    rej = {"static": 0, "isolated": 0, "overlap": 0, "user": 0}
     # 점수: 길이 + 선수 근접 가점 (경기 공은 선수 곁에 오래 머문다)
     order = sorted(tracks, key=lambda t: -(len(t) * (2.0 - _track_stats(t)[2])))
     for t in order:
+        if _ignored(t):
+            rej["user"] += 1            # 사용자 지정 오인식 구간
+            continue
         r80, dur, iso_frac = _track_stats(t)
         if r80 <= decoy_static_px and iso_frac > 0.5 and dur >= decoy_win_sec:
             rej["static"] += 1          # 정지 + 고립 (낙엽·마킹)
@@ -312,7 +301,47 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
     if log and (tracks or accepted):
         log(f"[plan] 공 트랙 {len(tracks)}개 → 수락 {len(accepted)}개 "
             f"(기각: 정지미끼 {rej['static']}, 장외고립 {rej['isolated']}, "
-            f"중복 {rej['overlap']})")
+            f"중복 {rej['overlap']}, 사용자무시 {rej['user']})")
+    spans = sorted((int(idx[t[0]]), int(idx[t[-1]])) for t in accepted)
+    return idx, ball, spans
+
+
+def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
+               ball_conf=0.25, max_jump_per_frame=120.0, gap_fill_sec=2.0,
+               sigma_slow=1.2, sigma_fast=0.35, fast_err_px=400.0,
+               zoom_margin=260.0, top_margin=160,
+               decoy_static_px=30.0, decoy_iso_px=700.0, decoy_win_sec=3.0,
+               keyframes=None, kf_suppress_sec=1.5, kf_bridge_sec=8.0,
+               wide=False, ignore_ranges=None, log=print):
+    """검출 궤적 → 프레임별 (cx, cy, crop_w) 계획.
+
+    - 공: conf 게이팅 + 점프 게이팅, gap_fill_sec 까지 선형 보간.
+    - 정적 미끼 필터: decoy_win_sec 창 내내 decoy_static_px 안에 정지해 있고
+      모든 선수로부터 decoy_iso_px 이상 고립된 '공'은 오검출(낙엽·마킹 등)로
+      기각. 실제 공은 경기 중 장시간 정지+고립 상태가 없다 (코너킥 준비 등
+      짧은 예외는 줌아웃으로 처리돼 해가 없음).
+    - keyframes: [(frame_idx, x, y), ...] 사용자 지정 공 위치. 자동 검출보다
+      우선한다 — 키프레임 ±kf_suppress_sec 의 자동 샘플은 버리고, 인접
+      키프레임끼리는 kf_bridge_sec 까지 직접 보간으로 잇는다.
+    - 공 없는 구간: 선수 중앙값 주변(트림 평균) 목표 + 줌아웃(선수 분포 커버).
+    - 스무딩: 기본 sigma_slow(초). 잔차가 fast_err_px 를 넘는 구간(공이 빠르게
+      이동)만 sigma_fast 추종으로 크로스페이드 — "평상시 최대한 부드럽게".
+    - top_margin: 파노라마 상단 검은 스티칭 경계를 크롭에 넣지 않기 위한
+      상단 여백(px). 최대 줌아웃 높이도 이만큼 줄어든다.
+    - wide=True: 감상용 와이드 모드 — 크롭 폭을 항상 최대(세로 꽉 채움)로
+      고정하고 가로만 완만하게 팬. out_w/out_h 를 21:9 등으로 주고
+      sigma_slow 를 크게(권장 3.0) 주면 방송 와이드샷처럼 움직인다.
+    """
+    fps = analysis["fps"]
+    total = analysis["total_frames"]
+    idx = np.array(analysis["frames"])
+    n = len(idx)
+
+    # --- 0~1. 공 트랙 수락 (accept_ball_tracks 참조) --------------------
+    _, ball, _ = accept_ball_tracks(
+        analysis, ball_conf=ball_conf, max_jump_per_frame=max_jump_per_frame,
+        decoy_static_px=decoy_static_px, decoy_iso_px=decoy_iso_px,
+        decoy_win_sec=decoy_win_sec, ignore_ranges=ignore_ranges, log=log)
 
     # --- 1.5 사용자 키프레임 병합 (자동보다 우선) -----------------------
     kf_idx = []

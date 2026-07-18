@@ -142,3 +142,15 @@ def test_wide_mode_fixed_zoom_gentle_pan():
     assert np.allclose(plan["crop_w"], max_w, atol=1.0)   # 줌 변동 없음
     step = np.abs(np.diff(plan["cx"][90:-90]))
     assert step.max() < 3.0                               # 완만한 팬
+
+
+def test_ignore_ranges_kill_track():
+    """사용자 무시 구간과 겹치는 트랙은 통째로 기각."""
+    from pystitch.core.ptz import accept_ball_tracks
+    frames = list(range(0, 900, 3))
+    balls = [[2000.0 + f, 900.0, 0.5] for f in frames]
+    a = _analysis(frames, balls)
+    _, ball, spans = accept_ball_tracks(a)
+    assert len(spans) == 1 and not np.isnan(ball[50, 0])
+    _, ball2, spans2 = accept_ball_tracks(a, ignore_ranges=[(400, 500)])
+    assert spans2 == [] and np.all(np.isnan(ball2[:, 0]))   # 한 트랙 전체 기각

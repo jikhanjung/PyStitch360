@@ -12,6 +12,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QPainter
 from PyQt6.QtWidgets import (
     QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout, QLabel, QListWidget,
     QMessageBox, QProgressBar, QPushButton, QSlider, QSpinBox, QVBoxLayout,
@@ -19,8 +20,53 @@ from PyQt6.QtWidgets import (
 )
 
 from ..core.encoders import available_encoders
-from ..core.ptz import analyze_video, build_plan, ptz_available, render_plan
+from ..core.ptz import (
+    accept_ball_tracks, analyze_video, build_plan, ptz_available, render_plan,
+)
 from .widgets import FramePane
+
+
+class TrackBar(QWidget):
+    """타임라인 위 공 트랙 표시줄: 초록=수락 트랙, 빨강=무시 구간, 주황=키프레임.
+
+    클릭하면 해당 프레임으로 이동한다.
+    """
+
+    seek = pyqtSignal(int)
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(16)
+        self.total = 0
+        self.spans: list = []
+        self.ignores: list = []
+        self.kfs: list = []
+
+    def set_data(self, total, spans, ignores, kfs):
+        self.total = max(1, total)
+        self.spans, self.ignores, self.kfs = list(spans), list(ignores), list(kfs)
+        self.update()
+
+    def _x(self, f):
+        return int(f / self.total * (self.width() - 1))
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(40, 40, 40))
+        h = self.height()
+        for f0, f1 in self.spans:
+            p.fillRect(self._x(f0), 2, max(1, self._x(f1) - self._x(f0)), h - 4,
+                       QColor(70, 200, 90))
+        for f0, f1 in self.ignores:
+            p.fillRect(self._x(f0), 2, max(1, self._x(f1) - self._x(f0)), h - 4,
+                       QColor(220, 70, 60))
+        for kf in self.kfs:
+            p.fillRect(self._x(kf[0]) - 1, 0, 3, h, QColor(255, 190, 0))
+        p.end()
+
+    def mousePressEvent(self, ev):
+        if self.total > 1:
+            self.seek.emit(int(ev.position().x() / max(1, self.width() - 1) * self.total))
 
 
 class AnalyzeWorker(QThread):
@@ -40,6 +86,29 @@ class AnalyzeWorker(QThread):
             self.failed.emit(str(e))
 
 
+class PlanWorker(QThread):
+    """크롭 계획 미리보기 재계산 (키프레임/무시 변경 시 백그라운드)."""
+
+    done = pyqtSignal(dict, tuple)   # plan, (out_w, out_h)
+
+    def __init__(self, analysis, keyframes, ignores, wide):
+        super().__init__()
+        self.args = (analysis, keyframes, ignores, wide)
+
+    def run(self):
+        analysis, kfs, ignores, wide = self.args
+        try:
+            out_w, out_h = (2560, 1080) if wide else (1920, 1080)
+            plan = build_plan(analysis, analysis["pano_w"], analysis["pano_h"],
+                              out_w=out_w, out_h=out_h, keyframes=kfs,
+                              wide=wide, ignore_ranges=ignores,
+                              sigma_slow=3.0 if wide else 1.2,
+                              fast_err_px=800.0 if wide else 400.0, log=None)
+            self.done.emit(plan, (out_w, out_h))
+        except Exception:  # noqa: BLE001
+            pass
+
+
 class PtzRenderWorker(QThread):
     progress = pyqtSignal(int, int, float)
     log = pyqtSignal(str)
@@ -47,21 +116,22 @@ class PtzRenderWorker(QThread):
     failed = pyqtSignal(str)
 
     def __init__(self, pano_path, out_path, analysis, keyframes, codec, crf,
-                 wide=False):
+                 wide=False, ignores=None):
         super().__init__()
-        self.args = (pano_path, out_path, analysis, keyframes, codec, crf, wide)
+        self.args = (pano_path, out_path, analysis, keyframes, codec, crf, wide,
+                     ignores or [])
         self._cancel = False
 
     def cancel(self):
         self._cancel = True
 
     def run(self):
-        pano, out, analysis, kfs, codec, crf, wide = self.args
+        pano, out, analysis, kfs, codec, crf, wide, ignores = self.args
         try:
             out_w, out_h = (2560, 1080) if wide else (1920, 1080)
             plan = build_plan(analysis, analysis["pano_w"], analysis["pano_h"],
                               out_w=out_w, out_h=out_h, keyframes=kfs,
-                              wide=wide,
+                              wide=wide, ignore_ranges=ignores,
                               sigma_slow=3.0 if wide else 1.2,
                               fast_err_px=800.0 if wide else 400.0,
                               log=lambda s: self.log.emit(s))
@@ -93,9 +163,16 @@ class PtzTab(QWidget):
         self.pano_w = self.pano_h = 0
         self.analysis: dict | None = None
         self.keyframes: list[list] = []   # [frame, x, y]
+        self.ignores: list[list] = []     # [f0, f1] 사용자 지정 오인식 구간
+        self.track_spans: list = []
         self._analyze_worker = None
         self._render_worker = None
+        self._plan_worker = None
+        self.plan = None
+        self.plan_out = (1920, 1080)
         self._build_ui()
+        self._plan_timer = QTimer(singleShot=True, interval=600)
+        self._plan_timer.timeout.connect(self._run_plan)
 
     # ------------------------------------------------------------ UI
     def _build_ui(self):
@@ -117,7 +194,7 @@ class PtzTab(QWidget):
         self.pane.clicked.connect(self._pane_clicked)
         mid.addWidget(self.pane, 1)
         side = QVBoxLayout()
-        side.addWidget(QLabel("키프레임 (더블클릭=이동)"))
+        side.addWidget(QLabel("키프레임·무시 구간 (더블클릭=이동)"))
         self.kf_list = QListWidget()
         self.kf_list.setMaximumWidth(240)
         self.kf_list.itemDoubleClicked.connect(self._goto_kf)
@@ -125,9 +202,15 @@ class PtzTab(QWidget):
         btn_del = QPushButton("선택 삭제")
         btn_del.clicked.connect(self._delete_kf)
         side.addWidget(btn_del)
+        self.btn_ignore = QPushButton("현재 공 트랙 무시 (오인식)")
+        self.btn_ignore.clicked.connect(self._ignore_current_track)
+        side.addWidget(self.btn_ignore)
         mid.addLayout(side)
         v.addLayout(mid, 1)
 
+        self.trackbar = TrackBar()
+        self.trackbar.seek.connect(lambda f: self.slider.setValue(f))
+        v.addWidget(self.trackbar)
         tl = QHBoxLayout()
         for text, d in [("-10s", -300), ("-1s", -30), ("-1", -1),
                         ("+1", 1), ("+1s", 30), ("+10s", 300)]:
@@ -151,6 +234,7 @@ class PtzTab(QWidget):
         self.combo_mode = QComboBox()
         self.combo_mode.addItems(["공 추적 PTZ (1920×1080)",
                                   "와이드 감상 (2560×1080, 완만한 팬)"])
+        self.combo_mode.currentIndexChanged.connect(lambda _: self._plan_dirty())
         bottom.addWidget(self.combo_mode)
         bottom.addWidget(QLabel("코덱"))
         self.combo_codec = QComboBox()
@@ -234,6 +318,7 @@ class PtzTab(QWidget):
                     self.analysis = d
                     self.log(f"[ptz] 분석 캐시 불러옴: {c.name} "
                              f"(검출 샘플 {len(d['frames'])}개)")
+                    self._recompute_tracks()
             except Exception as e:  # noqa: BLE001
                 self.log(f"[ptz] 분석 캐시 무시: {e}")
 
@@ -263,6 +348,7 @@ class PtzTab(QWidget):
         self.log(f"[ptz] 분석 완료: 샘플 {len(d['frames'])}개, "
                  f"공 검출 {n_ball}개 ({n_ball/max(len(d['frames']),1):.0%}) → 캐시 저장")
         self._update_export_enabled()
+        self._recompute_tracks()
         self._show_frame()
 
     def _analyze_failed(self, msg):
@@ -301,6 +387,18 @@ class PtzTab(QWidget):
         ok, frame = self.cap.read()
         if not ok:
             return
+        # 계획된 크롭 창 (render_plan 과 동일한 클램프) — 결과 미리보기
+        if self.plan is not None and f < len(self.plan["cx"]):
+            ow, oh = self.plan_out
+            top = int(self.plan.get("top_margin", 0))
+            w = int(round(min(self.plan["crop_w"][f], self.pano_w,
+                              self.pano_h * ow / oh))) & ~1
+            h = int(round(w * oh / ow)) & ~1
+            x0 = int(round(self.plan["cx"][f] - w / 2))
+            y0 = int(round(self.plan["cy"][f] - h / 2))
+            x0 = max(0, min(x0, self.pano_w - w))
+            y0 = max(min(top, self.pano_h - h), min(y0, self.pano_h - h))
+            cv2.rectangle(frame, (x0, y0), (x0 + w, y0 + h), (255, 200, 0), 6)
         b = self._current_auto_ball()
         if b is not None:
             cv2.circle(frame, (int(b[0]), int(b[1])), 28, (0, 220, 0), 6)
@@ -323,42 +421,126 @@ class PtzTab(QWidget):
         self.keyframes.sort()
         self._save_keyframes()
         self._refresh_kf_list()
+        self.trackbar.set_data(self.total, self.track_spans,
+                               self.ignores, self.keyframes)
+        self._plan_dirty()
         self._show_frame()
         self.log(f"[ptz] 키프레임 {f/self.fps:.1f}s → ({x:.0f}, {y:.0f})")
 
     def _refresh_kf_list(self):
         self.kf_list.clear()
-        for kf, kx, ky in self.keyframes:
-            t = kf / self.fps
-            self.kf_list.addItem(f"{int(t//60):02d}:{t%60:04.1f}  ({kx:.0f}, {ky:.0f})")
+        self._entries = ([("kf", i) for i in range(len(self.keyframes))]
+                         + [("ig", i) for i in range(len(self.ignores))])
+        self._entries.sort(key=lambda e: (self.keyframes[e[1]][0] if e[0] == "kf"
+                                          else self.ignores[e[1]][0]))
+        for kind, i in self._entries:
+            if kind == "kf":
+                kf, kx, ky = self.keyframes[i]
+                t = kf / self.fps
+                self.kf_list.addItem(
+                    f"{int(t//60):02d}:{t%60:04.1f}  공 ({kx:.0f}, {ky:.0f})")
+            else:
+                f0, f1 = self.ignores[i]
+                self.kf_list.addItem(
+                    f"{int(f0/self.fps//60):02d}:{f0/self.fps%60:04.1f}~"
+                    f"{int(f1/self.fps//60):02d}:{f1/self.fps%60:04.1f}  무시")
+
+    def _selected_entry(self):
+        row = self.kf_list.currentRow()
+        if 0 <= row < len(getattr(self, "_entries", [])):
+            return self._entries[row]
+        return None
 
     def _goto_kf(self):
-        row = self.kf_list.currentRow()
-        if 0 <= row < len(self.keyframes):
-            self.slider.setValue(int(self.keyframes[row][0]))
+        e = self._selected_entry()
+        if e is None:
+            return
+        f = self.keyframes[e[1]][0] if e[0] == "kf" else self.ignores[e[1]][0]
+        self.slider.setValue(int(f))
 
     def _delete_kf(self):
-        row = self.kf_list.currentRow()
-        if 0 <= row < len(self.keyframes):
-            del self.keyframes[row]
-            self._save_keyframes()
-            self._refresh_kf_list()
-            self._show_frame()
+        e = self._selected_entry()
+        if e is None:
+            return
+        if e[0] == "kf":
+            del self.keyframes[e[1]]
+            self._plan_dirty()
+        else:
+            del self.ignores[e[1]]
+            self._recompute_tracks()
+        self._save_keyframes()
+        self._refresh_kf_list()
+        self._show_frame()
 
     def _save_keyframes(self):
         if self.pano_path is not None:
-            self._kf_path().write_text(json.dumps(self.keyframes))
+            self._kf_path().write_text(json.dumps(
+                {"keyframes": self.keyframes, "ignores": self.ignores}))
 
     def _load_keyframes(self):
-        self.keyframes = []
+        self.keyframes, self.ignores = [], []
         p = self._kf_path()
         if p.exists():
             try:
-                self.keyframes = [list(k) for k in json.loads(p.read_text())]
-                self.log(f"[ptz] 키프레임 {len(self.keyframes)}개 불러옴")
+                d = json.loads(p.read_text())
+                if isinstance(d, list):          # 구버전: 키프레임 목록만
+                    self.keyframes = [list(k) for k in d]
+                else:
+                    self.keyframes = [list(k) for k in d.get("keyframes", [])]
+                    self.ignores = [list(r) for r in d.get("ignores", [])]
+                self.log(f"[ptz] 키프레임 {len(self.keyframes)}개, "
+                         f"무시 구간 {len(self.ignores)}개 불러옴")
             except Exception as e:  # noqa: BLE001
                 self.log(f"[ptz] 키프레임 파일 무시: {e}")
         self._refresh_kf_list()
+
+    def _plan_dirty(self):
+        if self.analysis is not None:
+            self._plan_timer.start()
+
+    def _run_plan(self):
+        if self.analysis is None:
+            return
+        if self._plan_worker is not None and self._plan_worker.isRunning():
+            self._plan_timer.start()      # 진행 중이면 잠시 뒤 재시도
+            return
+        w = PlanWorker(self.analysis, [tuple(k) for k in self.keyframes],
+                       [tuple(r) for r in self.ignores],
+                       self.combo_mode.currentIndex() == 1)
+        w.done.connect(self._plan_done)
+        self._plan_worker = w
+        w.start()
+
+    def _plan_done(self, plan, out):
+        self.plan = plan
+        self.plan_out = out
+        self._show_frame()
+
+    def _recompute_tracks(self):
+        """수락 트랙 구간 재계산 → 트랙바 갱신 (분석/무시 구간 변경 시)."""
+        if self.analysis is None:
+            self.track_spans = []
+        else:
+            _, _, self.track_spans = accept_ball_tracks(
+                self.analysis, ignore_ranges=[tuple(r) for r in self.ignores],
+                log=self.log)
+        self.trackbar.set_data(self.total, self.track_spans,
+                               self.ignores, self.keyframes)
+        self._plan_dirty()
+
+    def _ignore_current_track(self):
+        """현재 시각을 덮는 수락 트랙을 통째로 무시 목록에 추가."""
+        f = self.slider.value()
+        for f0, f1 in self.track_spans:
+            if f0 <= f <= f1:
+                self.ignores.append([int(f0), int(f1)])
+                self._save_keyframes()
+                self._recompute_tracks()
+                self._refresh_kf_list()
+                self._show_frame()
+                self.log(f"[ptz] 트랙 무시: {f0/self.fps:.1f}s ~ {f1/self.fps:.1f}s")
+                return
+        QMessageBox.information(self, "무시", "현재 시각을 덮는 공 트랙이 없습니다.")
 
     # ------------------------------------------------------------ 내보내기
     def _update_export_enabled(self):
@@ -379,7 +561,8 @@ class PtzTab(QWidget):
         self.log(f"[ptz] 내보내기 시작: {'와이드' if wide else 'PTZ'} 모드, "
                  f"키프레임 {len(kfs)}개 반영")
         w = PtzRenderWorker(str(self.pano_path), out, self.analysis, kfs,
-                            codec, self.spin_crf.value(), wide=wide)
+                            codec, self.spin_crf.value(), wide=wide,
+                            ignores=[tuple(r) for r in self.ignores])
         w.log.connect(self.log)
         w.progress.connect(self._render_progress)
         w.finished_ok.connect(self._render_done)
