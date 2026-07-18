@@ -344,6 +344,9 @@ class PtzTab(QWidget):
         self._accepted_ball = None        # accept_ball_tracks 의 샘플별 수락 공
         self._hover = None                # 커서가 가리키는 오브젝트
         self._hover_key = None            # hover 변경 감지 키
+        self._plan_box = None             # 현재 프레임에 그려진 크롭 박스 (x0,y0,w,h)
+        self._box_hover = None            # 크롭 박스 hover 존: ("corner",i)|("border",None)
+        self._box_edit = None             # 진행 중인 박스 드래그 상태
         self._analyze_worker = None
         self._render_worker = None
         self._plan_worker = None
@@ -401,6 +404,9 @@ class PtzTab(QWidget):
         self.pane.clicked.connect(self._pane_clicked)
         self.pane.context_requested.connect(self._pane_context)
         self.pane.hover.connect(self._pane_hover)
+        self.pane.pressed.connect(self._pane_pressed)
+        self.pane.drag_moved.connect(self._pane_dragged)
+        self.pane.released.connect(self._pane_released)
         v.addWidget(self.pane, 1)
 
         tl = QHBoxLayout()
@@ -1028,6 +1034,103 @@ class PtzTab(QWidget):
             self._redraw()
             self.log(f"[ptz] 키프레임 삭제 {k[0]/self.fps:.1f}s")
 
+    # ------------------------------------------------- 크롭 박스 드래그 편집
+    def _disp_to_pano(self):
+        """표시 픽셀 1개가 파노라마 몇 px 인가 (히트 톨러런스 환산)."""
+        return self.pano_w / max(self.pane.displayed_width(), 1)
+
+    def _box_hit(self, x, y):
+        """크롭 박스 히트: ("corner", 0~3) | ("border", None) | None.
+
+        모서리(핸들) = 리사이즈(줌), 테두리 밴드 = 이동. 내부는 공 클릭용으로
+        비워 둔다 (공은 대개 박스 안에 있다).
+        """
+        if self._plan_box is None:
+            return None
+        x0, y0, w, h = self._plan_box
+        k = self._disp_to_pano()
+        ct = 18 * k                          # 모서리 히트 반경
+        for ci, (hx, hy) in enumerate([(x0, y0), (x0 + w, y0),
+                                       (x0, y0 + h), (x0 + w, y0 + h)]):
+            if abs(x - hx) <= ct and abs(y - hy) <= ct:
+                return ("corner", ci)
+        bt = 10 * k                          # 테두리 밴드 폭
+        on_v = (abs(x - x0) <= bt or abs(x - x0 - w) <= bt) \
+            and y0 - bt <= y <= y0 + h + bt
+        on_h = (abs(y - y0) <= bt or abs(y - y0 - h) <= bt) \
+            and x0 - bt <= x <= x0 + w + bt
+        if on_v or on_h:
+            return ("border", None)
+        return None
+
+    def _pane_pressed(self, fx, fy):
+        """좌버튼 프레스: 크롭 박스 테두리/핸들이면 편집 시작."""
+        if self.cap is None or self.plan is None or self.analysis is None:
+            return
+        if self._playing:
+            self._stop_play()
+        x, y = fx * self.pano_w, fy * self.pano_h
+        if self._hit(x, y) is not None:      # 공/키프레임이 우선 (클릭 동작)
+            return
+        hit = self._box_hit(x, y)
+        if hit is None or self._plan_box is None:
+            return
+        x0, y0, w, h = self._plan_box
+        box = [x0 + w / 2, y0 + h / 2, float(w)]
+        self._box_edit = {"mode": hit[0], "corner": hit[1],
+                          "box": list(box), "orig": list(box),
+                          "start": (x, y),
+                          "frame": getattr(self, "_cur_frame_idx",
+                                           self.slider.value())}
+
+    def _pane_dragged(self, fx, fy):
+        e = self._box_edit
+        if e is None:
+            return
+        x, y = fx * self.pano_w, fy * self.pano_h
+        ow, oh = self.plan_out
+        cx0, cy0, w0 = e["orig"]
+        if e["mode"] == "border":            # 이동
+            cx = cx0 + (x - e["start"][0])
+            cy = cy0 + (y - e["start"][1])
+            w = w0
+        else:                                # 모서리 = 중심 기준 리사이즈(줌)
+            w = 2 * max(abs(x - cx0), abs(y - cy0) * ow / oh)
+            cx, cy = cx0, cy0
+        top = int(self.plan.get("top_margin", 0)) if self.plan else 0
+        max_w = min(self.pano_w, (self.pano_h - top) * ow / oh)
+        w = min(max(w, ow / 6.0), max_w)     # 코어 min_crop_w 와 동일 하한
+        h = w * oh / ow
+        cx = min(max(cx, w / 2), self.pano_w - w / 2)
+        cy = min(max(cy, h / 2), self.pano_h - h / 2)
+        e["box"] = [cx, cy, w]
+        self._redraw()
+
+    def _pane_released(self, fx, fy):
+        e = self._box_edit
+        if e is None:
+            return
+        self._box_edit = None
+        cx, cy, w = e["box"]
+        cx0, cy0, w0 = e["orig"]
+        # 사실상 클릭(수 px 미만 이동)이면 커밋하지 않음
+        if abs(cx - cx0) + abs(cy - cy0) + abs(w - w0) < 6 * self._disp_to_pano():
+            self._redraw()
+            return
+        f = e["frame"]
+        self.keyframes = [k for k in self.keyframes
+                          if abs(k[0] - f) > 0.5 * self.fps]
+        self.keyframes.append([f, round(cx, 1), round(cy, 1), round(w, 1)])
+        self.keyframes.sort()
+        self._save_keyframes()
+        self._refresh_kf_list()
+        self.trackbar.set_data(self.total, self.track_spans,
+                               self.ignores, self.keyframes)
+        self._plan_dirty()
+        self._redraw()
+        self.log(f"[ptz] 크롭 키프레임 {f/self.fps:.1f}s → "
+                 f"중심 ({cx:.0f}, {cy:.0f}), 폭 {w:.0f}px")
+
     def _show_frame(self):
         """현재 프레임 디코딩 + 오버레이. 디코딩 결과는 캐시된다."""
         if self.cap is None or self._playing:
@@ -1047,24 +1150,48 @@ class PtzTab(QWidget):
         frame = self._cur_frame.copy()
         f = self._cur_frame_idx
         sc = self.disp_scale                 # 프록시 표시 시 좌표 축소
-        # 계획된 크롭 창 (render_plan 과 동일한 클램프) — 결과 미리보기
+        # 계획된 크롭 창 (render_plan 과 동일한 클램프) — 결과 미리보기.
+        # 드래그(이동)/모서리 핸들(줌)로 편집 가능 — 놓으면 줌 키프레임 커밋.
+        self._plan_box = None
         if self.plan is not None and f < len(self.plan["cx"]):
             ow, oh = self.plan_out
             top = int(self.plan.get("top_margin", 0))
-            w = int(round(min(self.plan["crop_w"][f], self.pano_w,
-                              self.pano_h * ow / oh))) & ~1
-            h = int(round(w * oh / ow)) & ~1
-            x0 = int(round(self.plan["cx"][f] - w / 2))
-            y0 = int(round(self.plan["cy"][f] - h / 2))
-            x0 = max(0, min(x0, self.pano_w - w))
-            y0 = max(min(top, self.pano_h - h), min(y0, self.pano_h - h))
+            if self._box_edit is not None:      # 편집 중: 미확정 박스
+                bcx, bcy, bw = self._box_edit["box"]
+                w = int(round(bw)) & ~1
+                h = int(round(w * oh / ow)) & ~1
+                x0 = int(round(bcx - w / 2))
+                y0 = int(round(bcy - h / 2))
+                box_color = (0, 255, 255)
+            else:
+                w = int(round(min(self.plan["crop_w"][f], self.pano_w,
+                                  self.pano_h * ow / oh))) & ~1
+                h = int(round(w * oh / ow)) & ~1
+                x0 = int(round(self.plan["cx"][f] - w / 2))
+                y0 = int(round(self.plan["cy"][f] - h / 2))
+                x0 = max(0, min(x0, self.pano_w - w))
+                y0 = max(min(top, self.pano_h - h), min(y0, self.pano_h - h))
+                box_color = (255, 200, 0)
+            self._plan_box = (x0, y0, w, h)
+            thick = max(2, int(6 * sc))
+            if self._box_edit is None and self._box_hover == ("border", None):
+                thick += max(2, int(4 * sc))    # 이동 가능 표시: 테두리 두껍게
             cv2.rectangle(frame, (int(x0 * sc), int(y0 * sc)),
                           (int((x0 + w) * sc), int((y0 + h) * sc)),
-                          (255, 200, 0), max(2, int(6 * sc)))
+                          box_color, thick)
+            hs = max(6, int(16 * sc))           # 모서리 핸들 (리사이즈 = 줌)
+            for ci, (hx, hy) in enumerate([(x0, y0), (x0 + w, y0),
+                                           (x0, y0 + h), (x0 + w, y0 + h)]):
+                hov = (self._box_edit is None
+                       and self._box_hover == ("corner", ci))
+                r = hs + (max(3, int(8 * sc)) if hov else 0)
+                cv2.rectangle(frame, (int(hx * sc) - r, int(hy * sc) - r),
+                              (int(hx * sc) + r, int(hy * sc) + r),
+                              (0, 255, 255) if hov else box_color, -1)
         # 공 후보 전부 표시 — 상태별 색: 초록=수락, 자홍=승격, 빨강X=무시,
         # 회색=자동 기각. 커서가 가리키는 오브젝트는 노란 링으로 하이라이트.
         si = self._current_sample()
-        hv = self._hover_key
+        hv = self._hover_key[0] if self._hover_key else None
 
         def _is_hover(kind, ox, oy):
             return hv is not None and hv == (kind, round(ox), round(oy))
@@ -1136,8 +1263,10 @@ class PtzTab(QWidget):
         f = getattr(self, "_cur_frame_idx", self.slider.value())
         x, y = fx * self.pano_w, fy * self.pano_h
         o = self._hit(x, y)
-        if o is None:                       # 빈 곳 = 키프레임 추가
-            self._add_keyframe(f, x, y)
+        if o is None:
+            if self._box_hit(x, y) is not None:
+                return                      # 박스 테두리 클릭 = 드래그 미수 — 무동작
+            self._add_keyframe(f, x, y)     # 빈 곳 = 키프레임 추가
             return
         if o["kind"] == "kf":               # 키프레임 = 삭제
             self._delete_keyframe_idx(o["i"])
@@ -1186,15 +1315,30 @@ class PtzTab(QWidget):
         menu.exec(gpos)
 
     def _pane_hover(self, fx, fy):
-        """커서 근처 오브젝트를 하이라이트 (바뀔 때만 리드로우)."""
+        """커서 근처 오브젝트/크롭 박스를 하이라이트 (바뀔 때만 리드로우)."""
         if self.analysis is None or getattr(self, "_cur_frame", None) is None:
+            return
+        if self._box_edit is not None:
             return
         x, y = fx * self.pano_w, fy * self.pano_h
         o = self._hit(x, y)
-        key = None if o is None else (o["kind"], round(o["x"]), round(o["y"]))
+        zone = None if o is not None else self._box_hit(x, y)
+        key = ((None if o is None
+                else (o["kind"], round(o["x"]), round(o["y"]))), zone)
         if key != self._hover_key:
             self._hover_key = key
             self._hover = o
+            self._box_hover = zone
+            if o is not None:
+                cur = Qt.CursorShape.PointingHandCursor
+            elif zone is None:
+                cur = Qt.CursorShape.OpenHandCursor
+            elif zone[0] == "border":
+                cur = Qt.CursorShape.SizeAllCursor
+            else:                            # 모서리: 대각 리사이즈 커서
+                cur = (Qt.CursorShape.SizeFDiagCursor if zone[1] in (0, 3)
+                       else Qt.CursorShape.SizeBDiagCursor)
+            self.pane.setCursor(cur)
             self._redraw()
 
     def _refresh_lists(self):
@@ -1216,9 +1360,11 @@ class PtzTab(QWidget):
             else:
                 k = self.keyframes[i]
                 kf, kx, ky = k[0], k[1], k[2]
+                zoom = f", 폭{k[3]:.0f}" if len(k) > 3 else ""
                 t = kf / self.fps
                 self.track_list.addItem(
-                    f"{int(t//60):02d}:{t%60:04.1f}  ● 수동 ({kx:.0f}, {ky:.0f})")
+                    f"{int(t//60):02d}:{t%60:04.1f}  ● 수동 "
+                    f"({kx:.0f}, {ky:.0f}{zoom})")
         self.track_list.blockSignals(False)
         # 아래 목록 — 오인식만
         self.kf_list.clear()

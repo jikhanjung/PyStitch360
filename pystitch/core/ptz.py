@@ -720,16 +720,23 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
         force_ranges=force_ranges, linked=linked, log=log)
 
     # --- 1.5 사용자 키프레임 병합 (자동보다 우선) -----------------------
+    # 키프레임: [frame, x, y] 또는 [frame, x, y, crop_w] (4번째=줌 오버라이드,
+    # 크롭 폭 px; None 이면 자동 깊이 기반 줌 유지).
     kf_idx = []
+    kf_zoom = {}                          # 샘플 i -> 사용자 지정 크롭 폭(px)
+    kfs_norm = [(k[0], k[1], k[2], (k[3] if len(k) > 3 else None))
+                for k in sorted(keyframes)] if keyframes else []
     if keyframes:
         sup = kf_suppress_sec * fps
-        for kf_f, kx, ky in sorted(keyframes):
+        for kf_f, kx, ky, kw in kfs_norm:
             near = np.abs(idx - kf_f) <= sup
             ball[near] = np.nan          # 키프레임 주변 자동 샘플 무효화
-        for kf_f, kx, ky in sorted(keyframes):
+        for kf_f, kx, ky, kw in kfs_norm:
             i = int(np.argmin(np.abs(idx - kf_f)))
             ball[i] = (kx, ky)
             kf_idx.append(i)
+            if kw is not None:
+                kf_zoom[i] = float(kw)
 
     # --- 2. 갭 보간 (짧은 가림/미검출) ----------------------------------
     known = ~np.isnan(ball[:, 0])
@@ -749,6 +756,7 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
 
     # --- 3. 목표점 + 줌 ------------------------------------------------
     max_crop_w = int(min(pano_w, (pano_h - top_margin) * out_w / out_h))
+    min_crop_w = out_w / 6.0            # 사용자 줌인 하한 (업스케일 한도)
     tx = np.empty(n)
     ty = np.empty(n)
     zw = np.full(n, float(out_w))
@@ -771,6 +779,10 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
             zw[i] = max_crop_w   # 정보 부족 — 최대한 넓게
         prev = (tx[i], ty[i])
 
+    # 사용자 키프레임 줌 오버라이드 (자동 깊이 줌보다 우선)
+    for i, kw in kf_zoom.items():
+        zw[i] = min(max(kw, min_crop_w), max_crop_w)
+
     # --- 4. 프레임별 업샘플 + 적응 스무딩 -------------------------------
     if wide:
         zw[:] = max_crop_w              # 항상 최대 폭 (줌 변동 없음)
@@ -790,11 +802,14 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
     # 카메라가 정확히 그 지점을 보도록 보장 (가우시안 창으로 부드럽게)
     if keyframes:
         anchor_sigma = 0.8 * fps
-        for kf_f, kx, ky in sorted(keyframes):
+        for kf_f, kx, ky, kw in kfs_norm:
             j = int(np.clip(kf_f, 0, total - 1))
             g = np.exp(-0.5 * ((fr - j) / anchor_sigma) ** 2)
             cx = cx + (kx - cx[j]) * g
             cy = cy + (ky - cy[j]) * g
+            if kw is not None and not wide:
+                kwc = min(max(float(kw), min_crop_w), max_crop_w)
+                cw = cw + (kwc - cw[j]) * g
     if log:
         log(f"[plan] 공 궤적 {known.mean():.0%} (보간 포함), "
             f"빠른 추종 구간 {(w > 0.5).mean():.0%}, "

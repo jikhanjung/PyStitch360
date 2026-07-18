@@ -20,6 +20,9 @@ class FramePane(QLabel):
     clicked = pyqtSignal(float, float)   # 표시 픽스맵 기준 좌표 비율 (0~1)
     context_requested = pyqtSignal(float, float, QPoint)   # fx, fy, 전역좌표
     hover = pyqtSignal(float, float)     # 버튼 안 눌린 이동 시 커서 위치 비율
+    pressed = pyqtSignal(float, float)   # 좌버튼 프레스 위치 비율
+    drag_moved = pyqtSignal(float, float)   # 드래그 중 절대 위치 비율(클램프)
+    released = pyqtSignal(float, float)  # 좌버튼 릴리스 위치 비율(클램프)
 
     def __init__(self, placeholder="영상 없음", interactive=False):
         super().__init__(placeholder)
@@ -47,6 +50,17 @@ class FramePane(QLabel):
         if 0.0 <= fx <= 1.0 and 0.0 <= fy <= 1.0:
             return fx, fy
         return None
+
+    def _frac_clamped(self, pos):
+        """위젯 좌표 → 픽스맵 비율, 밖이면 가장자리로 클램프 (드래그용)."""
+        p = self.pixmap()
+        if p is None or p.isNull():
+            return None
+        x0 = (self.width() - p.width()) / 2
+        y0 = (self.height() - p.height()) / 2
+        fx = (pos.x() - x0) / p.width()
+        fy = (pos.y() - y0) / p.height()
+        return min(max(fx, 0.0), 1.0), min(max(fy, 0.0), 1.0)
 
     def set_grid(self, on: bool):
         """정렬 가이드라인 그리드 표시 (중앙 세로선 강조 — 하프라인 맞춤용)."""
@@ -94,6 +108,9 @@ class FramePane(QLabel):
             self._press_pos = ev.position()
             self._moved = 0.0
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            fr = self._frac_at(ev.position())
+            if fr is not None:
+                self.pressed.emit(fr[0], fr[1])
         super().mousePressEvent(ev)
 
     def mouseMoveEvent(self, ev):
@@ -103,6 +120,9 @@ class FramePane(QLabel):
             self._moved += abs(d.x()) + abs(d.y())
             shift = bool(ev.modifiers() & Qt.KeyboardModifier.ShiftModifier)
             self.dragged.emit(d.x(), d.y(), shift)
+            fr = self._frac_clamped(ev.position())
+            if fr is not None:
+                self.drag_moved.emit(fr[0], fr[1])
         elif self._interactive:              # 버튼 없이 이동 = hover
             fr = self._frac_at(ev.position())
             if fr is not None:
@@ -111,6 +131,9 @@ class FramePane(QLabel):
 
     def mouseReleaseEvent(self, ev):
         if self._drag_pos is not None:
+            fr = self._frac_clamped(ev.position())
+            if fr is not None:
+                self.released.emit(fr[0], fr[1])   # clicked 보다 먼저
             if self._moved < 4.0:        # 이동 없는 프레스+릴리스 = 클릭
                 fr = self._frac_at(self._press_pos)
                 if fr is not None:

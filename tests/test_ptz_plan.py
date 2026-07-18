@@ -131,6 +131,20 @@ def test_keyframe_pair_bridges_detection_gap():
     assert np.all(plan["crop_w"][360:420] < 1920 * 1.25)  # 구간 중앙: 줌인 유지
 
 
+def test_keyframe_zoom_override():
+    """키프레임 4번째 값(crop_w)이 그 시점 크롭 폭을 좌우한다 (수동 줌)."""
+    frames = list(range(0, 900, 3))
+    balls = [[2900.0, 900.0, 0.5] for _ in frames]
+    base = build_plan(_analysis(frames, balls), PANO_W, PANO_H,
+                      keyframes=[(450, 2900.0, 900.0)], log=None)
+    tight = build_plan(_analysis(frames, balls), PANO_W, PANO_H,
+                       keyframes=[(450, 2900.0, 900.0, 800.0)], log=None)
+    assert tight["crop_w"][450] < base["crop_w"][450] - 100   # 더 타이트
+    assert abs(tight["crop_w"][450] - 800.0) < 200            # 앵커가 근처로
+    # 3-요소(줌 없음) 키프레임은 기존과 동일하게 동작 (하위 호환)
+    assert abs(base["crop_w"][450] - tight["crop_w"][450]) > 100
+
+
 def test_wide_mode_fixed_zoom_gentle_pan():
     """와이드 모드: 크롭 폭 고정(최대), 가로 팬은 완만."""
     frames = list(range(0, 2700, 3))
