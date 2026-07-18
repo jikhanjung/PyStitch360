@@ -124,6 +124,45 @@ class PlanWorker(QThread):
             pass
 
 
+class PtzPlayWorker(QThread):
+    """파노라마 순차 재생 (자체 디코더) — 오버레이는 GUI 쪽 _redraw 가 담당."""
+
+    frame_ready = pyqtSignal(object, int)
+
+    def __init__(self, path, start_frame, fps, display_fps=15.0):
+        super().__init__()
+        self.path, self.start_frame = str(path), start_frame
+        self.fps, self.display_fps = fps, display_fps
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        import time
+        cap = cv2.VideoCapture(self.path)
+        try:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
+            step = max(1, int(round(self.fps / self.display_fps)))
+            f = self.start_frame
+            t0 = time.perf_counter()
+            shown = 0
+            while not self._stop:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                self.frame_ready.emit(frame, f)
+                shown += 1
+                lag = shown * step / self.fps - (time.perf_counter() - t0)
+                if lag > 0:
+                    time.sleep(min(lag, 0.5))
+                for _ in range(step - 1):
+                    cap.grab()
+                f += step
+        finally:
+            cap.release()
+
+
 class PtzRenderWorker(QThread):
     progress = pyqtSignal(int, int, float)
     log = pyqtSignal(str)
@@ -185,6 +224,8 @@ class PtzTab(QWidget):
         self._plan_worker = None
         self._link_worker = None
         self._linked = None
+        self._play_worker = None
+        self._playing = False
         self.plan = None
         self.plan_out = (1920, 1080)
         self._build_ui()
@@ -211,6 +252,11 @@ class PtzTab(QWidget):
         self.pane.clicked.connect(self._pane_clicked)
         mid.addWidget(self.pane, 1)
         side = QVBoxLayout()
+        side.addWidget(QLabel("공 트랙 (더블클릭=이동)"))
+        self.track_list = QListWidget()
+        self.track_list.setMaximumWidth(240)
+        self.track_list.itemDoubleClicked.connect(self._goto_track)
+        side.addWidget(self.track_list, 1)
         side.addWidget(QLabel("키프레임·무시 구간 (더블클릭=이동)"))
         self.kf_list = QListWidget()
         self.kf_list.setMaximumWidth(240)
@@ -226,6 +272,18 @@ class PtzTab(QWidget):
         v.addLayout(mid, 1)
 
         tl = QHBoxLayout()
+        self.btn_play = QPushButton("▶ 재생")
+        self.btn_play.setMaximumWidth(80)
+        self.btn_play.clicked.connect(self._toggle_play)
+        tl.addWidget(self.btn_play)
+        btn_prev = QPushButton("◀트랙")
+        btn_prev.setMaximumWidth(58)
+        btn_prev.clicked.connect(lambda: self._jump_track(-1))
+        tl.addWidget(btn_prev)
+        btn_next = QPushButton("트랙▶")
+        btn_next.setMaximumWidth(58)
+        btn_next.clicked.connect(lambda: self._jump_track(1))
+        tl.addWidget(btn_next)
         for text, d in [("-10s", -300), ("-1s", -30), ("-1", -1),
                         ("+1", 1), ("+1s", 30), ("+10s", 300)]:
             b = QPushButton(text)
@@ -237,6 +295,7 @@ class PtzTab(QWidget):
         self.trackbar.seek.connect(lambda f: self.slider.setValue(f))
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setEnabled(False)
+        self.slider.sliderPressed.connect(self._stop_play)
         self.slider.valueChanged.connect(self._on_slider)
         bar_col = QVBoxLayout()
         bar_col.setSpacing(1)
@@ -380,6 +439,7 @@ class PtzTab(QWidget):
 
     # ------------------------------------------------------------ 타임라인/표시
     def _step(self, d):
+        self._stop_play()
         if self.slider.isEnabled():
             self.slider.setValue(self.slider.value() + d)
 
@@ -389,6 +449,33 @@ class PtzTab(QWidget):
         m, cs = divmod(cs, 6000)
         self.lbl_time.setText(f"{m:02d}:{cs/100:05.2f}")
         self._slider_timer.start()
+
+    def _toggle_play(self):
+        if self._playing:
+            self._stop_play()
+            return
+        if self.cap is None:
+            return
+        w = PtzPlayWorker(self.pano_path, self.slider.value(), self.fps)
+        w.frame_ready.connect(self._play_frame)
+        w.finished.connect(self._play_finished)
+        self._play_worker = w
+        self._playing = True
+        self.btn_play.setText("⏸ 정지")
+        w.start()
+
+    def _stop_play(self):
+        if self._play_worker is not None and self._play_worker.isRunning():
+            self._play_worker.stop()
+
+    def _play_frame(self, frame, f):
+        self._cur_frame, self._cur_frame_idx = frame, f
+        self.slider.setValue(f)     # _show_frame 은 재생 중 가드로 무시됨
+        self._redraw()
+
+    def _play_finished(self):
+        self._playing = False
+        self.btn_play.setText("▶ 재생")
 
     def _current_auto_ball(self):
         """현재 시각 근처(±0.5s)의 자동 검출 공."""
@@ -402,7 +489,7 @@ class PtzTab(QWidget):
 
     def _show_frame(self):
         """현재 프레임 디코딩 + 오버레이. 디코딩 결과는 캐시된다."""
-        if self.cap is None:
+        if self.cap is None or self._playing:
             return
         f = self.slider.value()
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, f)
@@ -459,7 +546,9 @@ class PtzTab(QWidget):
     def _pane_clicked(self, fx, fy):
         if self.cap is None:
             return
-        f = self.slider.value()
+        if self._playing:
+            self._stop_play()
+        f = getattr(self, "_cur_frame_idx", self.slider.value())
         x, y = fx * self.pano_w, fy * self.pano_h
         # 같은 시각(±0.5s) 클릭은 교체
         self.keyframes = [k for k in self.keyframes
@@ -592,7 +681,34 @@ class PtzTab(QWidget):
                 linked=self._linked, log=self.log)
         self.trackbar.set_data(self.total, self.track_spans,
                                self.ignores, self.keyframes)
+        self._refresh_track_list()
         self._plan_dirty()
+
+    def _refresh_track_list(self):
+        self.track_list.clear()
+        for f0, f1 in self.track_spans:
+            t0, t1 = f0 / self.fps, f1 / self.fps
+            self.track_list.addItem(
+                f"{int(t0//60):02d}:{t0%60:04.1f} ~ {int(t1//60):02d}:{t1%60:04.1f}"
+                f"  ({t1-t0:.1f}s)")
+
+    def _goto_track(self):
+        row = self.track_list.currentRow()
+        if 0 <= row < len(self.track_spans):
+            self.slider.setValue(int(self.track_spans[row][0]))
+
+    def _jump_track(self, direction: int):
+        """현재 위치 기준 이전(-1)/다음(+1) 수락 트랙 시작으로 이동."""
+        self._stop_play()
+        f = self.slider.value()
+        if direction > 0:
+            nxt = [sp for sp in self.track_spans if sp[0] > f]
+            if nxt:
+                self.slider.setValue(int(nxt[0][0]))
+        else:
+            prv = [sp for sp in self.track_spans if sp[0] < f - 1]
+            if prv:
+                self.slider.setValue(int(prv[-1][0]))
 
     def _ignore_current_track(self):
         """현재 시각을 덮는 수락 트랙을 통째로 무시 목록에 추가."""
@@ -619,6 +735,7 @@ class PtzTab(QWidget):
     def _start_render(self):
         if self.analysis is None or self.pano_path is None:
             return
+        self._stop_play()
         wide = self.combo_mode.currentIndex() == 1
         suffix = "_wide.mp4" if wide else "_ptz.mp4"
         default = str(self.pano_path.with_name(self.pano_path.stem + suffix))
