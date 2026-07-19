@@ -23,9 +23,9 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QColorDialog, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar,
-    QPushButton, QScrollBar, QSlider, QSpinBox, QTabWidget, QVBoxLayout,
-    QWidget,
+    QListWidget, QListWidgetItem, QMenu, QMessageBox, QPlainTextEdit,
+    QProgressBar, QPushButton, QScrollBar, QSlider, QSpinBox, QTabWidget,
+    QVBoxLayout, QWidget,
 )
 
 from ..core.encoders import available_encoders
@@ -35,9 +35,9 @@ from ..core.field import (
 )
 from ..core.ptz import (
     accept_ball_tracks, analyze_video, build_plan, build_radar_data,
-    classify_teams, gapfill_analysis, gapfill_targets, ground_positions,
-    link_ball_tracks, propagate_seed, ptz_available, render_plan,
-    same_spot_spans, tracklet_colors,
+    classify_teams, draw_radar_panel, gapfill_analysis, gapfill_targets,
+    ground_positions, link_ball_tracks, propagate_seed, ptz_available,
+    render_plan, same_spot_spans, tracklet_colors,
 )
 from .widgets import FramePane
 
@@ -81,100 +81,6 @@ def _hsv_hex(hsv):
     b, g, r = _boost_bgr(tuple(int(v) for v in
                                cv2.cvtColor(px, cv2.COLOR_HSV2BGR)[0, 0]))
     return f"#{r:02x}{g:02x}{b:02x}"
-
-
-class RadarView(QWidget):
-    """탑다운 레이더: 카메라 기준 지면 좌표(m)의 선수(팀 색)·공 표시."""
-
-    def __init__(self):
-        super().__init__()
-        self.setFixedHeight(180)
-        self.setFixedWidth(int(180 * 110 / 75))   # 기본(카메라 기준) 범위 비율
-        self.points: list = []      # (X, Y, team)
-        self.ball = None            # (X, Y) or None
-        self.field = None           # {length, width, cam} — 캘리브레이션 후
-        self.palette: dict = {}     # {역할: BGR} 유니폼 대표색 (없으면 기본)
-
-    def set_data(self, points, ball=None):
-        self.points, self.ball = list(points), ball
-        self.update()
-
-    def set_field(self, field):
-        """경기장 절대 좌표 모드 on/off — 켜지면 실측 경기장을 그린다.
-
-        위젯 폭을 표시 범위의 실제 가로세로 비율에 맞춰 고정 —
-        경기장 사각형이 입력 크기(예: 100×62m) 비율 그대로 보인다.
-        """
-        if field != self.field:
-            self.field = field
-            h = self.height()
-            if field:
-                hl, hw = field["length"] / 2, field["width"] / 2
-                camy = field["cam"][1]
-                span_x = (hl + 6) * 2
-                span_y = (hw + 6) - (min(camy, -hw) - 4)
-            else:
-                span_x, span_y = 110.0, 75.0
-            self.setFixedWidth(int(round(h * span_x / span_y)))
-            self.update()
-
-    def paintEvent(self, ev):
-        p = QPainter(self)
-        p.fillRect(self.rect(), QColor(30, 60, 34))
-        W, H = self.width(), self.height()
-        if self.field:
-            hl, hw = self.field["length"] / 2, self.field["width"] / 2
-            camx, camy = self.field["cam"]
-            xmin, xmax = -hl - 6, hl + 6
-            ymin, ymax = min(camy, -hw) - 4, hw + 6
-        else:
-            # 캘리브레이션 전: 카메라 기준 X -55..55m, Y 0..75m
-            xmin, xmax, ymin, ymax = -55, 55, 0, 75
-
-        def px(X, Y):
-            return (int((X - xmin) / (xmax - xmin) * (W - 1)),
-                    int((1 - (Y - ymin) / (ymax - ymin)) * (H - 1)))
-
-        if self.field:
-            p.setPen(QColor(255, 255, 255, 150))
-            for (a, b), (c, d) in [((-hl, -hw), (hl, -hw)),
-                                   ((hl, -hw), (hl, hw)),
-                                   ((hl, hw), (-hl, hw)),
-                                   ((-hl, hw), (-hl, -hw)),
-                                   ((0, -hw), (0, hw))]:
-                p.drawLine(*px(a, b), *px(c, d))
-            rx = int(9.15 / (xmax - xmin) * (W - 1))
-            ry = int(9.15 / (ymax - ymin) * (H - 1))
-            cx0, cy0 = px(0, 0)
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(cx0 - rx, cy0 - ry, 2 * rx, 2 * ry)
-            p.setPen(Qt.PenStyle.NoPen)
-        else:
-            p.setPen(QColor(255, 255, 255, 45))
-            for gx in range(-50, 51, 10):
-                p.drawLine(*px(gx, 0), *px(gx, 75))
-            for gy in range(0, 76, 10):
-                p.drawLine(*px(-55, gy), *px(55, gy))
-            p.setPen(QColor(255, 255, 255, 140))
-            p.drawLine(*px(0, 0), *px(0, 75))        # 하프라인 방향
-        for X, Y, team in self.points:
-            b, g, r = self.palette.get(
-                team, TEAM_COLORS[min(max(team, 0), len(TEAM_COLORS) - 1)])
-            p.setBrush(QColor(r, g, b))
-            p.setPen(Qt.PenStyle.NoPen)
-            x, y = px(X, Y)
-            p.drawEllipse(x - 4, y - 4, 8, 8)
-        if self.ball is not None:
-            x, y = px(*self.ball)
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.setPen(QColor(0, 0, 0, 180))            # 외곽선 — 배경 대비
-            p.drawEllipse(x - 6, y - 6, 12, 12)
-            p.setBrush(QColor(255, 140, 0))          # 공 = 주황
-            p.setPen(Qt.PenStyle.NoPen)
-            p.drawEllipse(x - 5, y - 5, 10, 10)
-        p.setPen(QColor(255, 255, 255, 160))
-        p.drawText(6, 14, "레이더 (카메라 기준, 10m 격자)")
-        p.end()
 
 
 class TimelineView(QWidget):
@@ -1372,7 +1278,7 @@ class PtzTab(QWidget):
 
     def __init__(self, log_fn, video_dir_fn=None, remember_dir_fn=None):
         super().__init__()
-        self.log = log_fn
+        self._ext_log = log_fn
         self._video_dir = video_dir_fn or (lambda: "")
         self._remember_dir = remember_dir_fn or (lambda p: None)
         self.pano_path: Path | None = None
@@ -1390,6 +1296,7 @@ class PtzTab(QWidget):
         self.highlights: list[dict] = []   # .events.json "highlights" 문서
         self.match_info: dict | None = None  # 경기 정보 (하프·앵커·중단)
         self._referees: dict = {}         # .events.json "referees" (근/원측 선심)
+        self._radar_palette: dict = {}    # {역할: BGR} 레이더 오버레이 색
         self.roles: dict[int, int] = {}   # {track_id: 역할} 사용자 지정 (GK 등)
         self.merges: dict[int, int] = {}  # {tid: 대표 tid} 트랙릿 병합 (비파괴)
         self.field_points: dict[str, list] = {}   # {랜드마크키: [x, y]}
@@ -1436,6 +1343,15 @@ class PtzTab(QWidget):
         self.plan = None
         self.plan_out = (1920, 1080)
         self._build_ui()
+        st = QSettings("PyStitch360", "PyStitch360")
+        for cb, key in ((self.check_players, "ptz_show_players"),
+                        (self.check_ball, "ptz_show_ball"),
+                        (self.check_crop, "ptz_show_crop")):
+            cb.setChecked(st.value(key, "true") == "true")
+            cb.toggled.connect(
+                lambda on, k=key: (QSettings("PyStitch360", "PyStitch360")
+                                   .setValue(k, "true" if on else "false"),
+                                   self._redraw()))
         # 스페이스 = 재생/정지 — 포커스가 아니라 커서 위치 기준이라
         # (타임라인/영상 위에서만) 앱 필터로 처리, 그 외엔 통과
         QApplication.instance().installEventFilter(self)
@@ -1443,6 +1359,31 @@ class PtzTab(QWidget):
         self._plan_timer.timeout.connect(self._run_plan)
         self._save_timer = QTimer(singleShot=True, interval=1500)
         self._save_timer.timeout.connect(self._write_sidecar)
+
+    def _draw_radar_overlay(self, frame, pts, ball_g):
+        """우하단 반투명 탑다운 레이더 — 내보내기(draw_radar_panel)와 동일."""
+        radar = {"frames": [0], "points": [pts], "balls": [ball_g],
+                 "length": float(self.field_size[0]),
+                 "width": float(self.field_size[1]),
+                 "palette": self._radar_palette}
+        pw = (frame.shape[1] // 6) & ~1
+        if pw < 60:
+            return
+        panel = draw_radar_panel(radar, 0, pw)
+        ph, pw_ = panel.shape[:2]
+        H, W = frame.shape[:2]
+        mgn = W // 96
+        if ph + mgn >= H or pw_ + mgn >= W:
+            return
+        roi = frame[H - mgn - ph:H - mgn, W - mgn - pw_:W - mgn]
+        cv2.addWeighted(panel, 0.55, roi, 0.45, 0.0, dst=roi)
+
+    def log(self, msg):
+        """메인 윈도우 로그 + 탭 내 로그 미러."""
+        self._ext_log(msg)
+        lv = getattr(self, "log_view", None)
+        if lv is not None:
+            lv.appendPlainText(str(msg))
 
     def eventFilter(self, obj, ev):
         """커서가 타임라인/슬라이더/영상 위일 때 Space = 재생/정지.
@@ -1504,6 +1445,22 @@ class PtzTab(QWidget):
         self.pane.pressed.connect(self._pane_pressed)
         self.pane.drag_moved.connect(self._pane_dragged)
         self.pane.released.connect(self._pane_released)
+        # 우상단 오버레이 체크박스: 선수/공/크롭 박스 표시 토글
+        self.check_players = QCheckBox("선수")
+        self.check_ball = QCheckBox("공")
+        self.check_crop = QCheckBox("크롭 박스")
+        ov = QVBoxLayout(self.pane)
+        ov.setContentsMargins(8, 8, 8, 8)
+        ov_row = QHBoxLayout()
+        ov_row.addStretch(1)
+        for cb in (self.check_players, self.check_ball, self.check_crop):
+            cb.setChecked(True)
+            cb.setStyleSheet(
+                "QCheckBox { color: white; background: rgba(20,20,20,150);"
+                " padding: 2px 8px; border-radius: 4px; }")
+            ov_row.addWidget(cb)
+        ov.addLayout(ov_row)
+        ov.addStretch(1)
         v.addWidget(self.pane, 1)
 
         tl = QHBoxLayout()
@@ -1733,22 +1690,18 @@ class PtzTab(QWidget):
         fr.addStretch(1)
         fl.addLayout(fr)
 
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(2000)
+
         self.tabs_review = QTabWidget()
         self.tabs_review.addTab(w_ball, "공")
         self.tabs_review.addTab(w_players, "선수")
         self.tabs_review.addTab(w_field, "경기장")
+        self.tabs_review.addTab(self.log_view, "로그")
         self.tabs_review.setMaximumHeight(210)
         self.tabs_review.currentChanged.connect(self._review_tab_changed)
-        strip.addWidget(self.tabs_review, 5)
-
-        col_radar = QVBoxLayout()
-        self.radar = RadarView()
-        col_radar.addWidget(self.radar)
-        self.check_players = QCheckBox("선수 표시 (팀 색)")
-        self.check_players.setChecked(True)
-        self.check_players.toggled.connect(lambda _: self._redraw())
-        col_radar.addWidget(self.check_players)
-        strip.addLayout(col_radar, 1)
+        strip.addWidget(self.tabs_review, 1)
         v.addLayout(strip)
 
         bottom = QHBoxLayout()
@@ -2712,7 +2665,8 @@ class PtzTab(QWidget):
         # 계획된 크롭 창 (render_plan 과 동일한 클램프) — 결과 미리보기.
         # 드래그(이동)/모서리 핸들(줌)로 편집 가능 — 놓으면 줌 키프레임 커밋.
         self._plan_box = None
-        if self.plan is not None and not picking and f < len(self.plan["cx"]):
+        if self.plan is not None and not picking \
+                and self.check_crop.isChecked() and f < len(self.plan["cx"]):
             ow, oh = self.plan_out
             top = int(self.plan.get("top_margin", 0))
             commit = self._box_commit
@@ -2764,7 +2718,9 @@ class PtzTab(QWidget):
             return hv is not None and hv == (kind, round(ox), round(oy))
 
         rad = max(10, int(28 * sc))
-        for (bx, by, conf) in ([] if picking else self._candidates_at(si)):
+        show_ball = self.check_ball.isChecked()
+        for (bx, by, conf) in ([] if picking or not show_ball
+                               else self._candidates_at(si)):
             p = (int(bx * sc), int(by * sc))
             st = self._cand_state(f, si, bx, by)
             if st == "ignored":
@@ -2784,6 +2740,10 @@ class PtzTab(QWidget):
             if _is_hover("ball", bx, by):
                 cv2.circle(frame, p, rad + max(6, int(12 * sc)), (0, 255, 255), 3)
         for k in ([] if picking else self.keyframes):
+            if len(k) > 3 and not self.check_crop.isChecked():
+                continue                      # 크롭 키프레임은 크롭 토글에
+            if len(k) <= 3 and not show_ball:
+                continue                      # 수동 공은 공 토글에
             if abs(k[0] - f) <= 1.0 * self.fps:
                 kx, ky = float(k[1]), float(k[2])
                 p = (int(kx * sc), int(ky * sc))
@@ -2847,16 +2807,17 @@ class PtzTab(QWidget):
                     if np.isfinite(g[0]):
                         ball_g = (float(g[0]), float(g[1]))
             else:
+                # 캘리브레이션 전: 카메라 기준 근사를 경기장 좌표계로 이동
+                # (build_radar_data 와 동일한 가정 위치)
+                cy0 = -(self.field_size[1] / 2.0 + 5.0)
                 for X, Y, tid, j in ground_positions(prow, self.pano_w,
                                                      self.pano_h):
-                    radar_pts.append((X, Y, self._role_of(tid)))
+                    radar_pts.append((X, cy0 + Y, self._role_of(tid)))
                 if bb is not None:
                     g = ground_positions([[bb[0], bb[1], 0.0, 0.0]],
                                          self.pano_w, self.pano_h)
-                    ball_g = (g[0][0], g[0][1]) if g else None
-            self.radar.set_data(radar_pts, ball_g)
-        else:
-            self.radar.set_data([], None)
+                    ball_g = (g[0][0], cy0 + g[0][1]) if g else None
+            self._draw_radar_overlay(frame, radar_pts, ball_g)
         # 경기장 탭: 랜드마크 마커 + (캘리브레이션 후) 예상 경기장 선
         if self._field_tab_active() or self.btn_field_pick.isChecked():
             if self._field_calib is not None:
@@ -3415,7 +3376,7 @@ class PtzTab(QWidget):
             logs.append(f"{self._role_name(r)} {hexc} ({len(member)}트랙릿)")
         self.lbl_team_colors.setText("유니폼 색:" if shown
                                      else "팀 색: 분석 후 표시")
-        self.radar.palette = {r: self._role_color(r) for r in range(6)}
+        self._radar_palette = {r: self._role_color(r) for r in range(6)}
         if log_colors and logs:
             self.log("[ptz] 팀 색 분류: " + ", ".join(logs))
 
@@ -4513,9 +4474,6 @@ class PtzTab(QWidget):
         self.lbl_field_status.setText(msg)
         if log_result:
             self.log(f"[field] {msg}")
-        self.radar.set_field(
-            {"length": self.field_size[0], "width": self.field_size[1],
-             "cam": self._cam_field_pos()} if c is not None else None)
 
     def _players_row(self, si):
         """샘플 si 의 선수 행: 분석 + 사용자 수동 검출(extra) 합침."""
