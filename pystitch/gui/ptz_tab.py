@@ -1324,6 +1324,7 @@ class PtzTab(QWidget):
         self._native_cap = None           # 프록시 표시 중 원본 프레임용
         self.track_spans: list = []
         self._pcache_id = None            # 선수 요약 캐시 기준 분석 객체 id
+        self._pcolors_id = None           # 대표색 캐시 키 (분석에만 의존)
         self._pspans: dict = {}           # {tid: [f0, f1, 검출수]}
         self._pcolors: dict = {}          # {tid: (h, s, v)} 유니폼 대표색
         self._accepted_ball = None        # accept_ball_tracks 의 샘플별 수락 공
@@ -3382,7 +3383,12 @@ class PtzTab(QWidget):
 
     # ------------------------------------------------------ 선수(역할) 검수
     def _player_cache(self):
-        """트랙릿 요약({tid: [f0, f1, n]})·대표색 캐시 — 분석 객체당 1회."""
+        """트랙릿 요약({tid: [f0, f1, n]})·대표색 캐시 — 분석 객체당 1회.
+
+        숨김(hidden_players)은 raw 캐시 위의 가벼운 필터 — 숨기기/복원이
+        전체 검출 재스캔(수 초, UI 프리즈)을 유발하지 않는다. 대표색은
+        분석에만 의존하므로 별도 키로 캐시.
+        """
         if self.analysis is None:
             return {}, {}
         if self._pcache_id != id(self.analysis):
@@ -3391,8 +3397,7 @@ class PtzTab(QWidget):
             for si, prow in enumerate(self.analysis["players"]):
                 f = int(frames[si])
                 for p in prow:
-                    if len(p) >= 5 and p[4] >= 0 \
-                            and self._rep(int(p[4])) not in self.hidden_players:
+                    if len(p) >= 5 and p[4] >= 0:
                         e = spans.get(int(p[4]))
                         if e is None:
                             spans[int(p[4])] = [f, f, 1]
@@ -3403,11 +3408,16 @@ class PtzTab(QWidget):
                 if si < len(frames):
                     f = int(frames[si])
                     for p in rows:
-                        if self._rep(int(p[4])) not in self.hidden_players:
-                            spans[int(p[4])] = [f, f, 1]
+                        spans[int(p[4])] = [f, f, 1]
             self._pspans = spans
-            self._pcolors = tracklet_colors(self.analysis)
+            if self._pcolors_id != id(self.analysis):
+                self._pcolors = tracklet_colors(self.analysis)
+                self._pcolors_id = id(self.analysis)
             self._pcache_id = id(self.analysis)
+        if self.hidden_players:
+            spans = {t: v for t, v in self._pspans.items()
+                     if self._rep(t) not in self.hidden_players}
+            return spans, self._pcolors
         return self._pspans, self._pcolors
 
     def _role_name(self, r):
@@ -3479,7 +3489,6 @@ class PtzTab(QWidget):
         """관중·오인식 트랙릿 숨김 (비파괴) — 병합 그룹 단위."""
         rep = self._rep(tid)
         self.hidden_players.add(rep)
-        self._pcache_id = None
         self._save_keyframes()
         self._refresh_team_label()
         self._refresh_player_list()
@@ -3490,7 +3499,6 @@ class PtzTab(QWidget):
     def _unhide_players(self):
         n = len(self.hidden_players)
         self.hidden_players = set()
-        self._pcache_id = None
         self._save_keyframes()
         self._refresh_team_label()
         self._refresh_player_list()
