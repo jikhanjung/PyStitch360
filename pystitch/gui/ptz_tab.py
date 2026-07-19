@@ -1370,6 +1370,7 @@ class PtzTab(QWidget):
         self.highlights: list[dict] = []   # .events.json "highlights" 문서
         self.match_info: dict | None = None  # 경기 정보 (하프·앵커·중단)
         self.roles: dict[int, int] = {}   # {track_id: 역할} 사용자 지정 (GK 등)
+        self.merges: dict[int, int] = {}  # {tid: 대표 tid} 트랙릿 병합 (비파괴)
         self.field_points: dict[str, list] = {}   # {랜드마크키: [x, y]}
         self.line_points: list[list] = []  # 흰 선 검출 샘플 [x, y] (사이드라인)
         self.field_size = [105.0, 68.0]   # 경기장 길이×폭 (m)
@@ -1615,6 +1616,9 @@ class PtzTab(QWidget):
             QListWidget.SelectionMode.ExtendedSelection)
         self.player_list.currentRowChanged.connect(
             lambda _: self._goto_player())
+        self.player_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self.player_list.customContextMenuRequested.connect(self._player_menu)
         pl.addWidget(self.player_list, 1)
         rl = QHBoxLayout()
         rl.addWidget(QLabel("선택한 트랙릿 →"))
@@ -1909,6 +1913,7 @@ class PtzTab(QWidget):
         self.kit_colors = {}
         self.user_events = []
         self.match_info = None
+        self.merges = {}
         sp = self._sidecar_path()
         doc = None
         if sp.exists():
@@ -1943,6 +1948,8 @@ class PtzTab(QWidget):
             self.user_events = [[int(e[0]), str(e[1])]
                                 for e in doc.get("user_events", [])]
             self.match_info = doc.get("match_info")
+            self.merges = {int(t): int(r) for t, r in
+                           (doc.get("merges") or {}).items()}
             ids = [int(p[4]) for rows in self.extra_players.values()
                    for p in rows]
             self._next_extra_id = max(ids, default=900000) + 1
@@ -2015,7 +2022,9 @@ class PtzTab(QWidget):
                                    "export_range": self.export_range,
                                    "team_names": self.team_names,
                                    "user_events": self.user_events,
-                                   "match_info": self.match_info}))
+                                   "match_info": self.match_info,
+                                   "merges": {str(t): r for t, r in
+                                              self.merges.items()}}))
         tmp.replace(sp)
 
     def _write_analysis(self):
@@ -3254,8 +3263,22 @@ class PtzTab(QWidget):
         self._refresh_team_label()
         self._refresh_player_list()
 
+    def _rep(self, tid):
+        """트랙릿의 병합 대표 tid (병합 없으면 자기 자신)."""
+        return self.merges.get(int(tid), int(tid))
+
     def _role_of(self, tid):
-        return self.roles.get(tid, self._teams.get(tid, 2))
+        """유효 역할 — 병합 그룹은 대표 기준 (역할 데이터는 비파괴).
+
+        대표의 역할이 우선이라 팀 분류가 틀린 조각도 그룹에 넣으면
+        표시가 바로잡히고, 분리하면 원래 분류로 돌아간다.
+        """
+        rep = self.merges.get(tid, tid)
+        if rep in self.roles:
+            return self.roles[rep]
+        if tid in self.roles:
+            return self.roles[tid]
+        return self._teams.get(rep, self._teams.get(tid, 2))
 
     def _role_color(self, role):
         """역할의 표시색(BGR) — 사용자 지정 > 측정 대표색 > 기본 팔레트."""
@@ -3339,18 +3362,36 @@ class PtzTab(QWidget):
         prev_cur = old_rows[cur] if 0 <= cur < len(old_rows) else None
         prev_sel = {old_rows[i.row()] for i in self.player_list.selectedIndexes()
                     if i.row() < len(old_rows)}
+        # 병합 그룹: 대표 아래 멤버를 들여쓰기로 (해제/분리를 위해 표시 유지)
+        groups: dict[int, list] = {}
+        for t in spans:
+            groups.setdefault(self._rep(t), []).append(t)
+        agg = {rep: [min(spans[t][0] for t in ms),
+                     max(spans[t][1] for t in ms),
+                     sum(spans[t][2] for t in ms)]
+               for rep, ms in groups.items()}
         # GK 는 목록 하단 그룹으로 (그 안에선 검출 수 순)
-        self._player_rows = sorted(
-            spans, key=lambda t: (self._role_of(t) in (3, 4), -spans[t][2]))
+        reps = sorted(groups, key=lambda t: (self._role_of(t) in (3, 4),
+                                             -agg[t][2]))
+        self._player_rows = []
+        for rep in reps:
+            self._player_rows.append(rep)
+            self._player_rows += sorted(
+                (t for t in groups[rep] if t != rep),
+                key=lambda t: spans[t][0])
         self.player_list.blockSignals(True)
         self.player_list.clear()
         for tid in self._player_rows:
-            f0, f1, n = spans[tid]
+            rep = self._rep(tid)
+            k = len(groups.get(tid, ()))
+            f0, f1, n = agg[tid] if tid == rep else spans[tid]
             r = self._role_of(tid)
             t0, t1 = f0 / self.fps, f1 / self.fps
-            mark = "● " if tid in self.roles else ""
+            mark = "● " if (tid in self.roles or rep in self.roles) else ""
+            head = (f"  ↳ #{tid}" if tid != rep
+                    else f"#{tid}" + (f" (+{k - 1})" if k > 1 else ""))
             it = QListWidgetItem(
-                f"#{tid}  {mark}{self._role_name(r)}  "
+                f"{head}  {mark}{self._role_name(r)}  "
                 f"{int(t0//60):02d}:{t0%60:04.1f}~"
                 f"{int(t1//60):02d}:{t1%60:04.1f}  ({n}회)")
             if tid in cols:
@@ -3744,6 +3785,7 @@ class PtzTab(QWidget):
         n_extra = sum(len(v) for v in self.extra_players.values())
         detail = (f"키프레임 {len(self.keyframes)} / 무시 {len(self.ignores)}"
                   f" / 승격 {len(self.promotes)} / 역할 {len(self.roles)}"
+                  f" / 병합 {len(self.merges)}"
                   f" / 랜드마크 {len(self.field_points)}"
                   f" / 수동 검출 {n_extra}")
         if QMessageBox.question(
@@ -3757,6 +3799,7 @@ class PtzTab(QWidget):
             self._box_commit = None
         if scope in ("roles", "all"):
             self.roles = {}
+            self.merges = {}
             self.extra_players = {}
             self.kit_colors = {}
             self._pcache_id = None
@@ -3929,8 +3972,10 @@ class PtzTab(QWidget):
 
     def _assign_selected_role(self, role):
         rows = getattr(self, "_player_rows", [])
-        sel = [rows[i.row()] for i in self.player_list.selectedIndexes()
-               if i.row() < len(rows)]
+        # 병합 멤버 선택은 대표에 지정 — 그룹(같은 사람) 전체에 적용
+        sel = {self._rep(rows[i.row()])
+               for i in self.player_list.selectedIndexes()
+               if i.row() < len(rows)}
         for tid in sel:
             if role is None:
                 self.roles.pop(tid, None)
@@ -3953,6 +3998,98 @@ class PtzTab(QWidget):
         self._refresh_player_list()
         self._save_keyframes()
         self._redraw()
+
+    # ------------------------------------------------------ 트랙릿 병합
+    def suggest_tracklet_merges(self):
+        """분석 메뉴: 트랙릿 병합 제안 (시공간 × 유니폼색 × 역할).
+
+        기존 병합(수동 포함)은 유지하고 새 링크를 합친다 — 비파괴라
+        목록 우클릭으로 언제든 그룹 해체/멤버 분리/추가 가능.
+        """
+        if self.analysis is None:
+            QMessageBox.information(self, "병합", "먼저 분석이 필요합니다.")
+            return
+        if self._field_calib is None:
+            QMessageBox.information(self, "병합",
+                                    "경기장 캘리브레이션이 필요합니다 "
+                                    "(시공간 근접 판단에 필드 좌표 사용).")
+            return
+        from ..core.tracklets import (
+            merge_map, suggest_links, tracklet_summaries,
+        )
+        spans, _ = self._player_cache()
+        n_before = len({self._rep(t) for t in spans})
+        with self._busy("트랙릿 병합 제안 (시공간 × 유니폼색 × 역할)"):
+            summ = tracklet_summaries(self.analysis, self._field_calib)
+            roles_eff = {t: self._role_of(t) for t in summ}
+            links = suggest_links(summ, roles_eff)
+            all_links = ([(a, b) for a, b, _ in links]
+                         + list(self.merges.items()))
+            self.merges = merge_map(all_links,
+                                    {t: spans[t][2] for t in spans})
+        self._merges_changed()
+        n_after = len({self._rep(t) for t in spans})
+        self.log(f"[merge] 링크 {len(links)}개 제안 — 트랙릿 {len(spans)}개"
+                 f" → 그룹 {n_before}→{n_after}개 "
+                 f"(선수 목록 우클릭으로 해제/분리/추가)")
+
+    def _merges_changed(self):
+        self._save_keyframes()
+        self._refresh_team_label()
+        self._refresh_player_list()
+        self._redraw()
+
+    def _player_menu(self, pos):
+        """선수 목록 우클릭 — 병합/분리/해체 (전부 되돌리기 가능)."""
+        rows = getattr(self, "_player_rows", [])
+        sel = sorted({rows[i.row()] for i in self.player_list.selectedIndexes()
+                      if i.row() < len(rows)})
+        menu = QMenu(self)
+        if len(sel) >= 2:
+            menu.addAction(
+                f"선택 {len(sel)}개 트랙릿 병합 (같은 사람)",
+                lambda: self._merge_tracklets(sel))
+        it = self.player_list.itemAt(pos)
+        tid = (rows[self.player_list.row(it)]
+               if it is not None and self.player_list.row(it) < len(rows)
+               else None)
+        if tid is not None:
+            rep = self._rep(tid)
+            group = [t for t in rows if self._rep(t) == rep]
+            if tid != rep:
+                menu.addAction(f"#{tid} 그룹에서 분리 (원래 분류로)",
+                               lambda: self._split_tracklet(tid))
+            if len(group) > 1:
+                menu.addAction(
+                    f"그룹 해체 — #{rep} 외 {len(group) - 1}개 전부 분리",
+                    lambda: self._dissolve_group(rep))
+        if not menu.isEmpty():
+            menu.exec(self.player_list.mapToGlobal(pos))
+
+    def _merge_tracklets(self, tids):
+        """선택 트랙릿 수동 병합 — 기존 그룹과 union (빠진 조각 추가 포함)."""
+        from ..core.tracklets import merge_map
+        spans, _ = self._player_cache()
+        links = ([(tids[0], t) for t in tids[1:]]
+                 + list(self.merges.items()))
+        self.merges = merge_map(links, {t: spans[t][2] for t in spans})
+        self._merges_changed()
+        self.log(f"[merge] 수동 병합: {', '.join(f'#{t}' for t in tids)}"
+                 f" → 대표 #{self._rep(tids[0])}")
+
+    def _split_tracklet(self, tid):
+        """멤버 하나만 그룹에서 분리 — 역할은 원래 분류로 돌아간다."""
+        rep = self.merges.pop(int(tid), None)
+        if rep is None:
+            return
+        self._merges_changed()
+        self.log(f"[merge] #{tid} 를 그룹 #{rep} 에서 분리")
+
+    def _dissolve_group(self, rep):
+        n = sum(1 for r in self.merges.values() if r == rep)
+        self.merges = {t: r for t, r in self.merges.items() if r != rep}
+        self._merges_changed()
+        self.log(f"[merge] 그룹 #{rep} 해체 ({n}개 분리)")
 
     # ------------------------------------------------------ 경기장 캘리브레이션
     def _review_tab_changed(self, idx):

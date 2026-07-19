@@ -92,6 +92,8 @@ class MainWindow(QMainWindow):
                     lambda: self.ptz_tab.start_gapfill())
         a.addAction("킥오프 검출 (호각 × 대형)",
                     lambda: self.ptz_tab.detect_events())
+        a.addAction("트랙릿 병합 제안 (ReID 라이트)",
+                    lambda: self.ptz_tab.suggest_tracklet_merges())
         a.addSeparator()
         a.addAction("하이라이트 후보 생성 (이벤트 융합)",
                     lambda: self.ptz_tab.detect_highlights())
