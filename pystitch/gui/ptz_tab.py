@@ -28,8 +28,9 @@ from ..core.field import (
 )
 from ..core.ptz import (
     accept_ball_tracks, analyze_video, build_plan, build_radar_data,
-    classify_teams, ground_positions, link_ball_tracks, ptz_available,
-    render_plan, same_spot_spans, tracklet_colors,
+    classify_teams, gapfill_analysis, gapfill_targets, ground_positions,
+    link_ball_tracks, ptz_available, render_plan, same_spot_spans,
+    tracklet_colors,
 )
 from .widgets import FramePane
 
@@ -184,7 +185,7 @@ class TimelineView(QWidget):
     RULER = 16
     LANE_H = 20
     GUTTER = 64
-    LANES = ["크롭/KF", "공", "팀1", "팀2", "기타"]
+    LANES = ["크롭/KF", "공", "팀1", "팀2", "기타", "호각"]
 
     def __init__(self):
         super().__init__()
@@ -203,7 +204,13 @@ class TimelineView(QWidget):
         self.selected = None         # (종류, 키)
         self.mark_in = None          # 내보내기 시작 프레임 (None=미지정)
         self.mark_out = None         # 내보내기 끝 프레임
+        self._whistle = None         # (hop_s, 프로미넌스 배열, 이벤트)
         self._press = None
+
+    def set_whistle(self, hop_s, prom, events):
+        self._whistle = (float(hop_s), np.asarray(prom, dtype=np.float32),
+                         list(events))
+        self.update()
 
     def set_range(self, f0, f1):
         if (f0, f1) != (self.mark_in, self.mark_out):
@@ -361,6 +368,30 @@ class TimelineView(QWidget):
             if self.selected == ("player", tid):
                 p.setPen(QColor(255, 255, 255))
                 p.drawRect(r[0] - 1, r[1] - 1, r[2] + 1, r[3] + 1)
+        # 호각 레인: 프로미넌스 세로 바 (dB → 높이·색), 이벤트는 밝은 틱
+        if self._whistle is not None and self.total > 1:
+            hop_s, prom, events = self._whistle
+            y, lh = self._lane_rect(5)
+            ppf = self._eff_ppf()
+            spf = 1.0 / max(self.fps, 1e-6)          # 초/프레임
+            for px_ in range(self.GUTTER, W):
+                f0 = self._f(px_)
+                i0 = int(f0 * spf / hop_s)
+                i1 = max(i0 + 1, int((f0 + 1.0 / ppf) * spf / hop_s))
+                if i0 >= len(prom):
+                    break
+                v = float(prom[i0:min(i1, len(prom))].max())
+                if v < 6.0:
+                    continue
+                h_ = int(np.clip((v - 6.0) / 24.0, 0.05, 1.0) * (lh - 4))
+                c = (QColor(255, 120, 60) if v >= 15.0
+                     else QColor(180, 180, 90))
+                p.fillRect(px_, y + lh - 2 - h_, 1, h_, c)
+            p.setPen(QColor(255, 200, 80))
+            for t0_, t1_, db in events:
+                x_ = self._x(t0_ * self.fps)
+                if self.GUTTER <= x_ <= W:
+                    p.drawLine(x_, y + 1, x_, y + 3)
         # 내보내기 구간: 바깥은 어둡게, IN/OUT 브래킷 표시
         if self.mark_in is not None or self.mark_out is not None:
             fi = 0 if self.mark_in is None else self.mark_in
@@ -511,6 +542,35 @@ class LinkWorker(QThread):
         linked = link_ball_tracks(self.analysis)
         linked["teams"] = classify_teams(self.analysis)
         self.done.emit(linked)
+
+
+class GapfillWorker(QThread):
+    """갭필 2차 패스: 트랙 갭 보간 위치의 저문턱 타일 검출 (공+선수)."""
+
+    progress = pyqtSignal(int, int, float)
+    done = pyqtSignal(dict, int, int)     # analysis, n_ball, n_person
+    failed = pyqtSignal(str)
+    log = pyqtSignal(str)
+
+    def __init__(self, pano_path, analysis, targets, weights=None):
+        super().__init__()
+        self.args = (pano_path, analysis, targets, weights)
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        pano, analysis, targets, weights = self.args
+        try:
+            nb, np_ = gapfill_analysis(
+                pano, analysis, targets, weights=weights,
+                progress=lambda i, t, f: self.progress.emit(i, t, f),
+                cancel=lambda: self._cancel,
+                log=lambda s: self.log.emit(s))
+            self.done.emit(analysis, nb, np_)
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(str(e))
 
 
 class PlanWorker(QThread):
@@ -821,6 +881,7 @@ class PtzTab(QWidget):
         self._box_commit = None           # 커밋 직후 낙관적 박스 (f, cx, cy, w)
         self._lm_drag = None              # 드래그 중인 랜드마크 키
         self._analyze_worker = None
+        self._gapfill_worker = None
         self._render_worker = None
         self._plan_worker = None
         self._link_worker = None
@@ -1171,6 +1232,16 @@ class PtzTab(QWidget):
         self.pano_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.lbl_file.setText(f"{self.pano_path.name} — {self.pano_w}x{self.pano_h}, "
                               f"{self.total/self.fps/60:.1f}분")
+        # 호각 트랙 (있으면) → 타임라인 레인
+        try:
+            from ..core.audio import load_whistle_track, whistle_prominence
+            tr, ev = load_whistle_track(self.pano_path)
+            if tr is not None:
+                self.trackbar.set_whistle(tr["hop_s"],
+                                          whistle_prominence(tr), ev)
+                self.log(f"[ptz] 호각 트랙 로드: 이벤트 {len(ev)}개")
+        except Exception as e:  # noqa: BLE001
+            self.log(f"[ptz] 호각 트랙 무시: {e}")
         self.slider.setEnabled(True)
         self.slider.setRange(0, max(0, self.total - 1))
         self.slider.setValue(0)
@@ -2515,6 +2586,53 @@ class PtzTab(QWidget):
             spans, _ = self._player_cache()
             self.slider.setValue(int(spans[rows[row]][0]))
             self.trackbar.set_selection("player", rows[row])
+
+    def start_gapfill(self):
+        """분석 메뉴: 갭필 2차 패스 — 트랙 갭을 저문턱 검출로 메꿈."""
+        if self.analysis is None or self.pano_path is None:
+            QMessageBox.information(self, "갭필", "먼저 분석이 필요합니다.")
+            return
+        if self._gapfill_worker is not None and self._gapfill_worker.isRunning():
+            self._gapfill_worker.cancel()
+            self.log("[gapfill] 취소 요청")
+            return
+        targets = gapfill_targets(
+            self.analysis,
+            ignore_ranges=[tuple(r) for r in self.ignores],
+            force_ranges=[tuple(p) for p in self.promotes],
+            linked=self._linked)
+        if not targets:
+            QMessageBox.information(self, "갭필",
+                                    "메꿀 갭이 없습니다 (≤4초 갭 기준).")
+            return
+        est = len(targets) * 0.17 / 60
+        if QMessageBox.question(
+                self, "갭필 2차 패스",
+                f"트랙 갭 {len(targets)}지점을 저문턱 재검출합니다 "
+                f"(예상 ~{est:.0f}분). 진행할까요?") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        w = GapfillWorker(str(self.pano_path), self.analysis, targets,
+                          weights=self._model_weights())
+        w.progress.connect(lambda i, t, f: (
+            self.progress.setRange(0, t), self.progress.setValue(i),
+            self.progress.setFormat(f"갭필 %p% ({f:.1f}/s)")))
+        w.log.connect(self.log)
+        w.done.connect(self._gapfill_done)
+        w.failed.connect(lambda e: self.log(f"[gapfill] 실패: {e}"))
+        self._gapfill_worker = w
+        self.log(f"[gapfill] 시작: {len(targets)}지점")
+        w.start()
+
+    def _gapfill_done(self, analysis, nb, np_):
+        self.analysis = analysis
+        self._write_analysis()            # 주입 반영해 .analysis.json 갱신
+        self._pcache_id = None            # 선수 캐시 무효화 (주입분 반영)
+        self.progress.setRange(0, 1)
+        self.progress.setValue(1)
+        self.progress.setFormat("갭필 완료")
+        self.log(f"[gapfill] 완료: 공 {nb}개, 선수 {np_}명 주입 — 트랙 재연결")
+        self._start_link()                # 링크·수락 재계산 → 목록/타임라인 갱신
 
     def reset_edits(self, scope="all"):
         """사용자 편집 무효화 → 순수 분석 원본 상태 (분석 메뉴에서 호출).

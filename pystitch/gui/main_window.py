@@ -88,6 +88,9 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         m.addAction("종료", self.close)
         a = self.menuBar().addMenu("분석(&A)")
+        a.addAction("갭필 2차 패스 (트랙 갭 재검출)...",
+                    lambda: self.ptz_tab.start_gapfill())
+        a.addSeparator()
         a.addAction("공/키프레임 편집 초기화",
                     lambda: self.ptz_tab.reset_edits("ball"))
         a.addAction("선수 역할 지정 초기화",

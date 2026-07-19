@@ -319,6 +319,135 @@ ROLE_TEAM0, ROLE_TEAM1, ROLE_OTHER = 0, 1, 2
 ROLE_GK0, ROLE_GK1, ROLE_REF = 3, 4, 5
 
 
+def gapfill_targets(analysis, ignore_ranges=None, force_ranges=None,
+                    linked=None, max_gap_s=4.0):
+    """수락 트랙 사이 갭의 보간 목표 [(si, x, y), ...] (갭필 2차 패스용).
+
+    수락 커버리지(사용자 편집 반영)에서 이웃한 두 수락 샘플 사이가
+    max_gap_s 이하인 갭만 — 그보다 길면 공이 화면 밖/플레이 중단일
+    가능성이 높아 보간 위치를 신뢰할 수 없다.
+    """
+    if linked is None:
+        linked = link_ball_tracks(analysis)
+    _, acc, _ = accept_ball_tracks(
+        analysis, ignore_ranges=ignore_ranges or [],
+        force_ranges=force_ranges or [], linked=linked, log=lambda s: None)
+    fps = analysis["fps"]
+    de = analysis["detect_every"]
+    fin = np.where(np.isfinite(acc[:, 0]))[0]
+    max_gap = max(2, int(round(max_gap_s * fps / de)))
+    out = []
+    for a, b in zip(fin[:-1], fin[1:]):
+        if b - a <= 1 or b - a > max_gap:
+            continue
+        for si in range(int(a) + 1, int(b)):
+            w = (si - a) / (b - a)
+            out.append((int(si),
+                        float(acc[a, 0] * (1 - w) + acc[b, 0] * w),
+                        float(acc[a, 1] * (1 - w) + acc[b, 1] * w)))
+    return out
+
+
+def gapfill_analysis(pano_path, analysis, targets, weights=None,
+                     conf=0.06, ball_radius=250.0, tile=640,
+                     progress=None, cancel=None, log=print):
+    """갭 보간 위치의 저문턱 640 타일 검출 → 분석에 공/선수 주입.
+
+    A/B 실험(devlog 020) 근거: 운영 패스가 놓친 지점의 ~49% 가 같은
+    파노라마에서 저문턱 중심 타일로 잡힌다. 같은 추론으로 사람도 함께
+    검출해 원경 선수 커버리지를 보강한다 (id -1, 상반신 HSV 포함).
+
+    공 주입 행은 저장 conf 를 링크 문턱(0.25)을 넘는 0.26 으로 바닥
+    처리하고 원래 conf 를 6번째 원소로 보존 — 길이 6 = 갭필 행.
+    반환: (주입 공 수, 주입 선수 수).
+    """
+    import time
+
+    from ultralytics import YOLO
+    model = YOLO(str(weights or _DEFAULT_WEIGHTS))
+    cap = cv2.VideoCapture(str(pano_path))
+    W, H = analysis["pano_w"], analysis["pano_h"]
+    frames = analysis["frames"]
+    field_top = analysis.get("field_top_frac", 0.26) * H
+    if not analysis.get("ball_cands"):
+        cap.release()
+        raise ValueError("구형 분석(ball_cands 없음) — 재분석 필요")
+    n_ball = n_person = 0
+    t0 = time.perf_counter()
+    pos = -10 ** 9                       # 마지막으로 읽은 프레임 위치
+    for k, (si, x, y) in enumerate(sorted(targets)):
+        if cancel is not None and cancel():
+            break
+        F = int(frames[si])
+        # 갭 목표는 연속 샘플이 대부분 — 가까우면 시크 대신 순차 grab
+        # (7.7GB 파일 랜덤 시크는 ~1.4s, grab 은 프레임당 ~10ms)
+        if 0 <= F - pos <= 90:
+            for _ in range(F - pos - 1):
+                cap.grab()
+        else:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, F)
+        ok, frame = cap.read()
+        pos = F
+        if not ok:
+            continue
+        x0 = int(np.clip(x - tile / 2, 0, max(W - tile, 0)))
+        y0 = int(np.clip(y - tile / 2, 0, max(H - tile, 0)))
+        crop = frame[y0:y0 + tile, x0:x0 + tile]
+        r = model.predict(crop, imgsz=tile, conf=conf,
+                          classes=[_CLS_PERSON, _CLS_BALL], verbose=False)[0]
+        hsv = None
+        best = None
+        prow = analysis["players"][si]
+        cands = analysis["ball_cands"][si]
+        for b in r.boxes:
+            bx1, by1, bx2, by2 = b.xyxy[0].tolist()
+            cx, cy = x0 + (bx1 + bx2) / 2, y0 + (by1 + by2) / 2
+            c = float(b.conf[0])
+            if cy < field_top:
+                continue                     # 장외 (원경 트랙·관중석)
+            if int(b.cls[0]) == _CLS_BALL:
+                if (cx - x) ** 2 + (cy - y) ** 2 <= ball_radius ** 2 \
+                        and (best is None or c > best[2]):
+                    best = [cx, cy, c, bx2 - bx1, by2 - by1]
+            else:
+                if any((p[0] - cx) ** 2 + (p[1] - cy) ** 2
+                       < max(p[3] / 2, 20.0) ** 2
+                       for p in prow if len(p) >= 4):
+                    continue                 # 기존 선수와 중복
+                if hsv is None:
+                    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+                tx1 = int(bx1 + (bx2 - bx1) * 0.2)
+                tx2 = int(bx2 - (bx2 - bx1) * 0.2)
+                torso = hsv[int(by1):int((by1 + by2) / 2),
+                            max(tx1, 0):max(tx2, 1)]
+                hm, sm, vm = (torso.reshape(-1, 3).mean(axis=0).tolist()
+                              if torso.size else (0.0, 0.0, 0.0))
+                prow.append([round(cx, 1), round(cy, 1),
+                             round(bx2 - bx1, 1), round(by2 - by1, 1), -1,
+                             round(hm, 1), round(sm, 1), round(vm, 1)])
+                n_person += 1
+        if best is not None and all(
+                np.hypot(best[0] - p[0], best[1] - p[1]) > 30
+                for p in cands):
+            cands.append([round(best[0], 1), round(best[1], 1),
+                          max(0.26, round(best[2], 3)),
+                          round(best[3], 1), round(best[4], 1),
+                          round(best[2], 3)])
+            if analysis["balls"][si] is None:
+                analysis["balls"][si] = list(cands[-1][:5])
+            n_ball += 1
+        if progress is not None and (k + 1) % 30 == 0:
+            progress(k + 1, len(targets),
+                     (k + 1) / max(time.perf_counter() - t0, 1e-9))
+    cap.release()
+    analysis["gapfill"] = {"targets": len(targets), "ball": n_ball,
+                           "person": n_person, "conf": conf,
+                           "radius": ball_radius}
+    log(f"[gapfill] 목표 {len(targets)}개 → 공 {n_ball}개, "
+        f"선수 {n_person}명 주입")
+    return n_ball, n_person
+
+
 def classify_teams(analysis, k=3, roles=None):
     """트랙릿(선수 ID)별 유니폼 색으로 팀/역할 분류.
 

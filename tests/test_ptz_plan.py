@@ -288,6 +288,33 @@ def test_tracklet_colors_circular_hue():
     assert 150 <= s <= 210 and 130 <= v <= 170
 
 
+def test_gapfill_targets_interpolate_gaps():
+    """수락 트랙 사이 짧은 갭만 보간 목표로 — 긴 갭(플레이 중단)은 제외."""
+    from pystitch.core.ptz import gapfill_targets
+    frames = list(range(0, 3000, 3))
+    balls = []
+    for f in frames:
+        if 300 <= f < 600 or 660 <= f < 900:      # 2초 갭 (660-600)
+            balls.append([1000.0 + f, 800.0, 0.6])
+        elif 1800 <= f < 2100:                     # 앞 트랙과 30초 갭
+            balls.append([2500.0, 800.0, 0.6])
+        else:
+            balls.append(None)
+    a = _analysis(frames, balls)
+    a.update({"pano_w": PANO_W, "pano_h": PANO_H, "detect_every": 3})
+    tg = gapfill_targets(a, max_gap_s=4.0)
+    assert tg, "짧은 갭 목표가 있어야 함"
+    sis = [t[0] for t in tg]
+    # 짧은 갭(600~660 프레임 = 샘플 200~220) 안에만 목표가 생겨야 함
+    assert min(sis) >= 200 and max(sis) <= 220
+    # 보간 위치는 양 끝 사이에서 단조 증가 (공이 +x 로 이동 중)
+    xs = [t[1] for t in tg]
+    assert all(b > a_ for a_, b in zip(xs, xs[1:]))
+    assert 1590 <= min(xs) and max(xs) <= 1670
+    # 긴 갭(900~1800)은 목표 없음
+    assert not any(300 < si < 600 for si in sis)
+
+
 def test_radar_panel_aspect_and_data():
     """내보내기 레이더: 경기장 사각형이 입력 크기(100×62) 비율 그대로."""
     from pystitch.core.ptz import build_radar_data, draw_radar_panel
