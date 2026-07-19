@@ -527,7 +527,35 @@ def propagate_seed(pano_path, analysis, f0, x0, y0, kind="ball",
     return out
 
 
-def classify_teams(analysis, k=3, roles=None):
+def team_features(analysis):
+    """트랙릿별 색 특징·스팬 추출 — classify_teams 의 비싼 전처리.
+
+    전체 검출을 한 번 훑는 유일한 단계라 호출부(GUI)가 분석당 1회
+    캐시해 재사용한다 (역할 지정마다 재추출하면 수 초 프리즈).
+    반환: {ids, X(중앙값 특징), n_det, spans}.
+    """
+    feats: dict[int, list] = {}
+    spans: dict[int, list] = {}          # {tid: [첫, 끝 프레임]} — GK 단일성
+    frames = np.asarray(analysis["frames"])
+    for si, prow in enumerate(analysis["players"]):
+        for p in prow:
+            if len(p) >= 8 and p[4] >= 0:
+                h, s_, v = p[5], p[6], p[7]
+                a = h / 90.0 * np.pi          # OpenCV H 는 0~180
+                feats.setdefault(int(p[4]), []).append(
+                    (s_ * np.cos(a), s_ * np.sin(a), v))
+                f = int(frames[si]) if si < len(frames) else si
+                e = spans.setdefault(int(p[4]), [f, f])
+                e[1] = f
+    ids = sorted(feats)
+    return {"ids": ids,
+            "X": (np.array([np.median(feats[t], axis=0) for t in ids])
+                  if ids else np.zeros((0, 3))),
+            "n_det": np.array([len(feats[t]) for t in ids], float),
+            "spans": spans}
+
+
+def classify_teams(analysis, k=3, roles=None, feats=None):
     """트랙릿(선수 ID)별 유니폼 색으로 팀/역할 분류.
 
     분석의 선수 행이 [cx,cy,w,h,id,h,s,v] 형식일 때만 동작. 특징은
@@ -547,24 +575,10 @@ def classify_teams(analysis, k=3, roles=None):
     끌려오는 오동작이 있었다.
     반환: {track_id: 역할번호}.
     """
-    feats: dict[int, list] = {}
-    spans: dict[int, list] = {}          # {tid: [첫, 끝 프레임]} — GK 단일성
-    frames = np.asarray(analysis["frames"])
-    for si, prow in enumerate(analysis["players"]):
-        for p in prow:
-            if len(p) >= 8 and p[4] >= 0:
-                h, s_, v = p[5], p[6], p[7]
-                a = h / 90.0 * np.pi          # OpenCV H 는 0~180
-                feats.setdefault(int(p[4]), []).append(
-                    (s_ * np.cos(a), s_ * np.sin(a), v))
-                f = int(frames[si]) if si < len(frames) else si
-                e = spans.setdefault(int(p[4]), [f, f])
-                e[1] = f
-    if not feats:
+    tf = feats if feats is not None else team_features(analysis)
+    ids, X, n_det, spans = tf["ids"], tf["X"], tf["n_det"], tf["spans"]
+    if not ids:
         return {}
-    ids = sorted(feats)
-    X = np.array([np.median(feats[t], axis=0) for t in ids])
-    n_det = np.array([len(feats[t]) for t in ids], float)
     k = min(k, len(ids))
     # farthest-point 초기화 (결정적)
     centers = [X[int(np.argmax(np.linalg.norm(X - X.mean(0), axis=1)))]]

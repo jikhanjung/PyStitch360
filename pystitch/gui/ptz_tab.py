@@ -1325,6 +1325,8 @@ class PtzTab(QWidget):
         self.track_spans: list = []
         self._pcache_id = None            # 선수 요약 캐시 기준 분석 객체 id
         self._pcolors_id = None           # 대표색 캐시 키 (분석에만 의존)
+        self._tfeat = None                # classify_teams 전처리 캐시
+        self._tfeat_id = None
         self._pspans: dict = {}           # {tid: [f0, f1, 검출수]}
         self._pcolors: dict = {}          # {tid: (h, s, v)} 유니폼 대표색
         self._accepted_ball = None        # accept_ball_tracks 의 샘플별 수락 공
@@ -3371,7 +3373,8 @@ class PtzTab(QWidget):
         self._linked = linked
         self._teams = linked.pop("teams", {}) or {}
         if self.roles and self.analysis is not None:
-            self._teams = classify_teams(self.analysis, roles=self.roles)
+            self._teams = classify_teams(self.analysis, roles=self.roles,
+                                         feats=self._team_feats())
         n_team = sum(1 for v in self._teams.values() if v < 2)
         self.log(f"[ptz] 트랙 연결 완료: {len(linked['tracks'])}개"
                  + (f", 팀 분류 선수 ID {n_team}개" if self._teams else
@@ -3419,6 +3422,17 @@ class PtzTab(QWidget):
                      if self._rep(t) not in self.hidden_players}
             return spans, self._pcolors
         return self._pspans, self._pcolors
+
+    def _team_feats(self):
+        """classify_teams 전처리(전 검출 스캔) 캐시 — 분석당 1회.
+
+        역할/번호 지정마다 재추출하면 수 초 UI 프리즈가 생긴다.
+        """
+        from ..core.ptz import team_features
+        if self._tfeat_id != id(self.analysis):
+            self._tfeat = team_features(self.analysis)
+            self._tfeat_id = id(self.analysis)
+        return self._tfeat
 
     def _role_name(self, r):
         """역할 표시명 — 팀1/팀2 자리에 사용자 입력 팀 이름."""
@@ -4182,7 +4196,8 @@ class PtzTab(QWidget):
             self.field_points = {}
             self.line_points = []
         if self.analysis is not None:
-            self._teams = classify_teams(self.analysis, roles=self.roles)
+            self._teams = classify_teams(self.analysis, roles=self.roles,
+                                         feats=self._team_feats())
         self._write_sidecar()
         self._refit_field()
         self._refresh_field_list()
@@ -4446,7 +4461,8 @@ class PtzTab(QWidget):
     def _roles_changed(self):
         self._ar_side_cache = {}
         if self.analysis is not None:
-            self._teams = classify_teams(self.analysis, roles=self.roles)
+            self._teams = classify_teams(self.analysis, roles=self.roles,
+                                         feats=self._team_feats())
         self._refresh_team_label()
         self._refresh_player_list()
         self._save_keyframes()
