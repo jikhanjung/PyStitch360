@@ -53,6 +53,33 @@ def test_fit_with_click_noise():
     calib = fit_field_calibration(_click_all(noise=4.0), PANO_W, PANO_H)
     assert calib is not None and calib["rms"] < 10.0
 
+def test_fit_with_near_sideline_points():
+    """half_near 가 안 보일 때: 위치 점 3개 + 사이드라인 위 점 2개로 해결."""
+    from pystitch.core.field import _sideline_rows
+    pts = _click_all()
+    hw = 34.0
+    # 사이드라인 위 임의 지점 (X는 미지라고 가정하고 픽셀만 사용)
+    sl = _project(TRUTH, np.array([[-20.0, -hw], [18.0, -hw]]), PANO_W, PANO_H)
+    use = {k: pts[k] for k in ("corner_far_l", "corner_far_r", "circle_far")}
+    use["sideline_near_l"] = tuple(sl[0])
+    use["sideline_near_r"] = tuple(sl[1])
+    calib = fit_field_calibration(use, PANO_W, PANO_H)   # 방정식 6+2=8
+    assert calib is not None and calib["rms"] < 2.0
+    # 사이드라인이 실제로 맞는 위치에 놓였는가: 예측 행 vs 정답 행
+    cols = np.linspace(sl[0, 0], sl[1, 0], 7)
+    p = np.array([calib["h"], calib["t_top"], calib["t_bot"], calib["phi0"],
+                  calib["theta"], calib["ex"], calib["ey"]])
+    pred = _sideline_rows(p, cols, PANO_W, PANO_H, 68.0)
+    true_rows = _project(TRUTH, np.stack(
+        [np.zeros(7), np.full(7, -hw)], axis=1), PANO_W, PANO_H)  # placeholder
+    # 정답 행: 각 열의 yaw 광선이 truth 모델에서 Y=-hw 와 만나는 행
+    true = _sideline_rows(TRUTH, cols, PANO_W, PANO_H, 68.0)
+    assert np.nanmax(np.abs(pred - true)) < 15.0
+    # 점이 모자라면 (방정식 7개) 거부
+    del use["sideline_near_r"]
+    assert fit_field_calibration(use, PANO_W, PANO_H) is None
+
+
 def test_inverse_consistency_and_outline():
     calib = fit_field_calibration(_click_all(), PANO_W, PANO_H)
     f = np.array([[10.0, 5.0], [-30.0, 20.0], [0.0, -34.0]])

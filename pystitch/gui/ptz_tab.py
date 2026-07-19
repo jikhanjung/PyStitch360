@@ -15,9 +15,9 @@ from PyQt6.QtCore import QSettings, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QCheckBox
 from PyQt6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
-    QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QMenu, QMessageBox, QProgressBar, QPushButton, QSlider,
-    QSpinBox, QTabWidget, QVBoxLayout, QWidget,
+    QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel,
+    QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar,
+    QPushButton, QSlider, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from ..core.encoders import available_encoders
@@ -42,7 +42,12 @@ ROLE_TAGS = {3: "GK1", 4: "GK2", 5: "REF"}
 LANDMARK_TAGS = {"corner_far_l": "FL", "corner_far_r": "FR",
                  "corner_near_l": "NL", "corner_near_r": "NR",
                  "half_far": "HF", "half_near": "HN",
-                 "circle_far": "CF", "circle_near": "CN"}
+                 "circle_far": "CF", "circle_near": "CN",
+                 "sideline_near_l": "SL", "sideline_near_r": "SR",
+                 "pen_l_far": "PLF", "pen_l_near": "PLN",
+                 "pen_r_far": "PRF", "pen_r_near": "PRN",
+                 "pen_l_box_far": "BLF", "pen_l_box_near": "BLN",
+                 "pen_r_box_far": "BRF", "pen_r_box_near": "BRN"}
 
 
 def _hsv_hex(hsv):
@@ -622,6 +627,10 @@ class PtzTab(QWidget):
         self.field_points: dict[str, list] = {}   # {랜드마크키: [x, y]}
         self.field_size = [105.0, 68.0]   # 경기장 길이×폭 (m)
         self._field_calib = None          # fit_field_calibration 결과
+        self.extra_players: dict[int, list] = {}  # {샘플si: [[cx,cy,w,h,id]]}
+        self._next_extra_id = 900001      # 수동 검출 ID (분석 ID와 분리)
+        self._adhoc = None                # 주변 재검출용 YOLO 캐시
+        self._native_cap = None           # 프록시 표시 중 원본 프레임용
         self.track_spans: list = []
         self._pcache_id = None            # 선수 요약 캐시 기준 분석 객체 id
         self._pspans: dict = {}           # {tid: [f0, f1, 검출수]}
@@ -633,6 +642,7 @@ class PtzTab(QWidget):
         self._box_hover = None            # 크롭 박스 hover 존: ("corner",i)|("border",None)
         self._box_edit = None             # 진행 중인 박스 드래그 상태
         self._box_commit = None           # 커밋 직후 낙관적 박스 (f, cx, cy, w)
+        self._lm_drag = None              # 드래그 중인 랜드마크 키
         self._analyze_worker = None
         self._render_worker = None
         self._plan_worker = None
@@ -696,24 +706,32 @@ class PtzTab(QWidget):
         v.addWidget(self.pane, 1)
 
         tl = QHBoxLayout()
-        self.btn_play = QPushButton("▶ 재생")
-        self.btn_play.setMaximumWidth(80)
-        self.btn_play.clicked.connect(self._toggle_play)
-        tl.addWidget(self.btn_play)
-        btn_prev = QPushButton("◀트랙")
-        btn_prev.setMaximumWidth(58)
-        btn_prev.clicked.connect(lambda: self._jump_track(-1))
-        tl.addWidget(btn_prev)
-        btn_next = QPushButton("트랙▶")
-        btn_next.setMaximumWidth(58)
-        btn_next.clicked.connect(lambda: self._jump_track(1))
-        tl.addWidget(btn_next)
-        for text, d in [("-10s", -300), ("-1s", -30), ("-1", -1),
-                        ("+1", 1), ("+1s", 30), ("+10s", 300)]:
+        # 컴팩트 트랜스포트: 2행 그리드 — 1행 재생/트랙 이동 + 시각,
+        # 2행 스텝 버튼 6개. 타임라인 왼쪽에 좁게 붙는다.
+        grid = QGridLayout()
+        grid.setSpacing(2)
+
+        def _tbtn(text, tip, slot, row, col, colspan=1):
             b = QPushButton(text)
-            b.setMaximumWidth(52)
-            b.clicked.connect(lambda _, dd=d: self._step(dd))
-            tl.addWidget(b)
+            b.setFixedWidth(30 * colspan + 2 * (colspan - 1))
+            b.setToolTip(tip)
+            b.clicked.connect(slot)
+            grid.addWidget(b, row, col, 1, colspan)
+            return b
+
+        self.btn_play = _tbtn("▶", "재생/정지 (Space)", self._toggle_play, 0, 0)
+        _tbtn("|◀", "이전 공 트랙으로", lambda: self._jump_track(-1), 0, 1)
+        _tbtn("▶|", "다음 공 트랙으로", lambda: self._jump_track(1), 0, 2)
+        for col, (text, tip, d) in enumerate(
+                [("≪", "-10초", -300), ("<", "-1초", -30), ("‹", "-1프레임", -1),
+                 ("›", "+1프레임", 1), (">", "+1초", 30), ("≫", "+10초", 300)]):
+            _tbtn(text, tip, lambda _, dd=d: self._step(dd), 1, col)
+        self.lbl_time = QLabel("-:--:--.- / -:--:--")
+        self.lbl_time.setToolTip("현재 위치 / 전체 길이")
+        grid.addWidget(self.lbl_time, 2, 0, 1, 6,
+                       Qt.AlignmentFlag.AlignCenter)
+        grid.setRowStretch(3, 1)          # 남는 세로 공간은 아래로
+        tl.addLayout(grid)
         # 멀티트랙 타임라인은 슬라이더 바로 위, 같은 폭
         self.trackbar = TimelineView()
         self.trackbar.seek.connect(lambda f: self.slider.setValue(f))
@@ -727,9 +745,6 @@ class PtzTab(QWidget):
         bar_col.addWidget(self.trackbar)
         bar_col.addWidget(self.slider)
         tl.addLayout(bar_col, 1)
-        self.lbl_time = QLabel("--:--.-")
-        self.lbl_time.setMinimumWidth(90)
-        tl.addWidget(self.lbl_time)
         v.addLayout(tl)
         self._slider_timer = QTimer(singleShot=True, interval=120)
         self._slider_timer.timeout.connect(self._show_frame)
@@ -812,8 +827,8 @@ class PtzTab(QWidget):
         fl = QVBoxLayout(w_field)
         fl.setContentsMargins(0, 2, 0, 0)
         self.lbl_field_status = QLabel(
-            "랜드마크를 찍으면 자동 매칭됩니다 (★=필수, 최소 4점). "
-            "우클릭으로 수동 지정/수정.")
+            "목록 순서대로(최외곽 선부터) 찍는 걸 권장 — 클릭=자동 매칭, "
+            "우클릭=수동 지정, 드래그=이동. 외곽 6~7점이면 외곽선이 잡힙니다.")
         fl.addWidget(self.lbl_field_status)
         self.field_list = QListWidget()
         fl.addWidget(self.field_list, 1)
@@ -822,10 +837,14 @@ class PtzTab(QWidget):
         self.btn_field_pick.setCheckable(True)
         self.btn_field_pick.setToolTip(
             "켜면 미리보기 클릭이 랜드마크 지정이 됩니다 (휴리스틱 자동 매칭)")
-        self.btn_field_pick.toggled.connect(lambda _: self._redraw())
+        self.btn_field_pick.toggled.connect(self._field_pick_toggled)
         fr.addWidget(self.btn_field_pick)
         b = QPushButton("선택 지우기")
         b.clicked.connect(self._field_clear_selected)
+        fr.addWidget(b)
+        b = QPushButton("모두 지우기")
+        b.setToolTip("찍은 랜드마크 전체 삭제")
+        b.clicked.connect(self._field_clear_all)
         fr.addWidget(b)
         fr.addWidget(QLabel("경기장(m)"))
         self.spin_field_len = QDoubleSpinBox()
@@ -921,6 +940,9 @@ class PtzTab(QWidget):
             return
         if self.cap is not None:
             self.cap.release()
+        if self._native_cap is not None:
+            self._native_cap.release()
+            self._native_cap = None
         self.cap = cap
         self.pano_path = Path(path)
         self._remember_dir(str(self.pano_path.parent))
@@ -1015,6 +1037,7 @@ class PtzTab(QWidget):
             [], [], [], None
         self.roles = {}
         self.field_points = {}
+        self.extra_players = {}
         sp = self._sidecar_path()
         doc = None
         if sp.exists():
@@ -1031,6 +1054,12 @@ class PtzTab(QWidget):
             self.field_points = {k: [float(v[0]), float(v[1])]
                                  for k, v in
                                  (doc.get("field_points") or {}).items()}
+            self.extra_players = {int(si): [list(p) for p in rows]
+                                  for si, rows in
+                                  (doc.get("extra_players") or {}).items()}
+            ids = [int(p[4]) for rows in self.extra_players.values()
+                   for p in rows]
+            self._next_extra_id = max(ids, default=900000) + 1
             fs = doc.get("field_size")
             if fs:
                 self.field_size = [float(fs[0]), float(fs[1])]
@@ -1092,7 +1121,8 @@ class PtzTab(QWidget):
                                    "promotes": self.promotes,
                                    "roles": self.roles,
                                    "field_points": self.field_points,
-                                   "field_size": self.field_size}))
+                                   "field_size": self.field_size,
+                                   "extra_players": self.extra_players}))
         tmp.replace(sp)
 
     def _write_analysis(self):
@@ -1190,12 +1220,18 @@ class PtzTab(QWidget):
         if self.slider.isEnabled():
             self.slider.setValue(self.slider.value() + d)
 
+    @staticmethod
+    def _hms(sec, tenth=False):
+        h, rem = divmod(max(0.0, sec), 3600)
+        m, s = divmod(rem, 60)
+        return (f"{int(h)}:{int(m):02d}:{s:04.1f}" if tenth
+                else f"{int(h)}:{int(m):02d}:{int(s):02d}")
+
     def _on_slider(self, _):
         self.trackbar.set_pos(self.slider.value())
         t = self.slider.value() / self.fps
-        cs = round(t * 100)
-        m, cs = divmod(cs, 6000)
-        self.lbl_time.setText(f"{m:02d}:{cs/100:05.2f}")
+        self.lbl_time.setText(f"{self._hms(t, tenth=True)} / "
+                              f"{self._hms(self.total / self.fps)}")
         self._slider_timer.start()
 
     def _toggle_play(self):
@@ -1211,7 +1247,7 @@ class PtzTab(QWidget):
         w.finished.connect(self._play_finished)
         self._play_worker = w
         self._playing = True
-        self.btn_play.setText("⏸ 정지")
+        self.btn_play.setText("⏸")
         w.start()
 
     def _stop_play(self):
@@ -1225,7 +1261,7 @@ class PtzTab(QWidget):
 
     def _play_finished(self):
         self._playing = False
-        self.btn_play.setText("▶ 재생")
+        self.btn_play.setText("▶")
 
     def _current_sample(self):
         """현재 시각 근처(±0.5s)의 분석 샘플 인덱스."""
@@ -1461,13 +1497,30 @@ class PtzTab(QWidget):
             return ("border", None)
         return None
 
+    def _landmark_at(self, x, y, r=60.0):
+        """(x, y) 근처의 찍힌 랜드마크 키 (반경 r px, 없으면 None)."""
+        best, bestd = None, r * r
+        for k, p in self.field_points.items():
+            d = (p[0] - x) ** 2 + (p[1] - y) ** 2
+            if d <= bestd:
+                best, bestd = k, d
+        return best
+
     def _pane_pressed(self, fx, fy):
-        """좌버튼 프레스: 크롭 박스 테두리/핸들이면 편집 시작."""
-        if self.cap is None or self.plan is None or self.analysis is None:
+        """좌버튼 프레스: 랜드마크(경기장 탭) 또는 크롭 박스 편집 시작."""
+        if self.cap is None:
             return
         if self._playing:
             self._stop_play()
         x, y = fx * self.pano_w, fy * self.pano_h
+        if self._field_tab_active() or self.btn_field_pick.isChecked():
+            self._lm_drag = self._landmark_at(x, y)   # 마커 잡으면 드래그 이동
+            if self._lm_drag is not None:
+                return
+        if self.btn_field_pick.isChecked():   # 찍기 모드: 박스 편집 비활성
+            return
+        if self.plan is None or self.analysis is None:
+            return
         if self._hit(x, y) is not None:      # 공/키프레임이 우선 (클릭 동작)
             return
         hit = self._box_hit(x, y)
@@ -1486,6 +1539,13 @@ class PtzTab(QWidget):
                                            self.slider.value())}
 
     def _pane_dragged(self, fx, fy):
+        if self._lm_drag is not None:        # 랜드마크 이동 — 라이브 재피팅
+            self.field_points[self._lm_drag] = \
+                [round(fx * self.pano_w, 1), round(fy * self.pano_h, 1)]
+            self._refit_field()
+            self._refresh_field_list()
+            self._redraw()
+            return
         e = self._box_edit
         if e is None:
             return
@@ -1517,6 +1577,13 @@ class PtzTab(QWidget):
         self._redraw()
 
     def _pane_released(self, fx, fy):
+        if self._lm_drag is not None:
+            key, self._lm_drag = self._lm_drag, None
+            self._refit_field(log_result=True)
+            self._save_keyframes()
+            self._refresh_field_list()
+            self._redraw()
+            return
         e = self._box_edit
         if e is None:
             return
@@ -1563,10 +1630,13 @@ class PtzTab(QWidget):
         frame = self._cur_frame.copy()
         f = self._cur_frame_idx
         sc = self.disp_scale                 # 프록시 표시 시 좌표 축소
+        # 랜드마크 찍기 모드: 크롭 박스/공/키프레임/선수 오버레이 숨김 —
+        # 경기장 선·마커만 보이게 해서 클릭 대상이 헷갈리지 않게 한다.
+        picking = self.btn_field_pick.isChecked()
         # 계획된 크롭 창 (render_plan 과 동일한 클램프) — 결과 미리보기.
         # 드래그(이동)/모서리 핸들(줌)로 편집 가능 — 놓으면 줌 키프레임 커밋.
         self._plan_box = None
-        if self.plan is not None and f < len(self.plan["cx"]):
+        if self.plan is not None and not picking and f < len(self.plan["cx"]):
             ow, oh = self.plan_out
             top = int(self.plan.get("top_margin", 0))
             commit = self._box_commit
@@ -1618,7 +1688,7 @@ class PtzTab(QWidget):
             return hv is not None and hv == (kind, round(ox), round(oy))
 
         rad = max(10, int(28 * sc))
-        for (bx, by, conf) in self._candidates_at(si):
+        for (bx, by, conf) in ([] if picking else self._candidates_at(si)):
             p = (int(bx * sc), int(by * sc))
             st = self._cand_state(f, si, bx, by)
             if st == "ignored":
@@ -1637,7 +1707,7 @@ class PtzTab(QWidget):
                 cv2.circle(frame, p, rad, (150, 150, 150), 4)
             if _is_hover("ball", bx, by):
                 cv2.circle(frame, p, rad + max(6, int(12 * sc)), (0, 255, 255), 3)
-        for k in self.keyframes:
+        for k in ([] if picking else self.keyframes):
             if abs(k[0] - f) <= 1.0 * self.fps:
                 kx, ky = float(k[1]), float(k[2])
                 p = (int(kx * sc), int(ky * sc))
@@ -1652,8 +1722,8 @@ class PtzTab(QWidget):
         # 선수 박스(팀 색) + 레이더
         radar_pts = []
         if si is not None:
-            prow = self.analysis["players"][si]
-            if self.check_players.isChecked():
+            prow = self._players_row(si)
+            if self.check_players.isChecked() and not picking:
                 for pp in prow:
                     if len(pp) < 4:
                         continue
@@ -1740,6 +1810,9 @@ class PtzTab(QWidget):
             self._stop_play()
         f = getattr(self, "_cur_frame_idx", self.slider.value())
         x, y = fx * self.pano_w, fy * self.pano_h
+        if (self._field_tab_active() or self.btn_field_pick.isChecked()) \
+                and self._landmark_at(x, y) is not None:
+            return              # 랜드마크 위 클릭 = 드래그 미수 — 무동작
         if self.btn_field_pick.isChecked():   # 랜드마크 찍기 모드가 우선
             key = self._match_landmark(x, y)
             if key is None:
@@ -1808,6 +1881,14 @@ class PtzTab(QWidget):
             if tid in self.roles:
                 sub.addAction("자동 분류로 되돌리기",
                               lambda _=False, t=tid: self._set_role(t, None))
+            if tid >= 900001:
+                sub.addSeparator()
+                sub.addAction("이 수동 검출 삭제",
+                              lambda _=False, t=tid: self._delete_extra(t))
+        if self.analysis is not None and self._current_sample() is not None:
+            menu.addSeparator()
+            menu.addAction("이 주변 사람 재검출",
+                           lambda _=False: self._detect_here(f, x, y, gpos))
         if self._field_tab_active():
             menu.addSeparator()
             sub = menu.addMenu("이 위치를 랜드마크로 지정")
@@ -1979,6 +2060,11 @@ class PtzTab(QWidget):
                         else:
                             e[1] = f
                             e[2] += 1
+            for si, rows in self.extra_players.items():   # 수동 검출 포함
+                if si < len(frames):
+                    f = int(frames[si])
+                    for p in rows:
+                        spans[int(p[4])] = [f, f, 1]
             self._pspans = spans
             self._pcolors = tracklet_colors(self.analysis)
             self._pcache_id = id(self.analysis)
@@ -2059,9 +2145,11 @@ class PtzTab(QWidget):
         if self.pano_path is None:
             QMessageBox.information(self, "초기화", "열린 파노라마가 없습니다.")
             return
+        n_extra = sum(len(v) for v in self.extra_players.values())
         detail = (f"키프레임 {len(self.keyframes)} / 무시 {len(self.ignores)}"
                   f" / 승격 {len(self.promotes)} / 역할 {len(self.roles)}"
-                  f" / 랜드마크 {len(self.field_points)}")
+                  f" / 랜드마크 {len(self.field_points)}"
+                  f" / 수동 검출 {n_extra}")
         if QMessageBox.question(
                 self, "분석 원본으로 되돌리기",
                 f"{names[scope]}을(를) 삭제하고 분석 결과 원본으로 "
@@ -2073,6 +2161,8 @@ class PtzTab(QWidget):
             self._box_commit = None
         if scope in ("roles", "all"):
             self.roles = {}
+            self.extra_players = {}
+            self._pcache_id = None
         if scope in ("field", "all"):
             self.field_points = {}
         if self.analysis is not None:
@@ -2164,19 +2254,56 @@ class PtzTab(QWidget):
         cx, cy = self._cam_field_pos()
         return (cx + g[0][0], cy + g[0][1])
 
+    # 캘리브레이션 전 자동 매칭 후보: 간격이 넓은 최외곽 점들만.
+    # 페널티박스·센터서클은 기본 카메라 모델의 거리 오차(수십 m)보다
+    # 이웃 간격이 좁아 오배정되기 쉬움 — 피팅이 잡힌 뒤(픽셀 매칭)에만.
+    _PRECALIB_KEYS = ("corner_far_l", "corner_far_r", "corner_near_l",
+                      "corner_near_r", "half_far", "half_near",
+                      "sideline_near_l", "sideline_near_r")
+
+    def _match_positions(self):
+        pos = dict(landmark_positions(*self.field_size))
+        # 선 위 점(사이드라인)은 대표 위치로 매칭: 카메라 좌우 1/4 지점
+        hl, hw = self.field_size[0] / 2.0, self.field_size[1] / 2.0
+        pos["sideline_near_l"] = (-hl / 2.0, -hw)
+        pos["sideline_near_r"] = (hl / 2.0, -hw)
+        return pos
+
     def _match_landmark(self, x, y):
         """클릭 위치를 가장 그럴듯한 랜드마크에 휴리스틱 매칭.
 
-        기본(또는 현재) 카메라 모델로 지면 좌표를 추정해 기대 랜드마크
-        위치와 최근접. 미지정 랜드마크 우선, 전부 지정됐으면 최근접을
-        옮긴다(재클릭 = 수정). 수평선 위 클릭은 None.
+        피팅 후: 전체 랜드마크를 화면에 투영해 픽셀 최근접 (정확).
+        피팅 전: 외곽 8종만, 카메라 기준 방향(요)을 강하게·거리는
+        로그 비율로 느슨하게 비교 — 기본 모델의 높이/거리 오차가
+        모든 점을 같은 배율로 밀기 때문에 방향이 훨씬 믿을 만하다.
+        미지정 랜드마크 우선, 전부 지정됐으면 최근접 이동(재클릭=수정).
         """
+        pos = self._match_positions()
+        if self._field_calib is not None:
+            keys = list(pos)
+            px = field_to_pano(self._field_calib, [pos[k] for k in keys])
+            order = sorted(
+                range(len(keys)),
+                key=lambda i: (px[i][0] - x) ** 2 + (px[i][1] - y) ** 2
+                if np.isfinite(px[i][0]) else np.inf)
+            for i in order:
+                if keys[i] not in self.field_points:
+                    return keys[i]
+            return keys[order[0]]
         f = self._click_to_field(x, y)
         if f is None:
             return None
-        pos = landmark_positions(*self.field_size)
-        order = sorted(pos, key=lambda k: (pos[k][0] - f[0]) ** 2
-                       + (pos[k][1] - f[1]) ** 2)
+        cx, cy = self._cam_field_pos()
+        a_est = np.arctan2(f[0] - cx, f[1] - cy)
+        d_est = max(np.hypot(f[0] - cx, f[1] - cy), 1e-6)
+
+        def score(k):
+            lx, ly = pos[k]
+            da = a_est - np.arctan2(lx - cx, ly - cy)
+            dd = np.log(d_est / max(np.hypot(lx - cx, ly - cy), 1e-6))
+            return (da / 0.10) ** 2 + (dd / 0.4) ** 2
+
+        order = sorted(self._PRECALIB_KEYS, key=score)
         for k in order:
             if k not in self.field_points:
                 return k
@@ -2201,6 +2328,32 @@ class PtzTab(QWidget):
         if 0 <= row < len(LANDMARKS):
             self._field_remove_point(LANDMARKS[row][0])
 
+    def _field_clear_all(self):
+        if not self.field_points:
+            return
+        if QMessageBox.question(
+                self, "랜드마크 전체 삭제",
+                f"찍은 랜드마크 {len(self.field_points)}개를 모두 "
+                "삭제할까요?") != QMessageBox.StandardButton.Yes:
+            return
+        self.field_points = {}
+        self._refit_field(log_result=True)
+        self._save_keyframes()
+        self._refresh_field_list()
+        self._redraw()
+
+    def _field_pick_toggled(self, on):
+        self._refit_field()          # 상태 라벨의 '다음 찍을 점' 안내 갱신
+        self._refresh_field_list()   # 다음 항목 자동 선택
+        self._redraw()
+
+    def _field_next_key(self):
+        """권장 순서상 다음 미지정 랜드마크 (없으면 None)."""
+        for key, name, req in LANDMARKS:
+            if key not in self.field_points:
+                return key
+        return None
+
     def _field_size_changed(self, _v=None):
         self.field_size = [self.spin_field_len.value(),
                            self.spin_field_w.value()]
@@ -2211,13 +2364,17 @@ class PtzTab(QWidget):
     def _refresh_field_list(self):
         row = self.field_list.currentRow()
         self.field_list.clear()
-        for key, name, req in LANDMARKS:
+        for i, (key, name, req) in enumerate(LANDMARKS):
             p = self.field_points.get(key)
             mark = "★" if req else "☆"
             where = f"({p[0]:.0f}, {p[1]:.0f})" if p else "— 미지정"
             self.field_list.addItem(
-                f"{mark} [{LANDMARK_TAGS[key]}] {name}  {where}")
-        if row >= 0:
+                f"{i+1:2d}. {mark} [{LANDMARK_TAGS[key]}] {name}  {where}")
+        nk = self._field_next_key() if self.btn_field_pick.isChecked() else None
+        if nk is not None:                   # 찍기 모드: 다음 권장 점 하이라이트
+            self.field_list.setCurrentRow(
+                [k for k, _, _ in LANDMARKS].index(nk))
+        elif row >= 0:
             self.field_list.setCurrentRow(row)
 
     def _refit_field(self, log_result=False):
@@ -2232,10 +2389,19 @@ class PtzTab(QWidget):
                    f"{c['rms']:.1f}px, 카메라 높이 {c['h']:.1f}m, "
                    f"터치라인까지 {-(c['ey'] + c['width']/2):.1f}m")
         elif len(self.field_points) >= 4:
-            msg = "캘리브레이션 실패 — 점 위치를 확인하세요"
+            msg = ("캘리브레이션 실패 — 점 위치 확인 "
+                   "(위치 랜드마크 3개 이상 필요, 사이드라인 점은 보조)")
         else:
-            msg = (f"{len(self.field_points)}/8점 — 최소 4점 필요 "
-                   "(★ 먼쪽 코너 포함 권장)")
+            msg = (f"{len(self.field_points)}점 찍음 — 위치 랜드마크 4개"
+                   "(또는 3개+사이드라인 2점)부터 풀림, ★ 먼쪽 코너부터")
+        if self.btn_field_pick.isChecked():
+            nk = self._field_next_key()
+            if nk is not None:
+                i = [k for k, _, _ in LANDMARKS].index(nk)
+                msg = (f"다음 찍을 점 → {i+1}. {LANDMARKS[i][1]} "
+                       f"[{LANDMARK_TAGS[nk]}]   |   {msg}")
+            else:
+                msg = "모든 랜드마크 지정 완료   |   " + msg
         self.lbl_field_status.setText(msg)
         if log_result:
             self.log(f"[field] {msg}")
@@ -2243,13 +2409,125 @@ class PtzTab(QWidget):
             {"length": self.field_size[0], "width": self.field_size[1],
              "cam": self._cam_field_pos()} if c is not None else None)
 
+    def _players_row(self, si):
+        """샘플 si 의 선수 행: 분석 + 사용자 수동 검출(extra) 합침."""
+        if self.analysis is None or si is None:
+            return []
+        return list(self.analysis["players"][si]) \
+            + self.extra_players.get(int(si), [])
+
+    def _person_px_height(self, x, y):
+        """(x, y) 지점에 선 사람(1.8m)의 예상 픽셀 키 — 캘리브레이션 기준.
+
+        캘리브레이션 전이면 기본 카메라 모델로 대충 추정.
+        """
+        if self._field_calib is not None:
+            c = self._field_calib
+            g = pano_to_field(c, [[x, y]])[0]
+            if not np.isfinite(g[0]):
+                return None
+            d = np.hypot(g[0] - c["ex"], g[1] - c["ey"])
+            h, span = c["h"], c["t_top"] - c["t_bot"]
+        else:
+            gp = ground_positions([[x, y, 0.0, 0.0]], self.pano_w, self.pano_h)
+            if not gp:
+                return None
+            d = np.hypot(gp[0][0], gp[0][1])
+            h, span = 4.0, np.tan(np.deg2rad(10.0)) - np.tan(np.deg2rad(-38.0))
+        return 1.8 / max(d, 1.0) / span * (self.pano_h - 1)
+
+    def _native_frame(self, f):
+        """프레임 f 의 원본 해상도 이미지 (프록시 표시 중이면 원본을 읽음)."""
+        if self.disp_scale >= 1.0 and getattr(self, "_cur_frame_idx", -1) == f \
+                and getattr(self, "_cur_frame", None) is not None:
+            return self._cur_frame
+        if self._native_cap is None:
+            self._native_cap = cv2.VideoCapture(str(self.pano_path))
+        self._native_cap.set(cv2.CAP_PROP_POS_FRAMES, f)
+        ok, frame = self._native_cap.read()
+        return frame if ok else None
+
+    def _detect_here(self, f, x, y, gpos):
+        """빈 곳 우클릭 → 주변만 네이티브 해상도로 사람 재검출.
+
+        크롭 크기는 캘리브레이션으로 예측한 그 자리 사람 키의 ~6배
+        (마진 넉넉히). 검출된 사람은 수동 검출(extra)로 추가되고 바로
+        역할 지정 메뉴를 띄운다.
+        """
+        si = self._current_sample()
+        if si is None or not ptz_available():
+            return
+        ph = self._person_px_height(x, y) or 120.0
+        half = int(np.clip(3.0 * ph, 160, 900))
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            frame = self._native_frame(f)
+            if frame is None:
+                return
+            x0 = int(np.clip(x - half, 0, max(self.pano_w - 2 * half, 0)))
+            y0 = int(np.clip(y - half, 0, max(self.pano_h - 2 * half, 0)))
+            crop = frame[y0:y0 + 2 * half, x0:x0 + 2 * half]
+            if self._adhoc is None:
+                from ultralytics import YOLO
+                w = self._model_weights()
+                self._adhoc = YOLO(str(w) if w else "yolov8n.pt")
+            imgsz = int(np.clip(2 * half, 320, 1280)) // 32 * 32
+            r = self._adhoc.predict(crop, imgsz=imgsz, conf=0.1,
+                                    classes=[0], verbose=False)[0]
+        finally:
+            QApplication.restoreOverrideCursor()
+        rows = self.extra_players.setdefault(int(si), [])
+        new = []
+        for b in r.boxes:
+            x1, y1, x2, y2 = (float(v) for v in b.xyxy[0])
+            cx, cy = x0 + (x1 + x2) / 2, y0 + (y1 + y2) / 2
+            # 기존(분석+수동) 박스와 겹치면 중복 추가하지 않음
+            if any((p[0] - cx) ** 2 + (p[1] - cy) ** 2 < (p[3] / 2) ** 2
+                   for p in self._players_row(si) if len(p) >= 4):
+                continue
+            row = [round(cx, 1), round(cy, 1), round(x2 - x1, 1),
+                   round(y2 - y1, 1), self._next_extra_id]
+            self._next_extra_id += 1
+            rows.append(row)
+            new.append((row[4], float(b.conf[0])))
+        if not new:
+            self.log(f"[ptz] 주변 재검출: 새 사람 없음 (크롭 {2*half}px, "
+                     f"기존과 중복 {len(r.boxes)}건)")
+            return
+        self.log(f"[ptz] 주변 재검출: 사람 {len(new)}명 추가 "
+                 f"(크롭 {2*half}px, 예상 키 {ph:.0f}px)")
+        self._save_keyframes()
+        self._pcache_id = None           # 선수 목록 캐시 무효화
+        self._refresh_player_list()
+        self._redraw()
+        menu = QMenu(self)               # 바로 역할 지정
+        for tid, conf in new:
+            sub = menu.addMenu(f"사람 #{tid - 900000} (conf {conf:.2f}) 역할")
+            for rr in (3, 4, 5, 0, 1):
+                sub.addAction(ROLE_NAMES[rr],
+                              lambda _=False, r_=rr, t=tid:
+                              self._set_role(t, r_))
+        menu.addAction("역할 없이 두기", lambda: None)
+        menu.exec(gpos)
+
+    def _delete_extra(self, tid):
+        for si, rows in list(self.extra_players.items()):
+            self.extra_players[si] = [p for p in rows if p[4] != tid]
+            if not self.extra_players[si]:
+                del self.extra_players[si]
+        self.roles.pop(tid, None)
+        self._save_keyframes()
+        self._pcache_id = None
+        self._refresh_player_list()
+        self._redraw()
+
     def _player_at(self, x, y):
         """(x, y)를 포함하는 현재 샘플의 선수 박스 track id (없으면 None)."""
         si = self._current_sample()
         if self.analysis is None or si is None:
             return None
         best, bestd = None, None
-        for p in self.analysis["players"][si]:
+        for p in self._players_row(si):
             if len(p) < 5 or p[4] < 0:
                 continue
             if (abs(x - p[0]) <= p[2] / 2 + 10
