@@ -139,6 +139,7 @@ class TimelineView(QWidget):
         self.airborne = []           # [(f0, f1, apex_z)] 공중 구간
         self.highlights = []         # [(f0, f1, state, label)] 하이라이트 구간
         self.pauses = []             # [(f0, f1)] 경기 중단 (시계 정지) 구간
+        self.role_palette = {}       # {역할: BGR} 실측/지정 팀 색 (바 색)
         self._press = None
         self._resize = None          # 레인 경계 드래그 상태
 
@@ -164,6 +165,12 @@ class TimelineView(QWidget):
         """경기 중단 구간 [(f0, f1)] — 회색 세로 밴드 (시계 정지)."""
         self.pauses = list(pauses)
         self.update()
+
+    def set_role_palette(self, palette):
+        """역할별 표시 색 {역할: BGR} — 트랙릿 바를 실제 팀 색과 일치."""
+        if palette != self.role_palette:
+            self.role_palette = dict(palette)
+            self.update()
 
     def _emit_view(self):
         vis = (self.width() - self.GUTTER) / max(self._eff_ppf(), 1e-9)
@@ -385,7 +392,8 @@ class TimelineView(QWidget):
             pitch = (lh - 4) / max(self._lane_rows.get(lane, 3), 1)
             bh = max(1, int(pitch) - (1 if pitch >= 3 else 0))
             ry = y + 2 + int(si * pitch)
-            b, g, rr = TEAM_COLORS[min(role, len(TEAM_COLORS) - 1)]
+            b, g, rr = self.role_palette.get(
+                role, TEAM_COLORS[min(role, len(TEAM_COLORS) - 1)])
             r = (self._x(f0), ry, max(2, self._x(f1) - self._x(f0)), bh)
             p.fillRect(*r, QColor(rr, g, b))
             if self.selected == ("player", tid):
@@ -3429,6 +3437,7 @@ class PtzTab(QWidget):
         self.lbl_team_colors.setText("유니폼 색:" if shown
                                      else "팀 색: 분석 후 표시")
         self._radar_palette = {r: self._role_color(r) for r in range(6)}
+        self.trackbar.set_role_palette(self._radar_palette)
         if log_colors and logs:
             self.log("[ptz] 팀 색 분류: " + ", ".join(logs))
 
