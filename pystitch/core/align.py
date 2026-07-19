@@ -158,12 +158,14 @@ def auto_level(imgs, Rs, lens: LensProfile, yaw_range, scale=0.2, log=print):
             step = np.linalg.solve(J, -bc0)
         except np.linalg.LinAlgError:
             break
-        step = np.clip(step, -np.deg2rad(25), np.deg2rad(25))
+        # 삼각대+마스트 리그는 ~30° 내려보는 게 실측 정상 (20260712 pitch
+        # +28.9°) — 스텝 한계는 그보다 여유 있게.
+        step = np.clip(step, -np.deg2rad(35), np.deg2rad(35))
         pitch += step[0]
         roll += step[1]
         log(f"[auto-level] 반복 {it+1}: 인라이어 {n} → pitch {np.rad2deg(pitch):+.2f}°, roll {np.rad2deg(roll):+.2f}°")
-    if max(abs(pitch), abs(roll)) >= np.deg2rad(24):
-        log("[auto-level] 경고: 보정값이 한계(±25°) 부근 — 정합 기하가 비정상일 가능성")
+    if max(abs(pitch), abs(roll)) >= np.deg2rad(34):
+        log("[auto-level] 경고: 보정값이 한계(±35°) 부근 — 정합 기하가 비정상일 가능성")
     return pitch, roll
 
 
