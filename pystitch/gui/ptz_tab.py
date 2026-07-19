@@ -2760,10 +2760,10 @@ class PtzTab(QWidget):
         def _is_hover(kind, ox, oy):
             return hv is not None and hv == (kind, round(ox), round(oy))
 
-        rad = max(10, int(28 * sc))
         show_ball = self.check_ball.isChecked()
         for (bx, by, conf) in ([] if picking or not show_ball
                                else self._candidates_at(si)):
+            rad = self._ball_rad(bx, by, sc)
             p = (int(bx * sc), int(by * sc))
             st = self._cand_state(f, si, bx, by)
             if st == "ignored":
@@ -2800,9 +2800,9 @@ class PtzTab(QWidget):
                                         (0, 0, 255), th, tipLength=0.45)
                 else:
                     # 수동 공: 주황 이중 링 (공 후보 원과 구별)
-                    cv2.circle(frame, p, max(10, int(26 * sc)),
-                               (0, 140, 255), th)
-                    cv2.circle(frame, p, max(3, int(7 * sc)),
+                    r0 = self._ball_rad(kx, ky, sc) + 2
+                    cv2.circle(frame, p, r0, (0, 140, 255), th)
+                    cv2.circle(frame, p, max(2, r0 // 3),
                                (0, 140, 255), -1)
                 if _is_hover("kf", kx, ky):
                     cv2.circle(frame, p, max(16, int(40 * sc)), (0, 255, 255), 2)
@@ -4709,6 +4709,16 @@ class PtzTab(QWidget):
         self._pcache_id = None
         self._refresh_player_list()
         self._redraw()
+
+    def _ball_rad(self, x, y, sc):
+        """공 마커 반지름 — 그 자리 기대 공 크기에 비례 (원경 과대 방지).
+
+        사람 키 추정(_person_px_height)의 ~9% ≈ 공 지름보다 약간 크게.
+        """
+        ph = self._person_px_height(x, y)
+        if ph:
+            return int(np.clip(ph * 0.09 * sc + 2, 4.0, max(9.0, 22 * sc)))
+        return max(6, int(18 * sc))
 
     def _injected_person_at(self, x, y):
         """(x, y)가 ID 없는 주입 검출(갭필 id<0) 박스 안인지."""
