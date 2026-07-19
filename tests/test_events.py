@@ -89,6 +89,68 @@ def test_kickoff_detected_at_whistle():
     assert ks[0][2]["long_whistle"] and ks[0][2]["ball_left"]
 
 
+def test_classify_referees_positional():
+    """주심=필드 안 상주, 선심=양쪽 사이드라인 왕복 — 위치로 분류."""
+    from pystitch.core.events import classify_referees
+    rng = np.random.default_rng(3)
+    frames = list(range(0, 6000, DE))
+    players = []
+    hw = 34.0
+    for k, f in enumerate(frames):
+        t = f / FPS
+        row = []
+        for i in range(6):                       # 팀 선수들 (필드 안)
+            row.append(_row(-30 + 8 * i + rng.normal(0, 2),
+                            rng.normal(0, 12), 100 + i))
+        ph = 30 * np.sin(t / 20)                 # 주심: 필드 안 넓게 이동
+        row.append(_row(ph, 10 * np.cos(t / 15), 500))
+        # 근측 선심: Y=-hw 부근에서 X 왕복 / 원측 선심: Y=+hw
+        row.append(_row(25 * np.sin(t / 12), -hw - 0.5 + rng.normal(0, .5), 501))
+        row.append(_row(-25 * np.sin(t / 12), hw + 0.5 + rng.normal(0, .5), 502))
+        players.append(row)
+    a = {"fps": FPS, "total_frames": 6000, "detect_every": DE,
+         "frames": frames, "balls": [None] * len(frames),
+         "players": players, "pano_w": PANO_W, "pano_h": PANO_H}
+    teams = {100 + i: (0 if i < 3 else 1) for i in range(6)}
+    sug, info = classify_referees(a, teams, _calib())
+    assert sug.get(500) == 5 and 500 in info["main"]
+    assert sug.get(501) == 5 and 501 in info["ar_near"]
+    assert sug.get(502) == 5 and 502 in info["ar_far"]
+    assert 100 not in sug                        # 팀 선수는 제외
+
+
+def test_arm_pose_scores_geometry():
+    """(올림, 뻗음): 기 수직 = 올림>1, 수평 지시 = 올림≈0·뻗음>0.8."""
+    from pystitch.core.events import arm_pose_scores
+    k = np.zeros((17, 2))
+    k[5], k[6] = (40, 100), (60, 100)            # 어깨
+    k[11], k[12] = (42, 160), (58, 160)          # 엉덩이 (몸통 60)
+    k[9], k[10] = (35, 170), (70, 30)            # L 내림, R 번쩍
+    r, e = arm_pose_scores(k)
+    assert r > 1.0
+    k[10] = (130, 102)                           # R 수평 지시 (옆으로 쭉)
+    r, e = arm_pose_scores(k)
+    assert abs(r) < 0.2 and e > 0.8
+    conf = np.ones(17)
+    conf[9] = conf[10] = 0.1                     # 손목 신뢰 없음
+    r, e = arm_pose_scores(k, conf)
+    assert np.isnan(r) and np.isnan(e)
+
+
+def test_classify_flag_signal_patterns():
+    """파울(들고 유지/흔듦) vs 오프사이드(들었다 수평 지시) vs 없음."""
+    from pystitch.core.events import classify_flag_signal
+    dn = [(i * 0.1, -0.6, 0.1) for i in range(20)]        # 내림 2초
+    up = [(2 + i * 0.1, 1.1, 0.2) for i in range(15)]     # 올림 1.5초
+    pt = [(3.5 + i * 0.1, 0.05, 0.9) for i in range(15)]  # 수평 지시 1.5초
+    assert classify_flag_signal(dn + up)[0] == "foul"
+    assert classify_flag_signal(dn + up[:8] + pt)[0] == "offside"
+    assert classify_flag_signal(dn)[0] == "none"
+    # 지시가 올림보다 먼저면 (그냥 팔 벌린 자세) 오프사이드 아님
+    pre_pt = [(i * 0.1, 0.0, 0.9) for i in range(15)]
+    assert classify_flag_signal(pre_pt + dn)[0] == "none"
+
+
 def test_no_kickoff_without_formation():
     """대형 없이 호각만 있으면 (경기 중 파울) 킥오프 아님."""
     a = _match(kick_t=5.0)               # 5초에 이미 시작 — 이후 대형 없음

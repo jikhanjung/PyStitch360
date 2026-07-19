@@ -140,14 +140,202 @@ def detect_kickoffs(track, whistles, min_db=15.0,
     return merged
 
 
+def classify_referees(analysis, teams, calib, min_det=40):
+    """비팀 트랙릿의 위치 통계로 심판 역할(5) 제안.
+
+    주심: 필드 내부 상주 + 넓은 활동 범위 (경기를 따라다님).
+    선심(부심): 사이드라인 부근 상주(경계 ±3.5m, Y 요동 작음) +
+    터치라인 방향으로 이동. 근측/원측 각각. 한 사람이 여러 트랙릿으로
+    갈라져도 각 조각이 조건을 만족하면 모두 잡힌다.
+
+    반환: (suggest {tid: 5}, info {main, ar_near, ar_far}).
+    사용자 roles 오버라이드는 호출부에서 우선 적용할 것.
+    """
+    hw = calib["width"] / 2.0
+    hl = calib["length"] / 2.0
+    team_ids = {t for t, r in teams.items() if r in (0, 1, 3, 4)}
+    pts: dict[int, list] = {}
+    for si, prow in enumerate(analysis["players"]):
+        feet = [(p[0], p[1] + p[3] / 2.0, int(p[4]))
+                for p in prow if len(p) >= 5 and p[4] >= 0
+                and int(p[4]) not in team_ids]
+        if not feet:
+            continue
+        fxy = pano_to_field(calib, [(a, b) for a, b, _ in feet])
+        for (gx, gy), (_, _, tid) in zip(fxy, feet):
+            if np.isfinite(gx):
+                pts.setdefault(tid, []).append((gx, gy))
+    suggest = {}
+    info = {"main": [], "ar_near": [], "ar_far": []}
+    for tid, ps in pts.items():
+        if len(ps) < min_det:
+            continue
+        P = np.asarray(ps)
+        x, y = P[:, 0], P[:, 1]
+        my = float(np.median(y))
+        y_iqr = float(np.percentile(y, 80) - np.percentile(y, 20))
+        x_span = float(np.percentile(x, 95) - np.percentile(x, 5))
+        d_side = min(abs(my - hw), abs(my + hw))
+        inside = float(np.mean((np.abs(x) < hl + 2) & (np.abs(y) < hw - 2)))
+        if d_side <= 3.5 and y_iqr <= 3.0 and x_span >= 8.0:
+            suggest[tid] = 5
+            info["ar_near" if my < 0 else "ar_far"].append(tid)
+        elif inside >= 0.75 and x_span >= 15.0 and y_iqr >= 6.0:
+            suggest[tid] = 5
+            info["main"].append(tid)
+    return suggest, info
+
+
+# ------------------------------------------------------------- 선심 포즈
+# COCO 키포인트: 5/6 어깨, 9/10 손목, 11/12 엉덩이
+
+def arm_pose_scores(kpts, kconf=None, min_conf=0.3):
+    """포즈 키포인트 (17,2) → (올림, 뻗음) 점수 — 기 신호 원자료.
+
+    올림(raise) = max(어깨y − 손목y) / 몸통 — 1 근처면 손목이 머리 위.
+    뻗음(extend) = 그 팔의 |손목x − 어깨x| / 몸통 — 수평 지시(오프사이드
+    방향 지시)면 1 근처, 팔을 몸에 붙이면 0 근처.
+    두 점수는 같은 팔(더 올라간 쪽) 기준. 계산 불가면 (NaN, NaN).
+    """
+    k = np.asarray(kpts, dtype=np.float64)
+    if k.shape[0] < 13:
+        return float("nan"), float("nan")
+    c = (np.asarray(kconf, dtype=np.float64) if kconf is not None
+         else np.ones(len(k)))
+    sho = [i for i in (5, 6) if c[i] >= min_conf]
+    hip = [i for i in (11, 12) if c[i] >= min_conf]
+    if not sho or not hip:
+        return float("nan"), float("nan")
+    sho_y = float(np.mean([k[i, 1] for i in sho]))
+    torso = float(np.mean([k[i, 1] for i in hip])) - sho_y
+    if torso <= 1e-6:
+        return float("nan"), float("nan")
+    best = (float("nan"), float("nan"))
+    for s_i, w_i in ((5, 9), (6, 10)):
+        if c[s_i] < min_conf or c[w_i] < min_conf:
+            continue
+        rise = (k[s_i, 1] - k[w_i, 1]) / torso
+        ext = abs(k[w_i, 0] - k[s_i, 0]) / torso
+        if not np.isfinite(best[0]) or rise > best[0]:
+            best = (float(rise), float(ext))
+    return best
+
+
+def arm_raise_score(kpts, kconf=None, min_conf=0.3):
+    """(호환) 팔 올림 점수만."""
+    return arm_pose_scores(kpts, kconf, min_conf)[0]
+
+
+def classify_flag_signal(track, raise_hi=0.75, ext_hi=0.6,
+                         min_up_s=0.8, min_point_s=0.8):
+    """선심 팔 시계열 [(t, raise, extend)] → 기 신호 분류.
+
+    - "offside": 기를 올렸다가(올림 ≥ raise_hi 구간 ≥ min_up_s ×0.5)
+      내려서 수평 지시 유지 (올림 ≈ 0, 뻗음 ≥ ext_hi 가 min_point_s 이상,
+      올림 구간 이후).
+    - "foul": 올림 ≥ raise_hi 지속 ≥ min_up_s (수평 전환 없이 흔듦 포함).
+    - "none": 그 외.
+    반환: (종류, {up_s, point_s, max_raise}).
+    """
+    if not track:
+        return "none", {}
+    t = np.array([p[0] for p in track], dtype=np.float64)
+    r = np.array([p[1] for p in track], dtype=np.float64)
+    e = np.array([p[2] if len(p) > 2 else np.nan for p in track],
+                 dtype=np.float64)
+    dt = np.diff(t, append=t[-1] + (np.median(np.diff(t)) if len(t) > 1
+                                    else 0.1))
+    dt = np.clip(dt, 0.0, 0.5)             # 샘플 결손 구간 과대 계상 방지
+    up = np.isfinite(r) & (r >= raise_hi)
+    point = (np.isfinite(r) & np.isfinite(e)
+             & (np.abs(r) <= 0.4) & (e >= ext_hi))
+    up_s = float(dt[up].sum())
+    max_raise = float(np.nanmax(r)) if np.isfinite(r).any() else float("nan")
+    detail = {"up_s": round(up_s, 2), "max_raise": round(max_raise, 2)}
+    # 오프사이드: 올림 이후의 수평 지시 지속
+    if up.any():
+        t_up_end = t[up][-1]
+        pt_after = point & (t >= t[up][0])
+        point_s = float(dt[pt_after].sum())
+        detail["point_s"] = round(point_s, 2)
+        if up_s >= min_up_s * 0.5 and point_s >= min_point_s:
+            return "offside", detail
+        if up_s >= min_up_s:
+            return "foul", detail
+    return "none", detail
+
+
+def linesman_arm_track(pano_path, analysis, ar_tids, t0, t1,
+                       weights="yolo11n-pose.pt", pad=2.2, log=print):
+    """[t0, t1] 창에서 선심(ar_tids) 주변 포즈 추정 → 팔 올림 시계열.
+
+    각 분석 샘플에서 선심 검출 박스 중심의 정사각 크롭(키 ×pad,
+    네이티브)을 포즈 모델에 넣고, 크롭 중심에 가장 가까운 사람의
+    (올림, 뻗음) 점수를 기록. 반환: [(t, raise, extend), ...].
+    classify_flag_signal 로 파울(들고 흔듦)/오프사이드(들었다 수평
+    지시)를 구분한다. 원측 선심은 해상도가 낮아 근측 우선.
+    """
+    import cv2 as _cv2
+
+    from ultralytics import YOLO
+    model = YOLO(str(weights))
+    frames = np.asarray(analysis["frames"])
+    fps = analysis["fps"]
+    sis = np.where((frames / fps >= t0) & (frames / fps <= t1))[0]
+    cap = _cv2.VideoCapture(str(pano_path))
+    out = []
+    pos = -10 ** 9
+    for si in sis:
+        row = next((p for p in analysis["players"][si]
+                    if len(p) >= 5 and int(p[4]) in ar_tids), None)
+        if row is None:
+            continue
+        F = int(frames[si])
+        if 0 <= F - pos <= 90:
+            for _ in range(F - pos - 1):
+                cap.grab()
+        else:
+            cap.set(_cv2.CAP_PROP_POS_FRAMES, F)
+        ok, frame = cap.read()
+        pos = F
+        if not ok:
+            continue
+        H, W = frame.shape[:2]
+        half = int(np.clip(row[3] * pad / 2, 64, 500))
+        x0 = int(np.clip(row[0] - half, 0, max(W - 2 * half, 0)))
+        y0 = int(np.clip(row[1] - half, 0, max(H - 2 * half, 0)))
+        crop = frame[y0:y0 + 2 * half, x0:x0 + 2 * half]
+        r = model.predict(crop, imgsz=max(192, (2 * half) // 32 * 32),
+                          conf=0.25, verbose=False)[0]
+        if r.keypoints is None or len(r.keypoints) == 0:
+            continue
+        # 크롭 중심에 가장 가까운 사람
+        centers = r.boxes.xywh[:, :2].cpu().numpy()
+        j = int(np.argmin(((centers - half) ** 2).sum(axis=1)))
+        kx = r.keypoints.xy[j].cpu().numpy()
+        kc = (r.keypoints.conf[j].cpu().numpy()
+              if r.keypoints.conf is not None else None)
+        rise, ext = arm_pose_scores(kx, kc)
+        if np.isfinite(rise):
+            out.append((round(float(frames[si] / fps), 2),
+                        round(rise, 3),
+                        round(ext, 3) if np.isfinite(ext) else None))
+    cap.release()
+    return out
+
+
 def events_json_path(video_path) -> Path:
     return Path(video_path).with_suffix(".events.json")
 
 
-def save_events(video_path, kickoffs):
-    doc = {"kickoffs": [{"t": round(t, 2), "score": round(s, 3), **d}
-                        for t, s, d in kickoffs]}
+def save_events(video_path, kickoffs=None, **extra):
+    """이벤트 문서 갱신 — 기존 키 보존, 주어진 키만 교체."""
     p = events_json_path(video_path)
+    doc = json.loads(p.read_text()) if p.exists() else {}
+    if kickoffs is not None:
+        doc["kickoffs"] = [{"t": round(t, 2), "score": round(s, 3), **d}
+                           for t, s, d in kickoffs]
+    doc.update(extra)
     tmp = Path(str(p) + ".tmp")
     tmp.write_text(json.dumps(doc))
     tmp.replace(p)
