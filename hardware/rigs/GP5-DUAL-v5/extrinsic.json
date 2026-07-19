@@ -1,6 +1,6 @@
 {
-  "rig_id": "GP5-DUAL-v3",
-  "revision_note": "rearload cradles, lens-inward: left camera upside-down, lenses on the inboard edges, minimal baseline",
+  "rig_id": "GP5-DUAL-v5",
+  "revision_note": "v4 geometry with pitch 28 deg for the close-sideline futsal venue (mast ~4 m, ~1 m behind the touchline)",
   "camera": {
     "manufacturer": "GoPro",
     "model": "HERO5 Black",
@@ -9,36 +9,37 @@
     "lens_profile": "GoPro_HERO5_Black_Wide_4K_16x9"
   },
   "deployment": {
-    "scenario": "reproduces the measured 2026-07-12 test session aim (pitch 18 deg); generous sideline setback",
-    "camera_height_m": 2.0,
-    "sideline_setback_m": ">= 1.5 at 2 m height (>= 3.0 at 4 m height)",
-    "near_blind_radius_m": "0.75 x height (ground within this radius of the mast foot is below the frame)",
-    "sky_margin_deg": 17,
-    "status": "superseded by v4 (v4 = v3 + roof)"
+    "scenario": "close-sideline futsal venue: high mast right behind the touchline; near halfway-touchline corner prioritized",
+    "camera_height_m": 4.0,
+    "sideline_setback_m": 1.0,
+    "near_blind_radius_m": "0.5 x height (~2 m at 4 m mast)",
+    "sky_margin_deg": 7,
+    "tradeoff": "high lobs above +7 deg elevation leave the frame; the touchline within ~1.8 m of the halfway point is unseen",
+    "status": "recommended for the 1 m-setback venue"
   },
   "extrinsic_nominal": {
     "yaw_split_deg": 68.8,
     "per_camera": {
       "left": {
         "yaw_deg": -34.4,
-        "pitch_deg": -18.0,
+        "pitch_deg": -28.0,
         "roll_deg": 180.0,
         "orientation": "upside-down (set GoPro rotation to Down)"
       },
       "right": {
         "yaw_deg": 34.4,
-        "pitch_deg": -18.0,
+        "pitch_deg": -28.0,
         "roll_deg": 0.0,
         "orientation": "upright"
       }
     },
-    "baseline_mm": 71.6,
-    "lens_height_delta_mm": -0.0,
+    "baseline_mm": 75.14,
+    "lens_height_delta_mm": 0.0,
     "lens_offset_in_body_mm": {
       "from_side_edge": 14.5,
       "from_top_edge": 14.5
     },
-    "optical_center_height_above_base_mm": 40.88,
+    "optical_center_height_above_base_mm": 39.08,
     "conventions": {
       "yaw": "positive = clockwise seen from above (right camera positive)",
       "pitch": "negative = tilted down",

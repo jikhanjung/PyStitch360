@@ -302,7 +302,7 @@ def build_rig(cradle, local_cutters):
     return difference(rig, [hole, nut] + cutters), extrinsic
 
 
-def build_rig_lens_inward(cradle, local_cutters):
+def build_rig_lens_inward(cradle, local_cutters, pitch_deg=PITCH_DOWN_DEG):
     """v3 placement: both cameras still aim outward (±yaw/2) but the LEFT
     camera is mounted upside-down (roll 180°). The HERO5 lens sits in a body
     corner (behind-view left), so flipping the left camera puts both lens
@@ -312,7 +312,7 @@ def build_rig_lens_inward(cradle, local_cutters):
     instead of the conservative bounding-box formula of v1/v2.
     """
     yaw = np.radians(YAW_SPLIT_DEG / 2)
-    pitch = np.radians(PITCH_DOWN_DEG)
+    pitch = np.radians(pitch_deg)
     iw, ih, idp = cavity_dims()
     zc = FLOOR + ih / 2  # cavity center height: flip axis for the right side
 
@@ -452,7 +452,7 @@ def render(mesh, path):
     plt.close(fig)
 
 
-def emit(rig_id, loading, builder, rig_builder=None):
+def emit(rig_id, loading, builder, rig_builder=None, deployment=None):
     """Write rig.stl + test_cradle.stl + extrinsic.json + preview.png as a
     versioned pair under hardware/rigs/<rig_id>/."""
     import json
@@ -480,6 +480,7 @@ def emit(rig_id, loading, builder, rig_builder=None):
             "recording_mode": "4K_16:9_29.97_wide_eis_off",
             "lens_profile": "GoPro_HERO5_Black_Wide_4K_16x9",
         },
+        "deployment": deployment or {},
         "extrinsic_nominal": extrinsic,
         "mount": "1/4-20 captive hex nut, base center",
         "source_calibration": "yaw_split_deg 68.68-68.83 from project JSONs; "
@@ -492,15 +493,50 @@ def emit(rig_id, loading, builder, rig_builder=None):
     print(f"[{rig_id}] extrinsic.json + preview.png written")
 
 
+# Coverage rule of thumb: the near touchline is visible when
+# atan(height/setback) <= pitch + half-VFOV (~35 deg for 4K 16:9 Wide).
+DEPLOY_STD = {
+    "scenario": "reproduces the measured 2026-07-12 test session aim "
+                "(pitch 18 deg); generous sideline setback",
+    "camera_height_m": 2.0,
+    "sideline_setback_m": ">= 1.5 at 2 m height (>= 3.0 at 4 m height)",
+    "near_blind_radius_m": "0.75 x height (ground within this radius of the "
+                           "mast foot is below the frame)",
+    "sky_margin_deg": 17,
+}
+DEPLOY_CLOSE = {
+    "scenario": "close-sideline futsal venue: high mast right behind the "
+                "touchline; near halfway-touchline corner prioritized",
+    "camera_height_m": 4.0,
+    "sideline_setback_m": 1.0,
+    "near_blind_radius_m": "0.5 x height (~2 m at 4 m mast)",
+    "sky_margin_deg": 7,
+    "tradeoff": "high lobs above +7 deg elevation leave the frame; the "
+                "touchline within ~1.8 m of the halfway point is unseen",
+}
+
 if __name__ == "__main__":
     emit("GP5-DUAL-v1", "toploader: camera drops in from the top",
-         build_cradle_toploader)
+         build_cradle_toploader,
+         deployment=DEPLOY_STD | {
+             "status": "superseded by v2 — kept for reference"})
     emit("GP5-DUAL-v2", "rearload: camera slides in from the back, open rear",
-         build_cradle_rearload)
-    emit("GP5-DUAL-v3", "rearload cradles, lens-inward: right camera "
+         build_cradle_rearload,
+         deployment=DEPLOY_STD | {
+             "status": "superseded by v4 (same aim, longer baseline)"})
+    emit("GP5-DUAL-v3", "rearload cradles, lens-inward: left camera "
          "upside-down, lenses on the inboard edges, minimal baseline",
-         build_cradle_rearload, rig_builder=build_rig_lens_inward)
+         build_cradle_rearload, rig_builder=build_rig_lens_inward,
+         deployment=DEPLOY_STD | {
+             "status": "superseded by v4 (v4 = v3 + roof)"})
     emit("GP5-DUAL-v4", "v3 + roof plate on both cradles (shutter finger "
          "hole); sun/rain shade and extra stiffness",
          lambda: build_cradle_rearload(roof=True),
-         rig_builder=build_rig_lens_inward)
+         rig_builder=build_rig_lens_inward,
+         deployment=DEPLOY_STD | {"status": "recommended for standard venues"})
+    emit("GP5-DUAL-v5", "v4 geometry with pitch 28 deg for the close-sideline "
+         "futsal venue (mast ~4 m, ~1 m behind the touchline)",
+         lambda: build_cradle_rearload(roof=True),
+         rig_builder=lambda c, cu: build_rig_lens_inward(c, cu, pitch_deg=28.0),
+         deployment=DEPLOY_CLOSE | {
+             "status": "recommended for the 1 m-setback venue"})

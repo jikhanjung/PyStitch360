@@ -8,6 +8,14 @@
     "recording_mode": "4K_16:9_29.97_wide_eis_off",
     "lens_profile": "GoPro_HERO5_Black_Wide_4K_16x9"
   },
+  "deployment": {
+    "scenario": "reproduces the measured 2026-07-12 test session aim (pitch 18 deg); generous sideline setback",
+    "camera_height_m": 2.0,
+    "sideline_setback_m": ">= 1.5 at 2 m height (>= 3.0 at 4 m height)",
+    "near_blind_radius_m": "0.75 x height (ground within this radius of the mast foot is below the frame)",
+    "sky_margin_deg": 17,
+    "status": "superseded by v2 \u2014 kept for reference"
+  },
   "extrinsic_nominal": {
     "yaw_split_deg": 68.8,
     "left_yaw_deg": -34.4,
