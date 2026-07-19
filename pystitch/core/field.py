@@ -33,6 +33,7 @@ LANDMARKS = [
     ("half_near",     "중앙선 × 가까운 사이드라인", False),
     ("sideline_near_l", "가까운 사이드라인 위 왼쪽 (선 위 아무 점)", False),
     ("sideline_near_r", "가까운 사이드라인 위 오른쪽 (선 위 아무 점)", False),
+    ("center_near",   "중앙선 위 가까운 점 (선 위 아무 점)", False),
     ("pen_l_far",   "왼쪽 골라인 × 페널티박스 (먼쪽)", False),
     ("pen_l_near",  "왼쪽 골라인 × 페널티박스 (가까운쪽)", False),
     ("pen_r_far",   "오른쪽 골라인 × 페널티박스 (먼쪽)", False),
@@ -49,6 +50,9 @@ LANDMARKS = [
 # 안 보일 때, 크게 확대돼 보이는 가까운 사이드라인 위 아무 점 2개로
 # 그 선(Y = -폭/2)을 고정한다. 점당 방정식 1개 (해당 열에서 선까지 행 오차).
 LINE_LANDMARKS = {"sideline_near_l", "sideline_near_r"}
+# 중앙선(X=0) 위의 점 — 교차점 대신 보이는 중앙선 가까운 끝을 찍는다.
+# 점당 방정식 1개 (해당 행에서 선까지 열 오차).
+VLINE_LANDMARKS = {"center_near"}
 
 
 def landmark_positions(length=105.0, width=68.0):
@@ -127,6 +131,26 @@ def _sideline_rows(p, cols, pano_w, pano_h, width):
     return (t_top - t) / (t_top - t_bot) * (pano_h - 1)
 
 
+def _centerline_cols(p, rows, pano_w, pano_h):
+    """중앙선(X=0)이 각 행(rows)에서 지나는 예측 열 (N,).
+
+    행의 t 를 고정하면 지면 교차의 필드 X=0 조건이
+    a·sin(yaw) + b·cos(yaw) = -c 꼴 — 닫힌형으로 yaw 가 풀린다.
+    """
+    h, t_top, t_bot, theta, ex, ey, pitch, roll = p
+    R = _rot(theta, pitch, roll)
+    t = t_top - np.asarray(rows, float) / (pano_h - 1) * (t_top - t_bot)
+    k = ex / h
+    a = R[0, 0] - k * R[1, 0]
+    b = R[0, 2] - k * R[1, 2]
+    c = (R[0, 1] - k * R[1, 1]) * t
+    r = max(np.hypot(a, b), 1e-9)
+    yaw = np.arcsin(np.clip(-c / r, -1.0, 1.0)) - np.arctan2(b, a)
+    f = pano_h / (t_top - t_bot)
+    span = pano_w / f
+    return (yaw / span + 0.5) * (pano_w - 1)
+
+
 # ------------------------------------------------------------------ TPS 워프
 # 파라메트릭 모델이 못 잡는 잔류 왜곡(어안 외곽의 렌즈 잔차, 스티칭 심)
 # 을 얇은판 스플라인으로 보정 — 찍은 랜드마크는 정확히 통과한다.
@@ -164,12 +188,18 @@ def _tps_eval(tps, pts):
 
 
 def fit_field_calibration(points, pano_w, pano_h,
-                          length=105.0, width=68.0, iters=300):
+                          length=105.0, width=68.0, iters=300,
+                          line_points=None):
     """찍은 랜드마크 {키: (px, py)} 로 카메라 모델 + 잔차 워프 피팅.
 
     위치를 아는 점은 방정식 2개, 선 위의 점(LINE_LANDMARKS)은 1개.
     최소: 위치 점 3개 이상이고 총 방정식 8개 이상. 방정식 10개부터는
     리그 기울기(pitch/roll)도 푼다. 코너 플래그는 가중 3배.
+
+    line_points((M,2) 파노라마 픽셀)는 흰 선 검출로 얻은 근처 사이드
+    라인 위의 추가 샘플 — 클릭한 사이드라인 점과 같은 제약이지만 수가
+    많으므로 LM 에선 합산 가중치를 낮추고, 워프 앵커로는 전부 써서
+    그려지는 선이 실측 흰 선을 따라가게 한다.
 
     파라메트릭 피팅 뒤 랜드마크 잔차를 TPS 로 보간해 calib["warp"] 에
     저장 — field_to_pano 가 찍은 점을 정확히 통과한다 (렌즈 잔류
@@ -178,12 +208,23 @@ def fit_field_calibration(points, pano_w, pano_h,
     pos = landmark_positions(length, width)
     keys = [k for k in points if k in pos]
     ln_keys = [k for k in points if k in LINE_LANDMARKS]
-    n_eq = 2 * len(keys) + len(ln_keys)
+    cn_keys = [k for k in points if k in VLINE_LANDMARKS]
+    cn = np.array([points[k] for k in cn_keys], float).reshape(-1, 2)
+    n_eq = 2 * len(keys) + len(ln_keys) + len(cn_keys)
     if len(keys) < 3 or n_eq < 8:
         return None
     fxy = np.array([pos[k] for k in keys], float)
     pxy = np.array([points[k] for k in keys], float)
-    ln = np.array([points[k] for k in ln_keys], float).reshape(-1, 2)
+    lp = (np.array(line_points, float).reshape(-1, 2)
+          if line_points is not None and len(line_points) else
+          np.zeros((0, 2)))
+    ln = np.vstack([np.array([points[k] for k in ln_keys],
+                             float).reshape(-1, 2), lp])
+    # 자동 샘플은 합산 가중 ~6방정식 상당으로 눌러 클릭 점과 균형
+    lw = np.concatenate([np.ones(len(ln) - len(lp)),
+                         np.full(len(lp),
+                                 min(1.0, 6.0 / max(len(lp), 1)))])
+    n_eq += min(len(lp), 6)
     wgt = np.array([3.0 if k.startswith("corner") else 1.0 for k in keys])
     p = np.array([4.0, np.tan(np.deg2rad(10.0)), np.tan(np.deg2rad(-38.0)),
                   0.0, 0.0, -(width / 2.0 + 5.0), 0.0, 0.0])
@@ -195,9 +236,12 @@ def fit_field_calibration(points, pano_w, pano_h,
         r = ((_project(pp, fxy, pano_w, pano_h) - pxy)
              * wgt[:, None]).ravel()
         if len(ln):
-            rl = _sideline_rows(pp, ln[:, 0], pano_w, pano_h,
-                                width) - ln[:, 1]
+            rl = (_sideline_rows(pp, ln[:, 0], pano_w, pano_h,
+                                 width) - ln[:, 1]) * lw
             r = np.concatenate([r, rl])
+        if len(cn):
+            rc = _centerline_cols(pp, cn[:, 1], pano_w, pano_h) - cn[:, 0]
+            r = np.concatenate([r, rc])
         return np.where(np.isfinite(r), r, 1e6)
 
     r = residual(p)
@@ -238,7 +282,7 @@ def fit_field_calibration(points, pano_w, pano_h,
              "pitch": float(p[6]), "roll": float(p[7]),
              "length": float(length), "width": float(width),
              "pano_w": int(pano_w), "pano_h": int(pano_h),
-             "n_points": len(keys) + len(ln_keys), "rms": rms,
+             "n_points": len(keys) + len(ln_keys) + len(cn_keys), "rms": rms,
              "warp": None}
     # 잔차 워프: 예측 위치 → 클릭 위치 차이를 보간 (제어점 4개 이상일 때)
     src = _project(p, fxy, pano_w, pano_h)
@@ -250,9 +294,25 @@ def fit_field_calibration(points, pano_w, pano_h,
         delta = np.vstack([delta,
                            np.stack([np.zeros(m.sum()),
                                      ln[m, 1] - rows[m]], axis=1)])
+    if len(cn):
+        colp = _centerline_cols(p, cn[:, 1], pano_w, pano_h)
+        m = np.isfinite(colp)
+        src = np.vstack([src, np.stack([colp[m], cn[m, 1]], axis=1)])
+        delta = np.vstack([delta,
+                           np.stack([cn[m, 0] - colp[m],
+                                     np.zeros(m.sum())], axis=1)])
     ok = np.isfinite(src).all(axis=1)
-    if ok.sum() >= 4:
-        calib["warp"] = _tps_fit(src[ok], delta[ok], float(max(pano_w, 1)))
+    src, delta = src[ok], delta[ok]
+    # 근접 제어점 정리(≥20px 간격, 먼저 온 것 = 위치 랜드마크 우선) —
+    # 클릭 점과 자동 라인 샘플이 겹치면 TPS 가 요동하는 것을 방지
+    keep = []
+    for i in range(len(src)):
+        if all((src[i, 0] - src[j, 0]) ** 2
+               + (src[i, 1] - src[j, 1]) ** 2 >= 20.0 ** 2 for j in keep):
+            keep.append(i)
+    if len(keep) >= 4:
+        calib["warp"] = _tps_fit(src[keep], delta[keep],
+                                 float(max(pano_w, 1)))
     return calib
 
 
@@ -299,6 +359,47 @@ def pano_to_field(calib, pxy):
             u = pxy - _tps_eval(calib["warp"], u)
         pxy = u
     return _pano_to_field_raw(calib, pxy)
+
+
+def detect_sideline_points(calib, frame, n=64, min_contrast=0.10):
+    """근처 사이드라인 예측 곡선 주변에서 흰 선 중심 픽셀을 샘플링.
+
+    각 샘플 열에서 예측 행 ±윈도(그 지점의 선 굵기 추정 ×4) 안의
+    '흰 정도'(밝고 무채색: V·(1-S)) 가중 중심을 취한다. 대비가 없거나
+    (선이 안 보임/가림) 분포가 퍼져 있으면(사람·트랙 등) 기각.
+    반환: (M, 2) [x, y] 파노라마 픽셀 — fit 의 line_points 입력.
+    """
+    H, W = frame.shape[:2]
+    hl, hw = calib["length"] / 2.0, calib["width"] / 2.0
+    xs = np.linspace(-hl, hl, n)
+    pred = field_to_pano(calib, np.stack([xs, np.full(n, -hw)], axis=1))
+    out = []
+    for (px, py), fx in zip(pred, xs):
+        if not (np.isfinite(px) and 1 <= px < W - 1 and np.isfinite(py)):
+            continue
+        # 선 굵기(행 방향) 추정: 지면 0.12m 가 그 거리에서 차지하는 행 수
+        d = np.hypot(fx - calib["ex"], -hw - calib["ey"])
+        thick = (0.12 * calib["h"] / max(d, 1.0) ** 2
+                 / (calib["t_top"] - calib["t_bot"]) * (calib["pano_h"] - 1))
+        win = int(np.clip(4.0 * thick, 14, 160))
+        y0, y1 = int(max(py - win, 0)), int(min(py + win + 1, H))
+        if y1 - y0 < 8:
+            continue
+        col = int(round(px))
+        strip = frame[y0:y1, max(col - 1, 0):col + 2].astype(np.float32)
+        v = strip.max(axis=2)
+        s = (v - strip.min(axis=2)) / np.maximum(v, 1.0)
+        white = ((v / 255.0) * (1.0 - s)).mean(axis=1)
+        w = np.clip(white - np.median(white) - min_contrast, 0.0, None)
+        if w.sum() < 1e-6:
+            continue
+        rows = np.arange(y0, y1, dtype=np.float64)
+        mu = float((w * rows).sum() / w.sum())
+        sd = float(np.sqrt((w * (rows - mu) ** 2).sum() / w.sum()))
+        if sd > max(3.0 * thick, 6.0):       # 퍼진 흰 무리(선 아님) 기각
+            continue
+        out.append((float(px), mu))
+    return np.array(out, float).reshape(-1, 2)
 
 
 def field_outline(length=105.0, width=68.0, step=2.0):

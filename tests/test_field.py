@@ -77,6 +77,21 @@ def test_fit_with_near_sideline_points():
     assert fit_field_calibration(use, PANO_W, PANO_H) is None
 
 
+def test_center_near_line_constraint():
+    """중앙선 위 가까운 점(center_near): 클릭이 X=0 선 위로 매핑된다."""
+    pts = _click_all()
+    hw = 34.0
+    cn = _project(TRUTH, np.array([[0.0, -30.0]]), PANO_W, PANO_H)[0]
+    sl = _project(TRUTH, np.array([[-20.0, -hw]]), PANO_W, PANO_H)[0]
+    use = {k: pts[k] for k in ("corner_far_l", "corner_far_r", "circle_far")}
+    use["sideline_near_l"] = tuple(sl)
+    use["center_near"] = tuple(cn)          # 방정식 6+1+1=8
+    calib = fit_field_calibration(use, PANO_W, PANO_H)
+    assert calib is not None
+    back = pano_to_field(calib, [tuple(cn)])
+    assert abs(back[0, 0]) < 1.0            # 중앙선(X=0) 위
+
+
 def test_warp_pins_clicked_landmarks():
     """모델이 못 잡는 국소 왜곡이 있어도 찍은 점은 정확히 통과 (TPS)."""
     pts = _click_all()
@@ -96,6 +111,42 @@ def test_warp_pins_clicked_landmarks():
     # 역변환도 일관: 클릭 픽셀 → 필드 좌표 ≈ 실제 랜드마크 위치
     back = pano_to_field(calib, [shifted[k] for k in keys])
     assert np.nanmax(np.abs(back - np.array([pos[k] for k in keys]))) < 1.5
+
+
+def test_detect_sideline_and_refine():
+    """흰 선 검출 → line_points 재피팅으로 휜 사이드라인이 실측에 붙는다."""
+    import cv2
+    from pystitch.core.field import detect_sideline_points
+    # 잔디 배경에 TRUTH 사이드라인을 흰 띠로 그린 합성 프레임
+    frame = np.full((PANO_H, PANO_W, 3), (40, 120, 60), np.uint8)
+    xs = np.linspace(-52.5, 52.5, 600)
+    line = _project(TRUTH, np.stack([xs, np.full(600, -34.0)], axis=1),
+                    PANO_W, PANO_H)
+    ok = np.isfinite(line).all(axis=1) & (line[:, 1] < PANO_H + 200)
+    cv2.polylines(frame, [line[ok].astype(np.int32)], False,
+                  (245, 245, 245), 12)
+    # 클릭 노이즈가 있는 초기 캘리브레이션 (사이드라인이 어긋난 상태)
+    pts = _click_all(noise=6.0, seed=5)
+    use = {k: pts[k] for k in ("corner_far_l", "corner_far_r",
+                               "corner_near_l", "corner_near_r",
+                               "half_far", "circle_far")}
+    calib0 = fit_field_calibration(use, PANO_W, PANO_H)
+    sam = detect_sideline_points(calib0, frame)
+    assert len(sam) >= 15
+    # 검출 샘플이 실제 선 위에 있는가
+    true_rows = _sideline_rows(TRUTH, sam[:, 0], PANO_W, PANO_H, 68.0)
+    assert np.median(np.abs(sam[:, 1] - true_rows)) < 3.0
+    # 재피팅 후 그려지는 사이드라인이 실측(truth) 곡선에 붙는가
+    calib1 = fit_field_calibration(use, PANO_W, PANO_H, line_points=sam)
+    grid = np.stack([np.linspace(-45, 45, 25), np.full(25, -34.0)], axis=1)
+
+    def curve_err(calib):
+        q = field_to_pano(calib, grid)
+        t = _sideline_rows(TRUTH, q[:, 0], PANO_W, PANO_H, 68.0)
+        return np.nanmedian(np.abs(q[:, 1] - t))
+
+    assert curve_err(calib1) < 6.0          # 선 두께 12px 의 절반 이내
+    assert curve_err(calib1) <= curve_err(calib0) + 1e-9
 
 
 def test_inverse_consistency_and_outline():

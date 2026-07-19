@@ -22,8 +22,8 @@ from PyQt6.QtWidgets import (
 
 from ..core.encoders import available_encoders
 from ..core.field import (
-    LANDMARKS, field_outline, field_to_pano, fit_field_calibration,
-    landmark_positions, pano_to_field,
+    LANDMARKS, detect_sideline_points, field_outline, field_to_pano,
+    fit_field_calibration, landmark_positions, pano_to_field,
 )
 from ..core.ptz import (
     accept_ball_tracks, analyze_video, build_plan, classify_teams,
@@ -47,14 +47,29 @@ LANDMARK_TAGS = {"corner_far_l": "FL", "corner_far_r": "FR",
                  "pen_l_far": "PLF", "pen_l_near": "PLN",
                  "pen_r_far": "PRF", "pen_r_near": "PRN",
                  "pen_l_box_far": "BLF", "pen_l_box_near": "BLN",
-                 "pen_r_box_far": "BRF", "pen_r_box_near": "BRN"}
+                 "pen_r_box_far": "BRF", "pen_r_box_near": "BRN",
+                 "center_near": "CM"}
+
+
+def _boost_bgr(bgr, s_gain=1.35, v_gain=1.55, v_floor=190):
+    """그림자 보정: 유니폼 대표색을 실제 옷 색에 가깝게 밝고 진하게.
+
+    상반신 샘플은 그림자가 섞여 실제 유니폼보다 어둡게 나온다 —
+    표시용으로만 명도(V)·채도(S)를 끌어올린다.
+    """
+    h, s, v = cv2.cvtColor(np.uint8([[list(bgr)]]), cv2.COLOR_BGR2HSV)[0, 0]
+    s = min(int(s * s_gain), 255)
+    v = min(max(int(v * v_gain), v_floor), 255)
+    b, g, r = cv2.cvtColor(np.uint8([[[h, s, v]]]), cv2.COLOR_HSV2BGR)[0, 0]
+    return (int(b), int(g), int(r))
 
 
 def _hsv_hex(hsv):
-    """OpenCV HSV(0~180, 0~255, 0~255) → '#rrggbb'."""
+    """OpenCV HSV(0~180, 0~255, 0~255) → '#rrggbb' (그림자 보정 포함)."""
     px = np.uint8([[[int(hsv[0]) % 180, int(min(hsv[1], 255)),
                      int(min(hsv[2], 255))]]])
-    b, g, r = cv2.cvtColor(px, cv2.COLOR_HSV2BGR)[0, 0]
+    b, g, r = _boost_bgr(tuple(int(v) for v in
+                               cv2.cvtColor(px, cv2.COLOR_HSV2BGR)[0, 0]))
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
@@ -627,6 +642,7 @@ class PtzTab(QWidget):
         self.promotes: list[list] = []    # [f, x, y] 회색 공 → 트랙 강제 수락
         self.roles: dict[int, int] = {}   # {track_id: 역할} 사용자 지정 (GK 등)
         self.field_points: dict[str, list] = {}   # {랜드마크키: [x, y]}
+        self.line_points: list[list] = []  # 흰 선 검출 샘플 [x, y] (사이드라인)
         self.field_size = [105.0, 68.0]   # 경기장 길이×폭 (m)
         self._field_calib = None          # fit_field_calibration 결과
         self.extra_players: dict[int, list] = {}  # {샘플si: [[cx,cy,w,h,id]]}
@@ -849,6 +865,11 @@ class PtzTab(QWidget):
         b.setToolTip("찍은 랜드마크 전체 삭제")
         b.clicked.connect(self._field_clear_all)
         fr.addWidget(b)
+        b = QPushButton("흰 선 정밀화")
+        b.setToolTip("예측 사이드라인 주변의 흰 픽셀을 검출해 "
+                     "가까운 사이드라인을 실측 선에 맞춤")
+        b.clicked.connect(self._refine_sideline)
+        fr.addWidget(b)
         fr.addWidget(QLabel("경기장(m)"))
         self.spin_field_len = QDoubleSpinBox()
         self.spin_field_len.setRange(80.0, 130.0)
@@ -1040,6 +1061,7 @@ class PtzTab(QWidget):
             [], [], [], None
         self.roles = {}
         self.field_points = {}
+        self.line_points = []
         self.extra_players = {}
         sp = self._sidecar_path()
         doc = None
@@ -1057,6 +1079,7 @@ class PtzTab(QWidget):
             self.field_points = {k: [float(v[0]), float(v[1])]
                                  for k, v in
                                  (doc.get("field_points") or {}).items()}
+            self.line_points = [list(p) for p in doc.get("line_points", [])]
             self.extra_players = {int(si): [list(p) for p in rows]
                                   for si, rows in
                                   (doc.get("extra_players") or {}).items()}
@@ -1125,6 +1148,7 @@ class PtzTab(QWidget):
                                    "roles": self.roles,
                                    "field_points": self.field_points,
                                    "field_size": self.field_size,
+                                   "line_points": self.line_points,
                                    "extra_players": self.extra_players}))
         tmp.replace(sp)
 
@@ -1793,6 +1817,9 @@ class PtzTab(QWidget):
                             cv2.polylines(frame, [arr], False, (255, 255, 255),
                                           max(1, int(3 * sc)))
                         seg = [(qx, qy)] if np.isfinite(qx) else []
+            for lx, ly in self.line_points:      # 흰 선 검출 샘플 (녹색 점)
+                cv2.circle(frame, (int(lx * sc), int(ly * sc)),
+                           max(2, int(5 * sc)), (0, 255, 0), -1)
             for k, pt in self.field_points.items():
                 q = (int(pt[0] * sc), int(pt[1] * sc))
                 cv2.drawMarker(frame, q, (255, 255, 0),
@@ -1898,14 +1925,25 @@ class PtzTab(QWidget):
             for key, name, req in LANDMARKS:
                 mark = "★ " if req else ""
                 cur = " ✓" if key in self.field_points else ""
-                sub.addAction(f"{mark}{name}{cur}",
+                sub.addAction(f"[{LANDMARK_TAGS[key]}] {mark}{name}{cur}",
                               lambda _=False, kk=key:
                               self._field_set_point(kk, x, y))
-            for k, p in self.field_points.items():
-                if (p[0] - x) ** 2 + (p[1] - y) ** 2 <= 100.0 ** 2:
-                    menu.addAction(f"랜드마크 [{LANDMARK_TAGS[k]}] 지정 해제",
-                                   lambda _=False, kk=k:
-                                   self._field_remove_point(kk))
+            near = self._landmark_at(x, y, r=100.0)
+            if near is not None:
+                near_name = next(n for k, n, _ in LANDMARKS if k == near)
+                sub = menu.addMenu(f"마커 [{LANDMARK_TAGS[near]}] "
+                                   f"{near_name} → 다른 랜드마크로 변경")
+                for key, name, req in LANDMARKS:
+                    if key == near:
+                        continue
+                    mark = "★ " if req else ""
+                    cur = " ✓(교환)" if key in self.field_points else ""
+                    sub.addAction(f"[{LANDMARK_TAGS[key]}] {mark}{name}{cur}",
+                                  lambda _=False, o=near, n=key:
+                                  self._field_reassign(o, n))
+                menu.addAction(f"마커 [{LANDMARK_TAGS[near]}] 지정 해제",
+                               lambda _=False, kk=near:
+                               self._field_remove_point(kk))
         menu.exec(gpos)
 
     def _pane_hover(self, fx, fy):
@@ -2100,8 +2138,9 @@ class PtzTab(QWidget):
                                           int(min(cols[t][1], 255)),
                                           int(min(cols[t][2], 255))]]]),
                               cv2.COLOR_HSV2BGR)[0, 0] for t in member]), axis=0)
-            self._role_colors[r] = (int(bgr[0]), int(bgr[1]), int(bgr[2]))
-            hexc = f"#{int(bgr[2]):02x}{int(bgr[1]):02x}{int(bgr[0]):02x}"
+            boosted = _boost_bgr((int(bgr[0]), int(bgr[1]), int(bgr[2])))
+            self._role_colors[r] = boosted
+            hexc = f"#{boosted[2]:02x}{boosted[1]:02x}{boosted[0]:02x}"
             parts.append(f"{ROLE_NAMES[r]} <span style='background:{hexc};"
                          f"color:{hexc}'>&nbsp;██&nbsp;</span>"
                          f" {len(member)}명")
@@ -2189,6 +2228,7 @@ class PtzTab(QWidget):
             self._pcache_id = None
         if scope in ("field", "all"):
             self.field_points = {}
+            self.line_points = []
         if self.analysis is not None:
             self._teams = classify_teams(self.analysis, roles=self.roles)
         self._write_sidecar()
@@ -2291,6 +2331,7 @@ class PtzTab(QWidget):
         hl, hw = self.field_size[0] / 2.0, self.field_size[1] / 2.0
         pos["sideline_near_l"] = (-hl / 2.0, -hw)
         pos["sideline_near_r"] = (hl / 2.0, -hw)
+        pos["center_near"] = (0.0, -hw + 5.0)   # 중앙선 가까운 끝 대표점
         return pos
 
     def _match_landmark(self, x, y):
@@ -2340,6 +2381,19 @@ class PtzTab(QWidget):
         self._refresh_field_list()
         self._redraw()
 
+    def _field_reassign(self, old, new):
+        """찍힌 마커의 랜드마크 종류 변경 — 대상이 이미 있으면 서로 교환."""
+        pt = self.field_points.pop(old, None)
+        if pt is None or old == new:
+            return
+        if new in self.field_points:
+            self.field_points[old] = self.field_points[new]
+        self.field_points[new] = pt
+        self._refit_field(log_result=True)
+        self._save_keyframes()
+        self._refresh_field_list()
+        self._redraw()
+
     def _field_remove_point(self, key):
         if self.field_points.pop(key, None) is not None:
             self._refit_field()
@@ -2361,6 +2415,7 @@ class PtzTab(QWidget):
                 "삭제할까요?") != QMessageBox.StandardButton.Yes:
             return
         self.field_points = {}
+        self.line_points = []
         self._refit_field(log_result=True)
         self._save_keyframes()
         self._refresh_field_list()
@@ -2401,12 +2456,38 @@ class PtzTab(QWidget):
         elif row >= 0:
             self.field_list.setCurrentRow(row)
 
+    def _refine_sideline(self):
+        """예측 사이드라인 주변 흰 픽셀 검출 → 라인 샘플로 재피팅."""
+        if self._field_calib is None:
+            self.log("[field] 캘리브레이션 먼저 (랜드마크 4점 이상)")
+            return
+        f = getattr(self, "_cur_frame_idx", self.slider.value())
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            frame = self._native_frame(f)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if frame is None:
+            return
+        pts = detect_sideline_points(self._field_calib, frame)
+        if len(pts) < 8:
+            self.log(f"[field] 흰 선 샘플 부족 ({len(pts)}개) — "
+                     "선이 프레임에 잘 보이는 프레임에서 다시 시도")
+            return
+        self.line_points = [[round(float(a), 1), round(float(b), 1)]
+                            for a, b in pts]
+        self._refit_field(log_result=True)
+        self._save_keyframes()
+        self._redraw()
+        self.log(f"[field] 사이드라인 흰 선 샘플 {len(pts)}개 반영")
+
     def _refit_field(self, log_result=False):
         self._field_calib = None
         if self.pano_w and len(self.field_points) >= 4:
             self._field_calib = fit_field_calibration(
                 self.field_points, self.pano_w, self.pano_h,
-                length=self.field_size[0], width=self.field_size[1])
+                length=self.field_size[0], width=self.field_size[1],
+                line_points=self.line_points)
         c = self._field_calib
         if c is not None:
             tilt = (f", 기울기 {np.degrees(c['pitch']):+.1f}°/"
