@@ -2799,7 +2799,7 @@ class PtzTab(QWidget):
                     x2 = int((pp[0] + pp[2] / 2) * sc)
                     y2 = int((pp[1] + pp[3] / 2) * sc)
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color,
-                                  max(2, int(4 * sc)))
+                                  max(1, int(2 * sc)))
                     tag = ROLE_TAGS.get(team)
                     if team == 5 and len(pp) >= 5:
                         tag = self._ref_tag(int(pp[4]))   # 선심 ARN/ARF
