@@ -75,15 +75,6 @@ def _boost_bgr(bgr, s_gain=1.35, v_gain=1.55, v_floor=190):
     return (int(b), int(g), int(r))
 
 
-def _hsv_hex(hsv):
-    """OpenCV HSV(0~180, 0~255, 0~255) → '#rrggbb' (그림자 보정 포함)."""
-    px = np.uint8([[[int(hsv[0]) % 180, int(min(hsv[1], 255)),
-                     int(min(hsv[2], 255))]]])
-    b, g, r = _boost_bgr(tuple(int(v) for v in
-                               cv2.cvtColor(px, cv2.COLOR_HSV2BGR)[0, 0]))
-    return f"#{r:02x}{g:02x}{b:02x}"
-
-
 class TimelineView(QWidget):
     """NLE 스타일 멀티트랙 타임라인.
 
@@ -1327,6 +1318,8 @@ class PtzTab(QWidget):
         self._pcolors_id = None           # 대표색 캐시 키 (분석에만 의존)
         self._tfeat = None                # classify_teams 전처리 캐시
         self._tfeat_id = None
+        self._pbgr = {}                   # {tid: BGR} 대표색 변환 캐시
+        self._pbgr_id = None
         self._pspans: dict = {}           # {tid: [f0, f1, 검출수]}
         self._pcolors: dict = {}          # {tid: (h, s, v)} 유니폼 대표색
         self._accepted_ball = None        # accept_ball_tracks 의 샘플별 수락 공
@@ -1697,6 +1690,7 @@ class PtzTab(QWidget):
         legend.addStretch(1)
         pl.addLayout(legend)
         self.player_list = QListWidget()
+        self.player_list.setUniformItemSizes(True)
         self.player_list.setSelectionMode(
             QListWidget.SelectionMode.ExtendedSelection)
         self.player_list.currentRowChanged.connect(
@@ -3423,6 +3417,32 @@ class PtzTab(QWidget):
             return spans, self._pcolors
         return self._pspans, self._pcolors
 
+    def _tid_bgr(self):
+        """트랙릿 대표색 BGR 캐시 — cvtColor 1회(벡터화)로 전 트랙릿 변환.
+
+        목록 아이콘·범례가 트랙릿마다 cvtColor 를 부르던 것을 대체
+        (선수 목록 재구성 프리즈의 주범).
+        """
+        _, cols = self._player_cache()
+        if self._pbgr_id != self._pcolors_id:
+            ids = list(cols)
+            if ids:
+                hsv = np.array([[(int(cols[t][0]) % 180,
+                                  min(cols[t][1], 255.0),
+                                  min(cols[t][2], 255.0)) for t in ids]])
+                # 그림자 보정 (_boost_bgr 과 동일) — 벡터화
+                hsv[..., 1] = np.minimum(hsv[..., 1] * 1.35, 255)
+                hsv[..., 2] = np.minimum(
+                    np.maximum(hsv[..., 2] * 1.55, 190), 255)
+                bgr = cv2.cvtColor(hsv.astype(np.uint8),
+                                   cv2.COLOR_HSV2BGR)[0]
+                self._pbgr = {t: tuple(int(v) for v in bgr[i])
+                              for i, t in enumerate(ids)}
+            else:
+                self._pbgr = {}
+            self._pbgr_id = self._pcolors_id
+        return self._pbgr
+
     def _team_feats(self):
         """classify_teams 전처리(전 검출 스캔) 캐시 — 분석당 1회.
 
@@ -3669,11 +3689,8 @@ class PtzTab(QWidget):
             if not member:
                 continue
             # 대표색: 검출 수 가중 없이 BGR 중앙값 (스와치 용도라 충분)
-            bgr = np.median(np.array(
-                [cv2.cvtColor(np.uint8([[[int(cols[t][0]) % 180,
-                                          int(min(cols[t][1], 255)),
-                                          int(min(cols[t][2], 255))]]]),
-                              cv2.COLOR_HSV2BGR)[0, 0] for t in member]), axis=0)
+            pb = self._tid_bgr()
+            bgr = np.median(np.array([pb[t] for t in member]), axis=0)
             self._role_colors[r] = _boost_bgr(
                 (int(bgr[0]), int(bgr[1]), int(bgr[2])))
             b_, g_, r_ = self._role_color(r)          # 사용자 지정 우선
@@ -3742,6 +3759,7 @@ class PtzTab(QWidget):
                 (t for t in groups[rep] if t != rep),
                 key=lambda t: spans[t][0])
         self.player_list.blockSignals(True)
+        self.player_list.setUpdatesEnabled(False)
         self.player_list.clear()
         for tid in self._player_rows:
             rep = self._rep(tid)
@@ -3756,9 +3774,10 @@ class PtzTab(QWidget):
                 f"{head}  {mark}{self._disp_role(tid, r)}  "
                 f"{int(t0//60):02d}:{t0%60:04.1f}~"
                 f"{int(t1//60):02d}:{t1%60:04.1f}  ({n}회)")
-            if tid in cols:
+            c = self._tid_bgr().get(tid)
+            if c is not None:
                 px = QPixmap(14, 14)
-                px.fill(QColor(_hsv_hex(cols[tid])))
+                px.fill(QColor(c[2], c[1], c[0]))
                 it.setIcon(QIcon(px))
             self.player_list.addItem(it)
         for row, tid in enumerate(self._player_rows):     # 선택 복원
@@ -3766,6 +3785,7 @@ class PtzTab(QWidget):
                 self.player_list.item(row).setSelected(True)
             if tid == prev_cur:
                 self.player_list.setCurrentRow(row)
+        self.player_list.setUpdatesEnabled(True)
         self.player_list.blockSignals(False)
         self.trackbar.set_players(
             {t: (spans[t][0], spans[t][1], self._role_of(t)) for t in spans})
