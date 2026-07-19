@@ -24,8 +24,8 @@ from PyQt6.QtWidgets import (
     QColorDialog, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMenu, QMessageBox, QPlainTextEdit,
-    QProgressBar, QPushButton, QScrollBar, QSlider, QSpinBox, QTabWidget,
-    QVBoxLayout, QWidget,
+    QProgressBar, QPushButton, QScrollBar, QSlider, QSpinBox, QSplitter,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
 from ..core.encoders import available_encoders
@@ -1461,7 +1461,7 @@ class PtzTab(QWidget):
             ov_row.addWidget(cb)
         ov.addLayout(ov_row)
         ov.addStretch(1)
-        v.addWidget(self.pane, 1)
+        # pane/타임라인/정보 3행은 세로 스플리터로 — 아래에서 합침
 
         tl = QHBoxLayout()
         # 컴팩트 트랜스포트: 2행 그리드 — 1행 재생/트랙 이동 + 시각,
@@ -1536,7 +1536,8 @@ class PtzTab(QWidget):
         bar_col.addWidget(self.tl_scroll)
         bar_col.addWidget(self.slider)
         tl.addLayout(bar_col, 1)
-        v.addLayout(tl)
+        self._w_tl = QWidget()
+        self._w_tl.setLayout(tl)
         self._slider_timer = QTimer(singleShot=True, interval=120)
         self._slider_timer.timeout.connect(self._show_frame)
 
@@ -1699,10 +1700,27 @@ class PtzTab(QWidget):
         self.tabs_review.addTab(w_players, "선수")
         self.tabs_review.addTab(w_field, "경기장")
         self.tabs_review.addTab(self.log_view, "로그")
-        self.tabs_review.setMaximumHeight(210)
         self.tabs_review.currentChanged.connect(self._review_tab_changed)
         strip.addWidget(self.tabs_review, 1)
-        v.addLayout(strip)
+        w_strip = QWidget()
+        w_strip.setLayout(strip)
+        # 영상/타임라인/정보 3행 — 스플리터로 높이 조절 (크기 저장/복원)
+        self._rows = QSplitter(Qt.Orientation.Vertical)
+        self._rows.addWidget(self.pane)
+        self._rows.addWidget(self._w_tl)
+        self._rows.addWidget(w_strip)
+        self._rows.setStretchFactor(0, 1)     # 창 리사이즈 여분은 영상에
+        self._rows.setCollapsible(0, False)
+        saved_rows = QSettings("PyStitch360", "PyStitch360").value(
+            "ptz_row_sizes", None)
+        try:
+            self._rows.setSizes([max(0, int(s)) for s in saved_rows])
+        except Exception:  # noqa: BLE001
+            self._rows.setSizes([520, 260, 210])
+        self._rows.splitterMoved.connect(
+            lambda *_: QSettings("PyStitch360", "PyStitch360").setValue(
+                "ptz_row_sizes", [int(s) for s in self._rows.sizes()]))
+        v.addWidget(self._rows, 1)
 
         bottom = QHBoxLayout()
         bottom.addWidget(QLabel("출력"))
