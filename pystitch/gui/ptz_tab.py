@@ -3636,14 +3636,14 @@ class PtzTab(QWidget):
                 f"(지분 {float(ocr.get('share', 0)):.0%})",
                 lambda _=False, n=str(ocr["num"]):
                 self._set_player_num(tid, team, n))
+        if cur:
+            sub.addAction(f"      등번호 해제 ({cur}번)",
+                          lambda: self._clear_player_num(tid))
         more = sub.addMenu("      번호 입력/명단...")
         more.addAction("직접 입력...",
                        lambda: self._input_player_num(tid, team))
         more.addAction(f"{self.team_names[team]} 명단 입력/수정...",
                        lambda: self._edit_roster(team))
-        if cur:
-            more.addAction(f"등번호 해제 ({cur}번)",
-                           lambda: self._clear_player_num(tid))
 
     def _edit_team_names(self):
         dlg = QDialog(self)
