@@ -215,16 +215,12 @@ def fit_field_calibration(points, pano_w, pano_h,
         return None
     fxy = np.array([pos[k] for k in keys], float)
     pxy = np.array([points[k] for k in keys], float)
+    # 자동 흰 선 샘플은 LM 에는 넣지 않고 워프 앵커로만 쓴다 — 화면상
+    # 수직인 구간에서 행(row) 제약은 방향이 틀려 골라인까지 부풀린다.
     lp = (np.array(line_points, float).reshape(-1, 2)
           if line_points is not None and len(line_points) else
           np.zeros((0, 2)))
-    ln = np.vstack([np.array([points[k] for k in ln_keys],
-                             float).reshape(-1, 2), lp])
-    # 자동 샘플은 합산 가중 ~6방정식 상당으로 눌러 클릭 점과 균형
-    lw = np.concatenate([np.ones(len(ln) - len(lp)),
-                         np.full(len(lp),
-                                 min(1.0, 6.0 / max(len(lp), 1)))])
-    n_eq += min(len(lp), 6)
+    ln = np.array([points[k] for k in ln_keys], float).reshape(-1, 2)
     wgt = np.array([3.0 if k.startswith("corner") else 1.0 for k in keys])
     p = np.array([4.0, np.tan(np.deg2rad(10.0)), np.tan(np.deg2rad(-38.0)),
                   0.0, 0.0, -(width / 2.0 + 5.0), 0.0, 0.0])
@@ -236,8 +232,8 @@ def fit_field_calibration(points, pano_w, pano_h,
         r = ((_project(pp, fxy, pano_w, pano_h) - pxy)
              * wgt[:, None]).ravel()
         if len(ln):
-            rl = (_sideline_rows(pp, ln[:, 0], pano_w, pano_h,
-                                 width) - ln[:, 1]) * lw
+            rl = _sideline_rows(pp, ln[:, 0], pano_w, pano_h,
+                                width) - ln[:, 1]
             r = np.concatenate([r, rl])
         if len(cn):
             rc = _centerline_cols(pp, cn[:, 1], pano_w, pano_h) - cn[:, 0]
@@ -303,16 +299,59 @@ def fit_field_calibration(points, pano_w, pano_h,
                                      np.zeros(m.sum())], axis=1)])
     ok = np.isfinite(src).all(axis=1)
     src, delta = src[ok], delta[ok]
-    # 근접 제어점 정리(≥20px 간격, 먼저 온 것 = 위치 랜드마크 우선) —
-    # 클릭 점과 자동 라인 샘플이 겹치면 TPS 가 요동하는 것을 방지
-    keep = []
-    for i in range(len(src)):
-        if all((src[i, 0] - src[j, 0]) ** 2
-               + (src[i, 1] - src[j, 1]) ** 2 >= 20.0 ** 2 for j in keep):
-            keep.append(i)
-    if len(keep) >= 4:
-        calib["warp"] = _tps_fit(src[keep], delta[keep],
-                                 float(max(pano_w, 1)))
+
+    def _dedup_fit(s, d):
+        # 근접 제어점 정리(≥20px 간격, 먼저 온 것 우선 = 클릭 랜드마크)
+        keep = []
+        for i in range(len(s)):
+            if all((s[i, 0] - s[j, 0]) ** 2
+                   + (s[i, 1] - s[j, 1]) ** 2 >= 20.0 ** 2 for j in keep):
+                keep.append(i)
+        if len(keep) < 4:
+            return None
+        return _tps_fit(s[keep], d[keep], float(max(pano_w, 1)))
+
+    if not len(lp):
+        calib["warp"] = _dedup_fit(src, delta)
+        return calib
+    # 자동 흰 선 샘플: 예측 곡선 위 최근접점 → 샘플 위치의 수직 벡터
+    # 앵커 (가파른 구간에서도 올바른 방향의 보정).
+    hl2, hw2 = length / 2.0, width / 2.0
+    xs_d = np.linspace(-hl2, hl2, 600)
+    curve = _project(p, np.stack([xs_d, np.full(600, -hw2)], axis=1),
+                     pano_w, pano_h)
+    curve = curve[np.isfinite(curve).all(axis=1)]
+    s_src = np.zeros((0, 2))
+    s_delta = np.zeros((0, 2))
+    if len(curve):
+        j = np.argmin(((lp[:, None, :] - curve[None]) ** 2).sum(axis=2),
+                      axis=1)
+        s_src = curve[j]
+        s_delta = lp - s_src
+        good = np.linalg.norm(s_delta, axis=1) < 200.0   # 검출 오류 방어
+        s_src, s_delta = s_src[good], s_delta[good]
+    # 샘플이 커버하지 않는 다른 선(골라인·먼 사이드라인·중앙선)에는
+    # '클릭 랜드마크만의 워프' 값을 안정화 앵커로 깐다 — 샘플 보정이
+    # TPS 외삽으로 코너 밖 골라인까지 부풀리는 것을 방지.
+    warp_base = _dedup_fit(src, delta)
+    stab_f = []
+    for (x0, y0), (x1, y1) in [((-hl2, hw2), (hl2, hw2)),
+                               ((-hl2, -hw2), (-hl2, hw2)),
+                               ((hl2, -hw2), (hl2, hw2)),
+                               ((0.0, -hw2), (0.0, hw2))]:
+        m_ = max(2, int(np.hypot(x1 - x0, y1 - y0) / 5.0) + 1)
+        stab_f.append(np.stack([np.linspace(x0, x1, m_),
+                                np.linspace(y0, y1, m_)], axis=1))
+    sp = _project(p, np.vstack(stab_f), pano_w, pano_h)
+    inb = (np.isfinite(sp).all(axis=1)
+           & (sp[:, 0] >= -0.1 * pano_w) & (sp[:, 0] <= 1.1 * pano_w)
+           & (sp[:, 1] >= -0.1 * pano_h) & (sp[:, 1] <= 1.1 * pano_h))
+    sp = sp[inb]
+    sd = (_tps_eval(warp_base, sp) if warp_base is not None
+          else np.zeros_like(sp))
+    # 우선순위: 클릭 앵커 → 자동 샘플 → 안정화 (dedup 이 순서 유지)
+    calib["warp"] = _dedup_fit(np.vstack([src, s_src, sp]),
+                               np.vstack([delta, s_delta, sd]))
     return calib
 
 
@@ -364,41 +403,53 @@ def pano_to_field(calib, pxy):
 def detect_sideline_points(calib, frame, n=64, min_contrast=0.10):
     """근처 사이드라인 예측 곡선 주변에서 흰 선 중심 픽셀을 샘플링.
 
-    각 샘플 열에서 예측 행 ±윈도(그 지점의 선 굵기 추정 ×4) 안의
-    '흰 정도'(밝고 무채색: V·(1-S)) 가중 중심을 취한다. 대비가 없거나
-    (선이 안 보임/가림) 분포가 퍼져 있으면(사람·트랙 등) 기각.
-    반환: (M, 2) [x, y] 파노라마 픽셀 — fit 의 line_points 입력.
+    예측 곡선을 필드 X 등간격으로 훑되, 스캔은 곡선의 **국소 수직
+    방향**으로 한다 — 이 카메라 배치에선 사이드라인이 화면 좌우에서
+    거의 수직으로 서므로 열 스캔(행 보정)은 방향이 틀린다. 각 스캔에서
+    '흰 정도'(밝고 무채색: V·(1-S)) 가중 중심을 취하고, 대비가 없거나
+    분포가 퍼져 있으면(사람·트랙 등) 기각.
+    반환: (M, 2) [x, y] — 페인트 위의 점. fit 의 line_points 입력
+    (워프 앵커: 예측 곡선까지의 수직 오프셋 벡터로 쓰임).
     """
     H, W = frame.shape[:2]
     hl, hw = calib["length"] / 2.0, calib["width"] / 2.0
     xs = np.linspace(-hl, hl, n)
     pred = field_to_pano(calib, np.stack([xs, np.full(n, -hw)], axis=1))
     out = []
-    for (px, py), fx in zip(pred, xs):
-        if not (np.isfinite(px) and 1 <= px < W - 1 and np.isfinite(py)):
+    for i, (px, py) in enumerate(pred):
+        if not (np.isfinite(px) and 0 <= px < W and np.isfinite(py)
+                and -0.2 * H <= py < 1.2 * H):
             continue
-        # 선 굵기(행 방향) 추정: 지면 0.12m 가 그 거리에서 차지하는 행 수
-        d = np.hypot(fx - calib["ex"], -hw - calib["ey"])
+        tv = pred[min(i + 1, n - 1)] - pred[max(i - 1, 0)]   # 국소 접선
+        norm = float(np.hypot(tv[0], tv[1]))
+        if not np.isfinite(norm) or norm < 1e-6:
+            continue
+        nx, ny = -tv[1] / norm, tv[0] / norm                 # 수직 방향
+        # 선 굵기(픽셀) 추정: 지면 0.12m 가 그 거리에서 갖는 각크기
+        d = np.hypot(xs[i] - calib["ex"], -hw - calib["ey"])
         thick = (0.12 * calib["h"] / max(d, 1.0) ** 2
                  / (calib["t_top"] - calib["t_bot"]) * (calib["pano_h"] - 1))
         win = int(np.clip(4.0 * thick, 14, 160))
-        y0, y1 = int(max(py - win, 0)), int(min(py + win + 1, H))
-        if y1 - y0 < 8:
+        ss = np.arange(-win, win + 1, dtype=np.float64)
+        sx, sy = px + ss * nx, py + ss * ny
+        m = (sx >= 0) & (sx <= W - 1) & (sy >= 0) & (sy <= H - 1)
+        if m.sum() < 8:
             continue
-        col = int(round(px))
-        strip = frame[y0:y1, max(col - 1, 0):col + 2].astype(np.float32)
-        v = strip.max(axis=2)
-        s = (v - strip.min(axis=2)) / np.maximum(v, 1.0)
-        white = ((v / 255.0) * (1.0 - s)).mean(axis=1)
+        pix = frame[sy[m].astype(int), sx[m].astype(int)].astype(np.float32)
+        v = pix.max(axis=1)
+        s = (v - pix.min(axis=1)) / np.maximum(v, 1.0)
+        white = (v / 255.0) * (1.0 - s)
         w = np.clip(white - np.median(white) - min_contrast, 0.0, None)
         if w.sum() < 1e-6:
             continue
-        rows = np.arange(y0, y1, dtype=np.float64)
-        mu = float((w * rows).sum() / w.sum())
-        sd = float(np.sqrt((w * (rows - mu) ** 2).sum() / w.sum()))
+        sv = ss[m]
+        mu = float((w * sv).sum() / w.sum())
+        sd = float(np.sqrt((w * (sv - mu) ** 2).sum() / w.sum()))
         if sd > max(3.0 * thick, 6.0):       # 퍼진 흰 무리(선 아님) 기각
             continue
-        out.append((float(px), mu))
+        if abs(mu) > 0.8 * win:              # 윈도 가장자리 = 다른 흰 물체
+            continue
+        out.append((float(px + mu * nx), float(py + mu * ny)))
     return np.array(out, float).reshape(-1, 2)
 
 

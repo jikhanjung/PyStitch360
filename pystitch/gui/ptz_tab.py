@@ -870,6 +870,10 @@ class PtzTab(QWidget):
                      "가까운 사이드라인을 실측 선에 맞춤")
         b.clicked.connect(self._refine_sideline)
         fr.addWidget(b)
+        b = QPushButton("흰 선 취소")
+        b.setToolTip("흰 선 정밀화 샘플을 지우고 랜드마크만으로 재피팅")
+        b.clicked.connect(self._clear_line_points)
+        fr.addWidget(b)
         fr.addWidget(QLabel("경기장(m)"))
         self.spin_field_len = QDoubleSpinBox()
         self.spin_field_len.setRange(80.0, 130.0)
@@ -2480,6 +2484,18 @@ class PtzTab(QWidget):
         self._save_keyframes()
         self._redraw()
         self.log(f"[field] 사이드라인 흰 선 샘플 {len(pts)}개 반영")
+
+    def _clear_line_points(self):
+        """흰 선 정밀화 취소 — 샘플 제거 후 랜드마크만으로 재피팅."""
+        if not self.line_points:
+            self.log("[field] 지울 흰 선 샘플이 없습니다")
+            return
+        n = len(self.line_points)
+        self.line_points = []
+        self._refit_field(log_result=True)
+        self._save_keyframes()
+        self._redraw()
+        self.log(f"[field] 흰 선 샘플 {n}개 제거 — 랜드마크만으로 재피팅")
 
     def _refit_field(self, log_result=False):
         self._field_calib = None
