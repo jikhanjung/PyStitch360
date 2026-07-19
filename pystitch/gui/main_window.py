@@ -72,6 +72,10 @@ class MainWindow(QMainWindow):
         split.addWidget(self.log_box)
         split.setSizes([760, 140])
         self.setCentralWidget(split)
+        # PTZ 탭은 자체 로그 탭이 있음 — 하단 로그는 1~3 탭에서만 표시
+        tabs.currentChanged.connect(
+            lambda i: self.log_box.setVisible(tabs.widget(i)
+                                              is not self.ptz_tab))
 
         self.project_path: Path | None = None
         self._build_menu()
