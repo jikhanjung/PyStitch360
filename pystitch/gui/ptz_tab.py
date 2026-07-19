@@ -1024,6 +1024,7 @@ class PtzTab(QWidget):
         self._pspans: dict = {}           # {tid: [f0, f1, 검출수]}
         self._pcolors: dict = {}          # {tid: (h, s, v)} 유니폼 대표색
         self._accepted_ball = None        # accept_ball_tracks 의 샘플별 수락 공
+        self._air: dict[int, tuple] = {}  # {si: (X, Y, z)} 공중볼 보정 캐시
         self._hover = None                # 커서가 가리키는 오브젝트
         self._hover_key = None            # hover 변경 감지 키
         self._plan_box = None             # 현재 프레임에 그려진 크롭 박스 (x0,y0,w,h)
@@ -2289,7 +2290,9 @@ class PtzTab(QWidget):
                     for (gx, gy), (_, _, tid) in zip(fc, feet):
                         if np.isfinite(gx):
                             radar_pts.append((gx, gy, self._role_of(tid)))
-                if bb is not None:
+                if si in self._air:                 # 공중볼: 보정 XY 사용
+                    ball_g = self._air[si][:2]
+                elif bb is not None:
                     g = pano_to_field(self._field_calib, [[bb[0], bb[1]]])[0]
                     if np.isfinite(g[0]):
                         ball_g = (float(g[0]), float(g[1]))
@@ -2634,6 +2637,37 @@ class PtzTab(QWidget):
         self._link_worker = w
         self.log("[ptz] 트랙 연결 계산 중... (완료 후 클릭 반응이 빨라짐)")
         w.start()
+
+    def _recompute_airborne(self):
+        """공중볼 보정 캐시 {si: (X, Y, z)} — 링크/캘리브레이션 후 갱신."""
+        self._air = {}
+        if self.analysis is None or self._field_calib is None \
+                or self._accepted_ball is None:
+            return
+        try:
+            from ..core.airborne import correct_ball_track
+            from ..core.field import pano_to_field
+            acc = self._accepted_ball
+            fin = np.isfinite(acc[:, 0])
+            if fin.sum() < 10:
+                return
+            g = np.full((len(acc), 2), np.nan)
+            g[fin] = pano_to_field(self._field_calib, acc[fin])
+            t = np.asarray(self.analysis["frames"]) / self.fps
+            c = self._field_calib
+            corr, z, segs = correct_ball_track(
+                t, g, (c["ex"], c["ey"]), c["h"])
+            for i0, i1, fit in segs:
+                for si in range(i0, i1 + 1):
+                    self._air[si] = (float(corr[si, 0]), float(corr[si, 1]),
+                                     float(z[si]))
+            if segs:
+                times = ", ".join(
+                    f"{self._hms(t[i0])}~{self._hms(t[i1])} "
+                    f"(정점 {fit['apex_z']:.1f}m)" for i0, i1, fit in segs)
+                self.log(f"[air] 공중 구간 {len(segs)}개: {times}")
+        except Exception as e:  # noqa: BLE001
+            self.log(f"[air] 공중볼 보정 실패: {e}")
 
     def _link_done(self, linked):
         self._linked = linked
@@ -3533,6 +3567,7 @@ class PtzTab(QWidget):
                 self.analysis, ignore_ranges=[tuple(r) for r in self.ignores],
                 force_ranges=[tuple(p) for p in self.promotes],
                 linked=self._linked, log=self.log)
+        self._recompute_airborne()
         self.trackbar.set_data(self.total, self.track_spans,
                                self.ignores, self.keyframes,
                                promotes=self.promotes)

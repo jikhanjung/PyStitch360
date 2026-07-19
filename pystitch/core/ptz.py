@@ -1130,6 +1130,19 @@ def build_radar_data(analysis, teams, calib=None, field_size=(105.0, 68.0),
                 if g:
                     bg = (cam[0] + g[0][0], cam[1] + g[0][1])
         balls.append(bg)
+    # 공중볼 보정: 지면 투영 왜곡(높이 → 카메라 반대쪽 밀림)을 탄도
+    # 피팅으로 되돌린다 — 레이더에서 공중볼 XY 가 직선이 된다.
+    if calib is not None:
+        from .airborne import correct_ball_track
+        t = frames / analysis["fps"]
+        g = np.array([[b[0], b[1]] if b is not None else [np.nan, np.nan]
+                      for b in balls])
+        corr, z, segs = correct_ball_track(
+            t, g, (calib["ex"], calib["ey"]), calib["h"])
+        for i0, i1, _fit in segs:
+            for si in range(i0, i1 + 1):
+                if balls[si] is not None:
+                    balls[si] = (float(corr[si, 0]), float(corr[si, 1]))
     return {"frames": frames, "points": pts, "balls": balls,
             "length": float(field_size[0]), "width": float(field_size[1]),
             "palette": palette or {}}
