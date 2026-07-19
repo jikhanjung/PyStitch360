@@ -1172,8 +1172,9 @@ def draw_radar_panel(radar, si, panel_w):
         cv2.circle(img, px(X, Y), r_dot,
                    tuple(int(v) for v in pal.get(role, (160, 160, 160))), -1)
     if radar["balls"][si] is not None:
-        cv2.circle(img, px(*radar["balls"][si]), max(2, r_dot - 1),
-                   (255, 255, 255), -1)
+        q = px(*radar["balls"][si])
+        cv2.circle(img, q, r_dot + 2, (30, 30, 30), 2)   # 외곽선 — 대비
+        cv2.circle(img, q, r_dot + 1, (255, 255, 255), -1)
     return img
 
 

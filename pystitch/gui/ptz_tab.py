@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import json
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import cv2
@@ -162,9 +164,13 @@ class RadarView(QWidget):
             x, y = px(X, Y)
             p.drawEllipse(x - 4, y - 4, 8, 8)
         if self.ball is not None:
-            p.setBrush(QColor(255, 255, 255))
             x, y = px(*self.ball)
-            p.drawEllipse(x - 3, y - 3, 6, 6)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QColor(0, 0, 0, 180))            # 외곽선 — 배경 대비
+            p.drawEllipse(x - 6, y - 6, 12, 12)
+            p.setBrush(QColor(255, 255, 255))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawEllipse(x - 5, y - 5, 10, 10)
         p.setPen(QColor(255, 255, 255, 160))
         p.drawText(6, 14, "레이더 (카메라 기준, 10m 격자)")
         p.end()
@@ -187,7 +193,7 @@ class TimelineView(QWidget):
     RULER = 16
     LANE_H = 20                  # 기본 레인 높이 (개별 조절 가능)
     GUTTER = 64
-    LANES = ["크롭/KF", "공", "팀1", "팀2", "기타", "호각", "이벤트"]
+    LANES = ["크롭/KF", "공", "뜬 공", "팀1", "팀2", "기타", "호각", "이벤트"]
     WHISTLE_MIN_DB = 20.0        # 이 피크 이상만 '확실한 호각'으로 표시
 
     def __init__(self):
@@ -219,15 +225,21 @@ class TimelineView(QWidget):
         self.mark_out = None         # 내보내기 끝 프레임
         self._whistle = None         # (hop_s, 프로미넌스 배열, 이벤트)
         self.events = []             # [(frame, label, kind)] kind: auto|user
+        self.airborne = []           # [(f0, f1, apex_z)] 공중 구간
         self._press = None
         self._resize = None          # 레인 경계 드래그 상태
 
     def set_lane_names(self, team1, team2):
-        self.lanes[2], self.lanes[3] = team1, team2
+        self.lanes[3], self.lanes[4] = team1, team2
         self.update()
 
     def set_events(self, events):
         self.events = list(events)
+        self.update()
+
+    def set_airborne(self, segs):
+        """공중 구간 [(f0, f1, apex_z)] — '뜬 공' 레인."""
+        self.airborne = list(segs)
         self.update()
 
     def _emit_view(self):
@@ -312,10 +324,10 @@ class TimelineView(QWidget):
     @staticmethod
     def _lane_of_role(role):
         if role in (0, 3):
-            return 2
-        if role in (1, 4):
             return 3
-        return 4
+        if role in (1, 4):
+            return 4
+        return 5
 
     # --------------------------------------------------------------- 좌표계
     def _eff_ppf(self):
@@ -442,11 +454,26 @@ class TimelineView(QWidget):
             if self.selected == ("player", tid):
                 p.setPen(QColor(255, 255, 255))
                 p.drawRect(r[0] - 1, r[1] - 1, r[2] + 1, r[3] + 1)
+        # 뜬 공 레인: 공중 구간 바 (하늘색, 정점 높이 라벨)
+        if self.airborne and self.total > 1:
+            y, lh = self._lane_rect(2)
+            c = QColor(120, 200, 255)
+            for f0, f1, apex in self.airborne:
+                x0_, x1_ = self._x(f0), self._x(f1)
+                if x1_ < self.GUTTER or x0_ > W:
+                    continue
+                p.fillRect(max(x0_, self.GUTTER), y + 4,
+                           max(3, x1_ - max(x0_, self.GUTTER)), lh - 8, c)
+                if x1_ - x0_ > 44:
+                    p.setPen(QColor(20, 40, 60))
+                    p.drawText(QRect(x0_ + 3, y, x1_ - x0_ - 4, lh),
+                               Qt.AlignmentFlag.AlignVCenter,
+                               f"{apex:.1f}m")
         # 호각 레인: 확실한 이벤트(피크 ≥ WHISTLE_MIN_DB)만 불연속 마커로
         # — 연속 바는 노이즈처럼 보여 제거 (원본 트랙은 파일에 보관)
         if self._whistle is not None and self.total > 1:
             _, _, events = self._whistle
-            y, lh = self._lane_rect(5)
+            y, lh = self._lane_rect(6)
             for t0_, t1_, db in events:
                 if db < self.WHISTLE_MIN_DB:
                     continue
@@ -462,7 +489,7 @@ class TimelineView(QWidget):
                     p.drawLine(x_, y + 1, x_ + w_, y + 1)
         # 이벤트 레인: 자동(킥오프)=초록, 사용자=시안 마커 + 라벨
         if self.events and self.total > 1:
-            y, lh = self._lane_rect(6)
+            y, lh = self._lane_rect(7)
             for i, (f_, label, kind) in enumerate(self.events):
                 x_ = self._x(f_)
                 if not (self.GUTTER - 4 <= x_ <= W + 4):
@@ -524,7 +551,7 @@ class TimelineView(QWidget):
                 if f0 <= f <= f1:
                     return ("ball", i)
             return None
-        if lane in (2, 3, 4):
+        if lane in (3, 4, 5):
             ly, lh = self._lane_rect(int(lane))
             bh = (lh - 4) // 3
             for tid, f0, f1, role, si in self._players:
@@ -533,7 +560,7 @@ class TimelineView(QWidget):
                 ry = ly + 2 + si * bh
                 if f0 <= f <= f1 and ry - 1 <= y <= ry + bh:
                     return ("player", tid)
-        if lane == 6:
+        if lane == 7:
             best, bd = None, 10.0
             for i, (f_, label, kind) in enumerate(self.events):
                 d = abs(self._x(f_) - x)
@@ -697,26 +724,27 @@ class GapfillWorker(QThread):
 class AirborneWorker(QThread):
     """공중볼 스캔 (correct_ball_track) — UI 프리즈 방지용 백그라운드."""
 
-    done = pyqtSignal(int, dict, str)     # gen, {si: (X,Y,z)}, 로그 문구
+    done = pyqtSignal(int, dict, list, str)  # gen, 캐시, 구간(직렬화), 로그
 
-    def __init__(self, gen, frames, fps, acc, calib):
+    def __init__(self, gen, frames, fps, acc, calib, segments=None):
         super().__init__()
-        self.args = (gen, frames, fps, acc, calib)
+        self.args = (gen, frames, fps, acc, calib, segments)
 
     def run(self):
-        gen, frames, fps, acc, calib = self.args
+        gen, frames, fps, acc, calib, segments = self.args
         try:
             from ..core.airborne import correct_ball_track
             from ..core.field import pano_to_field
             fin = np.isfinite(acc[:, 0])
             if fin.sum() < 10:
-                self.done.emit(gen, {}, "")
+                self.done.emit(gen, {}, [], "")
                 return
             g = np.full((len(acc), 2), np.nan)
             g[fin] = pano_to_field(calib, acc[fin])
             t = frames / fps
             corr, z, segs = correct_ball_track(
-                t, g, (calib["ex"], calib["ey"]), calib["h"])
+                t, g, (calib["ex"], calib["ey"]), calib["h"],
+                segments=segments)
             cache = {}
             for i0, i1, fit in segs:
                 for si in range(i0, i1 + 1):
@@ -724,11 +752,15 @@ class AirborneWorker(QThread):
                                  float(z[si]))
             msg = ""
             if segs:
+                cached = " (캐시 재사용)" if segments is not None else ""
                 msg = (f"[air] 공중 구간 {len(segs)}개 (정점 최대 "
-                       f"{max(f['apex_z'] for _, _, f in segs):.1f}m)")
-            self.done.emit(gen, cache, msg)
+                       f"{max(f['apex_z'] for _, _, f in segs):.1f}m)"
+                       + cached)
+            self.done.emit(gen, cache,
+                           [[int(i0), int(i1), f] for i0, i1, f in segs],
+                           msg)
         except Exception as e:  # noqa: BLE001
-            self.done.emit(gen, {}, f"[air] 공중볼 보정 실패: {e}")
+            self.done.emit(gen, {}, [], f"[air] 공중볼 보정 실패: {e}")
 
 
 class SeedWorker(QThread):
@@ -1438,16 +1470,17 @@ class PtzTab(QWidget):
         self.pano_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.lbl_file.setText(f"{self.pano_path.name} — {self.pano_w}x{self.pano_h}, "
                               f"{self.total/self.fps/60:.1f}분")
-        # 호각 트랙 (있으면) → 타임라인 레인
-        try:
-            from ..core.audio import load_whistle_track, whistle_prominence
-            tr, ev = load_whistle_track(self.pano_path)
-            if tr is not None:
-                self.trackbar.set_whistle(tr["hop_s"],
-                                          whistle_prominence(tr), ev)
-                self.log(f"[ptz] 호각 트랙 로드: 이벤트 {len(ev)}개")
-        except Exception as e:  # noqa: BLE001
-            self.log(f"[ptz] 호각 트랙 무시: {e}")
+        with self._busy(f"호각 트랙 읽기"):
+            try:
+                from ..core.audio import load_whistle_track, \
+                    whistle_prominence
+                tr, ev = load_whistle_track(self.pano_path)
+                if tr is not None:
+                    self.trackbar.set_whistle(tr["hop_s"],
+                                              whistle_prominence(tr), ev)
+                    self.log(f"[ptz] 호각 트랙 로드: 이벤트 {len(ev)}개")
+            except Exception as e:  # noqa: BLE001
+                self.log(f"[ptz] 호각 트랙 무시: {e}")
         self.slider.setEnabled(True)
         self.slider.setRange(0, max(0, self.total - 1))
         self.slider.setValue(0)
@@ -1457,9 +1490,10 @@ class PtzTab(QWidget):
             self.btn_analyze.setToolTip("ultralytics 미설치 (pip install ultralytics)")
         self.analysis = None
         self._load_sidecar()
-        self._apply_team_names()
-        self._refresh_events()
-        self._show_frame()
+        with self._busy("목록/이벤트 표시 갱신"):
+            self._apply_team_names()
+            self._refresh_events()
+            self._show_frame()
         self._update_export_enabled()
 
     def _refresh_events(self):
@@ -1557,7 +1591,8 @@ class PtzTab(QWidget):
         doc = None
         if sp.exists():
             try:
-                doc = json.loads(sp.read_text())
+                with self._busy("편집 사이드카 읽기 (.ptz.json)"):
+                    doc = json.loads(sp.read_text())
             except Exception as e:  # noqa: BLE001
                 self.log(f"[ptz] 사이드카 무시: {e}")
         if doc is not None:
@@ -1602,7 +1637,8 @@ class PtzTab(QWidget):
         if ap.exists() and (self.analysis is None or
                             ap.stat().st_mtime > sp.stat().st_mtime):
             try:
-                self.analysis = json.loads(ap.read_text())
+                with self._busy("분석 읽기 (.analysis.json, 수 MB)"):
+                    self.analysis = json.loads(ap.read_text())
             except Exception as e:  # noqa: BLE001
                 self.log(f"[ptz] 분석 파일 무시: {e}")
         if doc is None and self._kf_path().exists():
@@ -1662,10 +1698,11 @@ class PtzTab(QWidget):
         """순수 분석 결과 저장 — 분석 완료/이전 시에만, 검수로는 안 바뀜."""
         if self.pano_path is None or self.analysis is None:
             return
-        ap = self._analysis_path()
-        tmp = Path(str(ap) + ".tmp")
-        tmp.write_text(json.dumps(self.analysis))
-        tmp.replace(ap)
+        with self._busy("분석 저장 (.analysis.json, 수 MB)"):
+            ap = self._analysis_path()
+            tmp = Path(str(ap) + ".tmp")
+            tmp.write_text(json.dumps(self.analysis))
+            tmp.replace(ap)
 
     _MODEL_NAMES = ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt",
                     "yolo11n.pt", "yolo11s.pt", "yolo11m.pt", None]
@@ -1759,6 +1796,21 @@ class PtzTab(QWidget):
         m, s = divmod(rem, 60)
         return (f"{int(h)}:{int(m):02d}:{s:04.1f}" if tenth
                 else f"{int(h)}:{int(m):02d}:{int(s):02d}")
+
+    @contextmanager
+    def _busy(self, msg):
+        """동기(UI 차단) 작업 래퍼: 시작 로그 + 웨이트 커서 + 완료 로그."""
+        self.log(f"[작업] {msg}...")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()          # 커서·로그 즉시 반영
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            QApplication.restoreOverrideCursor()
+            el = time.perf_counter() - t0
+            if el >= 0.5:                     # 짧은 작업은 완료 로그 생략
+                self.log(f"[작업] {msg} 완료 ({el:.1f}s)")
 
     def _on_slider(self, _):
         self.trackbar.set_pos(self.slider.value())
@@ -2677,28 +2729,67 @@ class PtzTab(QWidget):
         self.log("[ptz] 트랙 연결 계산 중... (완료 후 클릭 반응이 빨라짐)")
         w.start()
 
+    def _airborne_key(self):
+        """공중볼 캐시 무효화 키 — 수락 궤적에 영향 주는 입력의 해시."""
+        import hashlib
+        n_cands = sum(len(c) for c in (self.analysis.get("ball_cands")
+                                       or []))
+        payload = json.dumps([len(self.analysis["frames"]), n_cands,
+                              self.ignores, self.promotes],
+                             sort_keys=True)
+        return hashlib.md5(payload.encode()).hexdigest()[:16]
+
     def _recompute_airborne(self):
-        """공중볼 보정 캐시 재계산 시작 — 백그라운드 (UI 프리즈 방지)."""
+        """공중볼 보정 재계산 — 파일 캐시(.events.json) 우선, 백그라운드."""
         self._air = {}
         if self.analysis is None or self._field_calib is None \
                 or self._accepted_ball is None:
             return
         self._air_gen = getattr(self, "_air_gen", 0) + 1
+        key = self._airborne_key()
+        self._air_key = key
+        segments = None
+        try:                              # 저장된 구간이 유효하면 스캔 생략
+            from ..core.events import events_json_path
+            p = events_json_path(self.pano_path)
+            if p.exists():
+                doc = json.loads(p.read_text())
+                air = doc.get("airborne")
+                if air and air.get("key") == key:
+                    segments = [(int(a), int(b), f)
+                                for a, b, f in air["segments"]]
+        except Exception as e:  # noqa: BLE001
+            self.log(f"[air] 캐시 무시: {e}")
         w = AirborneWorker(self._air_gen,
                            np.asarray(self.analysis["frames"], dtype=float),
                            float(self.fps),
                            np.array(self._accepted_ball, copy=True),
-                           dict(self._field_calib))
+                           dict(self._field_calib), segments=segments)
         w.done.connect(self._airborne_done)
         self._air_worker = w
         w.start()
 
-    def _airborne_done(self, gen, cache, msg):
+    def _airborne_done(self, gen, cache, segments, msg):
         if gen != getattr(self, "_air_gen", 0):
             return                        # 그 사이 재계산됨 — 낡은 결과 폐기
         self._air = cache
         if msg:
             self.log(msg)
+        if "캐시 재사용" not in msg:      # 새 스캔 결과만 저장
+            try:
+                from ..core.events import save_events
+                save_events(self.pano_path,
+                            airborne={"key": getattr(self, "_air_key", ""),
+                                      "segments": segments})
+            except Exception as e:  # noqa: BLE001
+                self.log(f"[air] 캐시 저장 실패: {e}")
+        # 타임라인 '뜬 공' 레인 갱신
+        frames = np.asarray(self.analysis["frames"]) \
+            if self.analysis is not None else None
+        if frames is not None:
+            self.trackbar.set_airborne(
+                [(int(frames[i0]), int(frames[i1]),
+                  float(f["apex_z"])) for i0, i1, f in segments])
         if cache:
             self._redraw()
 
@@ -2965,15 +3056,12 @@ class PtzTab(QWidget):
                 "호각 트랙이 없습니다 — scripts/whistle.py 를 먼저 "
                 "실행하세요 (오디오 추출, ~20초).")
             return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
+        with self._busy("킥오프 검출 (대형 × 호각 융합)"):
             spans, _ = self._player_cache()
             teams = {tid: self._role_of(tid) for tid in spans}
             tr = formation_track(self.analysis, teams, self._field_calib)
             ks = detect_kickoffs(tr, whistles)
             save_events(self.pano_path, ks)
-        finally:
-            QApplication.restoreOverrideCursor()
         self._refresh_events()
         times = ", ".join(self._hms(t) for t, _, _ in ks) or "없음"
         self.log(f"[events] 킥오프 {len(ks)}개: {times}")
@@ -3327,14 +3415,12 @@ class PtzTab(QWidget):
             self.log("[field] 캘리브레이션 먼저 (랜드마크 4점 이상)")
             return
         f = getattr(self, "_cur_frame_idx", self.slider.value())
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
+        with self._busy("흰 선 검출 (사이드라인 정밀화)"):
             frame = self._native_frame(f)
-        finally:
-            QApplication.restoreOverrideCursor()
+            pts = (detect_sideline_points(self._field_calib, frame)
+                   if frame is not None else [])
         if frame is None:
             return
-        pts = detect_sideline_points(self._field_calib, frame)
         if len(pts) < 8:
             self.log(f"[field] 흰 선 샘플 부족 ({len(pts)}개) — "
                      "선이 프레임에 잘 보이는 프레임에서 다시 시도")
@@ -3445,8 +3531,7 @@ class PtzTab(QWidget):
             return
         ph = self._person_px_height(x, y) or 120.0
         half = int(np.clip(3.0 * ph, 160, 900))
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
+        with self._busy("주변 사람 재검출 (YOLO 타일)"):
             frame = self._native_frame(f)
             if frame is None:
                 return
@@ -3460,8 +3545,6 @@ class PtzTab(QWidget):
             imgsz = int(np.clip(2 * half, 320, 1280)) // 32 * 32
             r = self._adhoc.predict(crop, imgsz=imgsz, conf=0.1,
                                     classes=[0], verbose=False)[0]
-        finally:
-            QApplication.restoreOverrideCursor()
         # 주변에 여럿 잡혀도 커서를 포함하는 박스 하나만 채택
         # (포함 박스가 여럿이면 가장 작은 것 = 가장 특정한 것).
         best, best_key = None, None
