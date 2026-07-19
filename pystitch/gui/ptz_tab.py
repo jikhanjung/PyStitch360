@@ -1346,7 +1346,8 @@ class PtzTab(QWidget):
         st = QSettings("PyStitch360", "PyStitch360")
         for cb, key in ((self.check_players, "ptz_show_players"),
                         (self.check_ball, "ptz_show_ball"),
-                        (self.check_crop, "ptz_show_crop")):
+                        (self.check_crop, "ptz_show_crop"),
+                        (self.check_radar, "ptz_show_radar")):
             cb.setChecked(st.value(key, "true") == "true")
             cb.toggled.connect(
                 lambda on, k=key: (QSettings("PyStitch360", "PyStitch360")
@@ -1445,15 +1446,17 @@ class PtzTab(QWidget):
         self.pane.pressed.connect(self._pane_pressed)
         self.pane.drag_moved.connect(self._pane_dragged)
         self.pane.released.connect(self._pane_released)
-        # 우상단 오버레이 체크박스: 선수/공/크롭 박스 표시 토글
+        # 우상단 오버레이 체크박스: 선수/공/크롭 박스/레이더 표시 토글
         self.check_players = QCheckBox("선수")
         self.check_ball = QCheckBox("공")
         self.check_crop = QCheckBox("크롭 박스")
+        self.check_radar = QCheckBox("레이더")
         ov = QVBoxLayout(self.pane)
         ov.setContentsMargins(8, 8, 8, 8)
         ov_row = QHBoxLayout()
         ov_row.addStretch(1)
-        for cb in (self.check_players, self.check_ball, self.check_crop):
+        for cb in (self.check_players, self.check_ball, self.check_crop,
+                   self.check_radar):
             cb.setChecked(True)
             cb.setStyleSheet(
                 "QCheckBox { color: white; background: rgba(20,20,20,150);"
@@ -2835,7 +2838,8 @@ class PtzTab(QWidget):
                     g = ground_positions([[bb[0], bb[1], 0.0, 0.0]],
                                          self.pano_w, self.pano_h)
                     ball_g = (g[0][0], cy0 + g[0][1]) if g else None
-            self._draw_radar_overlay(frame, radar_pts, ball_g)
+            if self.check_radar.isChecked():
+                self._draw_radar_overlay(frame, radar_pts, ball_g)
         # 경기장 탭: 랜드마크 마커 + (캘리브레이션 후) 예상 경기장 선
         if self._field_tab_active() or self.btn_field_pick.isChecked():
             if self._field_calib is not None:
