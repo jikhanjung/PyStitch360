@@ -85,6 +85,7 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self):
         m = self.menuBar().addMenu("파일(&F)")
+        m.addAction("새 프로젝트", self._new_project)
         m.addAction("프로젝트 열기...", self._open_project)
         self._recent_menu = m.addMenu("최근 프로젝트")
         m.addAction("프로젝트 저장", self._save_project)
@@ -255,6 +256,27 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"PyStitch360 — {self.project_path.name}")
         self.log(f"[project] 저장: {self.project_path}")
         self._remember_recent(self.project_path)
+
+    def _new_project(self):
+        """새 프로젝트 — 초기 상태의 새 메인 윈도우로 교체.
+
+        로드된 영상·세그먼트·PTZ 상태를 필드별로 되돌리는 대신 윈도우를
+        새로 만든다 (초기화 누락 위험 없음). 진행 중 작업은 사라지므로
+        확인을 받는다.
+        """
+        if QMessageBox.question(
+                self, "새 프로젝트",
+                "현재 상태를 닫고 새 프로젝트를 시작할까요?\n"
+                "(저장하지 않은 변경·진행 중 작업은 사라집니다)") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        app = QApplication.instance()
+        app.removeEventFilter(self.ptz_tab)   # 구 윈도우 Space 필터 해제
+        win = MainWindow()
+        win.setGeometry(self.geometry())
+        win.show()
+        app._pystitch_main = win              # 참조 유지 (GC 방지)
+        self.close()
 
     def _open_project(self):
         path, _ = QFileDialog.getOpenFileName(self, "프로젝트 열기", "",
