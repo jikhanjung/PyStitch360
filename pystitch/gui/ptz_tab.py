@@ -204,7 +204,7 @@ class TimelineView(QWidget):
         saved = QSettings("PyStitch360", "PyStitch360").value(
             "ptz_timeline_lanes", None)
         try:
-            self.lane_h = [max(10, min(120, int(v))) for v in saved]
+            self.lane_h = [max(10, min(240, int(v))) for v in saved]
             assert len(self.lane_h) <= len(self.lanes)
             # 레인이 추가된 구버전 저장값은 기본 높이로 채움
             self.lane_h += [self.LANE_H] * (len(self.lanes) - len(self.lane_h))
@@ -389,17 +389,25 @@ class TimelineView(QWidget):
                 return i
         return None
 
+    RESIZE_GAIN = 0.35           # 드래그 감쇠 — 많이 움직여도 조금만 조정
+
     def _apply_lane_resize(self, dy):
-        """진행 중인 경계 드래그 적용 (Shift = 전체 비례)."""
+        """진행 중인 경계 드래그 적용 (Shift = 전체 비례).
+
+        미세 조정이 가능하도록 감쇠(RESIZE_GAIN)를 둔다. 전체 비례
+        모드는 레인 수 배가 아니라 합계 기준 — 구버전은 dy×레인 수라
+        9배 속도로 움직여 원하는 크기에 세우기 어려웠다.
+        """
         i, orig = self._resize["lane"], self._resize["orig"]
         if self._resize["all"]:
             total0 = sum(orig)
-            factor = max(0.3, (total0 + dy * len(orig)) / total0)
-            self.lane_h = [max(10, min(120, int(round(h * factor))))
+            factor = max(0.3, (total0 + dy * self.RESIZE_GAIN * 3) / total0)
+            self.lane_h = [max(10, min(240, int(round(h * factor))))
                            for h in orig]
         else:
             self.lane_h = list(orig)
-            self.lane_h[i] = max(10, min(120, orig[i] + dy))
+            self.lane_h[i] = max(10, min(240, orig[i]
+                                         + int(round(dy * self.RESIZE_GAIN))))
         self._apply_height()
         self.update()
 
