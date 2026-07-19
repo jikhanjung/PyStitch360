@@ -190,7 +190,8 @@ class TimelineView(QWidget):
     RULER = 16
     LANE_H = 20                  # 기본 레인 높이 (개별 조절 가능)
     GUTTER = 64
-    LANES = ["크롭/KF", "공", "뜬 공", "팀1", "팀2", "기타", "호각", "이벤트"]
+    LANES = ["크롭/KF", "공", "뜬 공", "팀1", "팀2", "기타", "호각", "이벤트",
+             "하이라이트"]
     WHISTLE_MIN_DB = 20.0        # 이 피크 이상만 '확실한 호각'으로 표시
 
     def __init__(self):
@@ -200,7 +201,9 @@ class TimelineView(QWidget):
             "ptz_timeline_lanes", None)
         try:
             self.lane_h = [max(10, min(120, int(v))) for v in saved]
-            assert len(self.lane_h) == len(self.lanes)
+            assert len(self.lane_h) <= len(self.lanes)
+            # 레인이 추가된 구버전 저장값은 기본 높이로 채움
+            self.lane_h += [self.LANE_H] * (len(self.lanes) - len(self.lane_h))
         except Exception:  # noqa: BLE001
             self.lane_h = [self.LANE_H] * len(self.lanes)
         self._apply_height()
@@ -490,18 +493,18 @@ class TimelineView(QWidget):
                 # 긴 호각(킥오프·종료 후보)은 위 눈금까지 강조
                 if t1_ - t0_ >= 0.8:
                     p.drawLine(x_, y + 1, x_ + w_, y + 1)
-        # 이벤트 레인 배경: 하이라이트 구간 바 (후보=호박, 수락=초록, 제외=회색)
+        # 하이라이트 레인: 구간 바 (후보=호박, 수락=초록, 제외=회색)
         if self.highlights and self.total > 1:
-            y, lh = self._lane_rect(7)
+            y, lh = self._lane_rect(8)
             for i, (f0, f1, state, label) in enumerate(self.highlights):
                 x0_, x1_ = self._x(f0), self._x(f1)
                 if x1_ < self.GUTTER or x0_ > W:
                     continue
-                c = {"accept": QColor(110, 210, 70, 170),
+                c = {"accept": QColor(110, 210, 70, 200),
                      "reject": QColor(130, 130, 130, 80)}.get(
-                    state, QColor(255, 176, 32, 150))
-                r = (max(x0_, self.GUTTER), y + 2,
-                     max(3, x1_ - max(x0_, self.GUTTER)), lh - 4)
+                    state, QColor(255, 176, 32, 180))
+                r = (max(x0_, self.GUTTER), y + 3,
+                     max(3, x1_ - max(x0_, self.GUTTER)), lh - 6)
                 p.fillRect(*r, c)
                 if self.selected == ("hl", i):
                     p.setPen(QColor(255, 255, 255))
@@ -589,8 +592,8 @@ class TimelineView(QWidget):
                 d = abs(self._x(f_) - x)
                 if d < bd:
                     best, bd = ("event", i), d
-            if best is not None:
-                return best
+            return best
+        if lane == 8:
             for i, (f0, f1, state, label) in enumerate(self.highlights):
                 if f0 <= f <= f1:
                     return ("hl", i)
@@ -3369,6 +3372,34 @@ class PtzTab(QWidget):
             self.log("[hl] 경기장 캘리브레이션 없음 — 공중볼/속도 규칙 생략됨")
 
     # ------------------------------------------------------ 하이라이트 검수
+    def _add_manual_highlight(self, f=None):
+        """수동 하이라이트 추가 — 자동이 놓친 장면 (빗나간 슛 등).
+
+        f 기준 ±8초, f=None 이면 현재 IN/OUT 마커 구간. 수동 추가는
+        검수가 끝난 것이므로 바로 수락 상태 — 재생성해도 보존된다.
+        """
+        if f is None:
+            r = self._norm_export_range()
+            if r is None:
+                return
+            t0, t1 = r[0] / self.fps, r[1] / self.fps
+        else:
+            t0 = max(0.0, f / self.fps - 8.0)
+            t1 = min(self.total / self.fps, f / self.fps + 8.0)
+        from PyQt6.QtWidgets import QInputDialog
+        label, ok = QInputDialog.getText(
+            self, "하이라이트 추가",
+            f"{self._hms(t0)} ~ {self._hms(t1)} 라벨 (예: 빗나간 슛):")
+        if not ok or not label.strip():
+            return
+        self.highlights.append({"t0": round(t0, 2), "t1": round(t1, 2),
+                                "kinds": ["user"], "label": label.strip(),
+                                "score": 5.0, "state": "accept"})
+        self.highlights.sort(key=lambda h: h["t0"])
+        self._save_highlights()
+        self.log(f"[hl] 수동 하이라이트 '{label.strip()}' "
+                 f"{self._hms(t0)}~{self._hms(t1)} (수락 상태)")
+
     def _set_hl_state(self, i, state):
         if not 0 <= i < len(self.highlights):
             return
@@ -3569,6 +3600,12 @@ class PtzTab(QWidget):
         for i in near:
             menu.addAction(f"이벤트 '{self.user_events[i][1]}' 삭제",
                            lambda _=False, ii=i: self._del_user_event(ii))
+        menu.addSeparator()
+        menu.addAction("여기에 하이라이트 추가 (±8초)...",
+                       lambda: self._add_manual_highlight(f))
+        if self._norm_export_range():
+            menu.addAction("IN/OUT 마커 구간 → 새 하이라이트...",
+                           lambda: self._add_manual_highlight(None))
         hl = [i for i, h in enumerate(self.highlights)
               if h["t0"] * self.fps <= f <= h["t1"] * self.fps]
         for i in hl:
