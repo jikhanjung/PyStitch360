@@ -3089,9 +3089,7 @@ class PtzTab(QWidget):
             for r in (0, 1):
                 sub.addAction(self._role_name(r),
                               lambda _=False, rr=r, t=tid: self._set_role(t, rr))
-                self._fill_num_menu(
-                    sub.addMenu(f"  ↳ {self._role_name(r)} 번호 지정"),
-                    tid, r)
+                self._add_num_items(sub, tid, r)
             for r in (5, 6):
                 sub.addAction(self._role_name(r),
                               lambda _=False, rr=r, t=tid:
@@ -3586,8 +3584,12 @@ class PtzTab(QWidget):
         self.log(f"[ptz] {self.team_names[team]} 명단 "
                  f"{len(self.rosters[team])}명 저장")
 
-    def _fill_num_menu(self, nsub, tid, team):
-        """번호 지정 서브메뉴: 명단 + 기입력 번호 + 직접 입력 + 명단 편집."""
+    def _add_num_items(self, sub, tid, team):
+        """팀 이름 바로 아래 들여쓴 번호/이름 항목 (서브메뉴 없이 선택).
+
+        선택 = 그 팀 + 그 번호 지정. 직접 입력·명단 편집·해제는 맨 뒤
+        작은 서브메뉴 하나로.
+        """
         cur = self._num_of(tid)
         used = {}                        # 번호 → 이미 쓴 대표 tid
         for t, n in self.player_nums.items():
@@ -3604,17 +3606,16 @@ class PtzTab(QWidget):
             mark = " ✓" if cur == num else (
                 f"  (#{used[num]})" if num in used
                 and used[num] != self._rep(tid) else "")
-            nsub.addAction(label + mark,
-                           lambda _=False, n=num:
-                           self._set_player_num(tid, team, n))
-        if entries:
-            nsub.addSeparator()
-        nsub.addAction("직접 입력...",
+            sub.addAction("      " + label + mark,
+                          lambda _=False, n=num:
+                          self._set_player_num(tid, team, n))
+        more = sub.addMenu("      번호 입력/명단...")
+        more.addAction("직접 입력...",
                        lambda: self._input_player_num(tid, team))
-        nsub.addAction(f"{self.team_names[team]} 명단 입력/수정...",
+        more.addAction(f"{self.team_names[team]} 명단 입력/수정...",
                        lambda: self._edit_roster(team))
         if cur:
-            nsub.addAction(f"등번호 해제 ({cur}번)",
+            more.addAction(f"등번호 해제 ({cur}번)",
                            lambda: self._clear_player_num(tid))
 
     def _edit_team_names(self):
@@ -4529,7 +4530,8 @@ class PtzTab(QWidget):
         with self._busy("트랙릿 병합 제안 (시공간 × 유니폼색 × 역할)"):
             summ = tracklet_summaries(self.analysis, self._field_calib)
             roles_eff = {t: self._role_of(t) for t in summ}
-            links = suggest_links(summ, roles_eff)
+            nums_eff = {t: self._num_of(t) for t in summ}
+            links = suggest_links(summ, roles_eff, nums=nums_eff)
             all_links = ([(a, b) for a, b, _ in links]
                          + list(self.merges.items()))
             self.merges = merge_map(all_links,
@@ -4542,6 +4544,11 @@ class PtzTab(QWidget):
 
     def _merges_changed(self):
         self._ar_side_cache = {}
+        # 등번호를 새 대표로 이관 (충돌 시 대표 기존 번호 우선)
+        for t in list(self.player_nums):
+            rep = self._rep(t)
+            if rep != t:
+                self.player_nums.setdefault(rep, self.player_nums.pop(t))
         self._save_keyframes()
         self._refresh_team_label()
         self._refresh_player_list()
@@ -4580,6 +4587,13 @@ class PtzTab(QWidget):
 
     def _merge_tracklets(self, tids):
         """선택 트랙릿 수동 병합 — 기존 그룹과 union (빠진 조각 추가 포함)."""
+        nums = {self._num_of(t) for t in tids} - {None}
+        if len(nums) > 1:
+            QMessageBox.warning(
+                self, "병합",
+                "등번호가 다른 선수는 병합할 수 없습니다: "
+                + ", ".join(sorted(nums)) + "번")
+            return
         from ..core.tracklets import merge_map
         spans, _ = self._player_cache()
         links = ([(tids[0], t) for t in tids[1:]]

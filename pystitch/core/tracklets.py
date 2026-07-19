@@ -56,13 +56,14 @@ def tracklet_summaries(analysis, calib, edge_k=5, min_det=3):
     return out
 
 
-def suggest_links(summ, roles, max_gap_s=3.0, speed_mps=8.0, base_m=2.0,
-                  color_thr=60.0, overlap_tol_s=0.3):
+def suggest_links(summ, roles, nums=None, max_gap_s=3.0, speed_mps=8.0,
+                  base_m=2.0, color_thr=60.0, overlap_tol_s=0.3):
     """병합 링크 제안 [(a, b, cost), ...] — a 끝 → b 시작 체인.
 
     조건 (P03-3): (a) 시간 겹침 없음 (overlap_tol_s 허용 — 트래커
     경계 지터), (b) Δt < max_gap_s 이고 필드 거리 < Δt×speed + base,
-    (c) 색 거리 < color_thr, (d) 유효 역할 일치. 그리디(비용 순)로
+    (c) 색 거리 < color_thr, (d) 유효 역할 일치, (e) 등번호가 서로
+    다르면 다른 사람 (nums={tid: 번호|None}). 그리디(비용 순)로
     트랙릿당 후속/선행 각 1개만 — 체인 병합.
     """
     ids = sorted(summ, key=lambda t: summ[t]["t0"])
@@ -86,6 +87,10 @@ def suggest_links(summ, roles, max_gap_s=3.0, speed_mps=8.0, base_m=2.0,
                 continue
             if roles.get(a, 2) != roles.get(b, 2):
                 continue
+            if nums:
+                na, nb = nums.get(a), nums.get(b)
+                if na and nb and na != nb:
+                    continue             # 등번호 불일치 = 다른 사람
             cands.append((a, b, d / reach + c / color_thr))
     cands.sort(key=lambda x: x[2])
     succ, pred = set(), set()

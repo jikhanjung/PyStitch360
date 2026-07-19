@@ -39,6 +39,18 @@ def test_role_gate():
     assert (1, 2) not in pairs
 
 
+def test_number_gate():
+    """등번호가 다른 트랙릿은 병합 후보에서 제외 (한쪽만 있으면 허용)."""
+    summ = _summ()
+    roles = {t: 0 for t in summ}
+    pairs = {(a, b) for a, b, _ in
+             suggest_links(summ, roles, nums={1: "7", 2: "10"})}
+    assert (1, 2) not in pairs and (2, 3) in pairs   # 3은 번호 없음 → 허용
+    pairs2 = {(a, b) for a, b, _ in
+              suggest_links(summ, roles, nums={1: "7", 2: "7"})}
+    assert (1, 2) in pairs2                           # 같은 번호는 병합
+
+
 def test_single_successor():
     summ = _summ()
     summ[7] = _s(11.6, 19.5, (12, 1), (29, 1), RED)  # 2와 경합
