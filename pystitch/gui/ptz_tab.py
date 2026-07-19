@@ -3681,6 +3681,30 @@ class PtzTab(QWidget):
         self.progress.setFormat("준비 중...")
         w.start()
 
+    def generate_report(self):
+        """분석 메뉴: 팀/선수 히트맵 + 활동량 리포트 (PNG + markdown)."""
+        if self.analysis is None or self.pano_path is None:
+            QMessageBox.information(self, "리포트", "먼저 분석이 필요합니다.")
+            return
+        if self._field_calib is None:
+            QMessageBox.information(self, "리포트",
+                                    "경기장 캘리브레이션이 필요합니다 "
+                                    "(히트맵은 필드 좌표 기준).")
+            return
+        from ..core.report import generate_report
+        out_dir = self.pano_path.with_name(self.pano_path.stem + "_report")
+        spans, _ = self._player_cache()
+        roles_of = {self._rep(t): self._role_of(t) for t in spans}
+        with self._busy("리포트 생성 (히트맵 + 활동량)"):
+            r = generate_report(
+                self.analysis, self._field_calib, roles_of, out_dir,
+                merges=dict(self.merges),
+                team_names=tuple(self.team_names), log=self.log)
+        QMessageBox.information(
+            self, "리포트",
+            f"{len(r['files'])}개 파일 생성:\n{r['dir']}\n\n"
+            f"선수 {len(r['rows'])}명 (players.md 요약표 포함)")
+
     # ------------------------------------------------------ 경기 정보/시계
     def edit_match_info(self):
         """분석 메뉴: 경기 정보 (시계 앵커·하프·중단 구간) 입력."""

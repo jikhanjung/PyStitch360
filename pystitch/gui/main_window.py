@@ -101,6 +101,8 @@ class MainWindow(QMainWindow):
                     lambda: self.ptz_tab.export_highlights())
         a.addAction("경기 정보 (시계 앵커·중단 구간)...",
                     lambda: self.ptz_tab.edit_match_info())
+        a.addAction("선수 히트맵/활동량 리포트",
+                    lambda: self.ptz_tab.generate_report())
         a.addSeparator()
         a.addAction("공/키프레임 편집 초기화",
                     lambda: self.ptz_tab.reset_edits("ball"))
