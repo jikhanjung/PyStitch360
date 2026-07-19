@@ -1305,10 +1305,13 @@ class PtzTab(QWidget):
         self.match_info: dict | None = None  # 경기 정보 (하프·앵커·중단)
         self._referees: dict = {}         # .events.json "referees" (근/원측 선심)
         self._radar_palette: dict = {}    # {역할: BGR} 레이더 오버레이 색
+        self._radar_smooth: dict = {}     # {tid: [x, y]} 미니맵 EMA 상태
+        self._radar_smooth_f = None       # EMA 마지막 프레임 (점프 리셋용)
         self.roles: dict[int, int] = {}   # {track_id: 역할} 사용자 지정 (GK 등)
         self.merges: dict[int, int] = {}  # {tid: 대표 tid} 트랙릿 병합 (비파괴)
         self.player_nums: dict[int, str] = {}  # {대표 tid: 등번호}
         self.rosters: dict[int, list] = {}     # {팀: ["7 이름", ...]} 명단
+        self.hidden_players: set[int] = set()  # 숨긴 대표 tid (관중·오인식)
         self.field_points: dict[str, list] = {}   # {랜드마크키: [x, y]}
         self.line_points: list[list] = []  # 흰 선 검출 샘플 [x, y] (사이드라인)
         self.field_size = [105.0, 68.0]   # 경기장 길이×폭 (m)
@@ -1357,7 +1360,8 @@ class PtzTab(QWidget):
         for cb, key in ((self.check_players, "ptz_show_players"),
                         (self.check_ball, "ptz_show_ball"),
                         (self.check_crop, "ptz_show_crop"),
-                        (self.check_radar, "ptz_show_radar")):
+                        (self.check_radar, "ptz_show_radar"),
+                        (self.check_radar_smooth, "ptz_radar_smooth")):
             cb.setChecked(st.value(key, "true") == "true")
             cb.toggled.connect(
                 lambda on, k=key: (QSettings("PyStitch360", "PyStitch360")
@@ -1375,6 +1379,51 @@ class PtzTab(QWidget):
         self._plan_timer.timeout.connect(self._run_plan)
         self._save_timer = QTimer(singleShot=True, interval=1500)
         self._save_timer.timeout.connect(self._write_sidecar)
+
+    def _smooth_radar(self, pts, ball_g, f):
+        """미니맵 EMA 스무딩 — 검출 지터(±0.3m) 완화.
+
+        pts = [(tid|None, x, y, role)]. tid 기준 상태 유지, 시간 점프
+        (>3s)면 리셋. tid 없는 점(주입 검출)은 스무딩 없이 통과.
+        반환: ([(x, y, role)], ball).
+        """
+        if not self.check_radar_smooth.isChecked():
+            self._radar_smooth = {}
+            self._radar_smooth_f = None
+            return [(x, y, r) for _t, x, y, r in pts], ball_g
+        if self._radar_smooth_f is None \
+                or abs(f - self._radar_smooth_f) > 3 * self.fps:
+            self._radar_smooth = {}
+        self._radar_smooth_f = f
+        a = 0.45
+        st = self._radar_smooth
+        out = []
+        seen = set()
+        for tid, x, y, role in pts:
+            if tid is None:
+                out.append((x, y, role))
+                continue
+            p = st.get(tid)
+            if p is None:
+                st[tid] = p = [x, y]
+            else:
+                p[0] += a * (x - p[0])
+                p[1] += a * (y - p[1])
+            seen.add(tid)
+            out.append((p[0], p[1], role))
+        if ball_g is not None:
+            p = st.get("__ball__")
+            if p is None:
+                st["__ball__"] = p = list(ball_g)
+            else:
+                p[0] += a * (ball_g[0] - p[0])
+                p[1] += a * (ball_g[1] - p[1])
+            seen.add("__ball__")
+            ball_g = (p[0], p[1])
+        for k in list(st):               # 사라진 트랙 상태 정리
+            if k not in seen:
+                del st[k]
+        return out, ball_g
 
     def _draw_radar_overlay(self, frame, pts, ball_g):
         """우하단 반투명 탑다운 레이더 — 내보내기(draw_radar_panel)와 동일."""
@@ -1467,12 +1516,14 @@ class PtzTab(QWidget):
         self.check_ball = QCheckBox("공")
         self.check_crop = QCheckBox("크롭 박스")
         self.check_radar = QCheckBox("레이더")
+        self.check_radar_smooth = QCheckBox("스무딩")
+        self.check_radar_smooth.setToolTip("미니맵 위치 지터 완화 (EMA)")
         ov = QVBoxLayout(self.pane)
         ov.setContentsMargins(8, 8, 8, 8)
         ov_row = QHBoxLayout()
         ov_row.addStretch(1)
         for cb in (self.check_players, self.check_ball, self.check_crop,
-                   self.check_radar):
+                   self.check_radar, self.check_radar_smooth):
             cb.setChecked(True)
             cb.setStyleSheet(
                 "QCheckBox { color: white; background: rgba(20,20,20,150);"
@@ -1959,6 +2010,7 @@ class PtzTab(QWidget):
         self.merges = {}
         self.player_nums = {}
         self.rosters = {}
+        self.hidden_players = set()
         sp = self._sidecar_path()
         doc = None
         if sp.exists():
@@ -1999,6 +2051,8 @@ class PtzTab(QWidget):
                                 (doc.get("player_nums") or {}).items()}
             self.rosters = {int(k): [str(e) for e in v] for k, v in
                             (doc.get("rosters") or {}).items()}
+            self.hidden_players = {int(t) for t in
+                                   doc.get("hidden_players") or []}
             ids = [int(p[4]) for rows in self.extra_players.values()
                    for p in rows]
             self._next_extra_id = max(ids, default=900000) + 1
@@ -2077,7 +2131,9 @@ class PtzTab(QWidget):
                                    "player_nums": {str(t): n for t, n in
                                                    self.player_nums.items()},
                                    "rosters": {str(k): v for k, v in
-                                               self.rosters.items()}}))
+                                               self.rosters.items()},
+                                   "hidden_players":
+                                       sorted(self.hidden_players)}))
         tmp.replace(sp)
 
     def _write_analysis(self):
@@ -2869,7 +2925,8 @@ class PtzTab(QWidget):
                                        [(a, b) for a, b, _ in feet])
                     for (gx, gy), (_, _, tid) in zip(fc, feet):
                         if np.isfinite(gx):
-                            radar_pts.append((gx, gy, self._role_of(tid)))
+                            radar_pts.append((tid if tid >= 0 else None,
+                                              gx, gy, self._role_of(tid)))
                 if si in self._air:                 # 공중볼: 보정 XY 사용
                     ball_g = self._air[si][:2]
                 elif bb is not None:
@@ -2882,13 +2939,15 @@ class PtzTab(QWidget):
                 cy0 = -(self.field_size[1] / 2.0 + 5.0)
                 for X, Y, tid, j in ground_positions(prow, self.pano_w,
                                                      self.pano_h):
-                    radar_pts.append((X, cy0 + Y, self._role_of(tid)))
+                    radar_pts.append((tid if tid >= 0 else None,
+                                      X, cy0 + Y, self._role_of(tid)))
                 if bb is not None:
                     g = ground_positions([[bb[0], bb[1], 0.0, 0.0]],
                                          self.pano_w, self.pano_h)
                     ball_g = (g[0][0], cy0 + g[0][1]) if g else None
             if self.check_radar.isChecked():
-                self._draw_radar_overlay(frame, radar_pts, ball_g)
+                pts, ball_sm = self._smooth_radar(radar_pts, ball_g, f)
+                self._draw_radar_overlay(frame, pts, ball_sm)
         # 경기장 탭: 랜드마크 마커 + (캘리브레이션 후) 예상 경기장 선
         if self._field_tab_active() or self.btn_field_pick.isChecked():
             if self._field_calib is not None:
@@ -3039,6 +3098,9 @@ class PtzTab(QWidget):
             for r in (3, 4):
                 sub.addAction(self._role_name(r),
                               lambda _=False, rr=r, t=tid: self._set_role(t, rr))
+            sub.addSeparator()
+            sub.addAction("이 사람 숨기기 — 선수/심판 아님 (관중·오인식)",
+                          lambda _=False, t=tid: self._hide_player(t))
             if tid in self.roles:
                 sub.addAction("자동 분류로 되돌리기",
                               lambda _=False, t=tid: self._set_role(t, None))
@@ -3324,7 +3386,8 @@ class PtzTab(QWidget):
             for si, prow in enumerate(self.analysis["players"]):
                 f = int(frames[si])
                 for p in prow:
-                    if len(p) >= 5 and p[4] >= 0:
+                    if len(p) >= 5 and p[4] >= 0 \
+                            and self._rep(int(p[4])) not in self.hidden_players:
                         e = spans.get(int(p[4]))
                         if e is None:
                             spans[int(p[4])] = [f, f, 1]
@@ -3335,7 +3398,8 @@ class PtzTab(QWidget):
                 if si < len(frames):
                     f = int(frames[si])
                     for p in rows:
-                        spans[int(p[4])] = [f, f, 1]
+                        if self._rep(int(p[4])) not in self.hidden_players:
+                            spans[int(p[4])] = [f, f, 1]
             self._pspans = spans
             self._pcolors = tracklet_colors(self.analysis)
             self._pcache_id = id(self.analysis)
@@ -3369,6 +3433,28 @@ class PtzTab(QWidget):
         name = self._role_name(r)
         num = self._num_of(tid)
         return f"{name} {num}번" if num else name
+
+    def _hide_player(self, tid):
+        """관중·오인식 트랙릿 숨김 (비파괴) — 병합 그룹 단위."""
+        rep = self._rep(tid)
+        self.hidden_players.add(rep)
+        self._pcache_id = None
+        self._save_keyframes()
+        self._refresh_team_label()
+        self._refresh_player_list()
+        self._redraw()
+        self.log(f"[ptz] #{rep} 숨김 (관중·오인식) — 선수 목록 우클릭 "
+                 f"\"숨긴 사람 복원\" 또는 역할 초기화로 되돌림")
+
+    def _unhide_players(self):
+        n = len(self.hidden_players)
+        self.hidden_players = set()
+        self._pcache_id = None
+        self._save_keyframes()
+        self._refresh_team_label()
+        self._refresh_player_list()
+        self._redraw()
+        self.log(f"[ptz] 숨긴 사람 {n}명 복원")
 
     # ------------------------------------------------------ 등번호
     def _num_of(self, tid):
@@ -4033,6 +4119,7 @@ class PtzTab(QWidget):
             self.roles = {}
             self.merges = {}
             self.player_nums = {}
+            self.hidden_players = set()
             self.extra_players = {}
             self.kit_colors = {}
             self._pcache_id = None
@@ -4373,6 +4460,10 @@ class PtzTab(QWidget):
                 menu.addAction(
                     f"그룹 해체 — #{rep} 외 {len(group) - 1}개 전부 분리",
                     lambda: self._dissolve_group(rep))
+        if self.hidden_players:
+            menu.addSeparator()
+            menu.addAction(f"숨긴 사람 {len(self.hidden_players)}명 전부 복원",
+                           self._unhide_players)
         if not menu.isEmpty():
             menu.exec(self.player_list.mapToGlobal(pos))
 
@@ -4635,11 +4726,20 @@ class PtzTab(QWidget):
             self.log(f"[field] {msg}")
 
     def _players_row(self, si):
-        """샘플 si 의 선수 행: 분석 + 사용자 수동 검출(extra) 합침."""
+        """샘플 si 의 선수 행: 분석 + 수동 검출(extra), 숨김 제외.
+
+        숨김(hidden_players, 관중·오인식)은 비파괴 — 분석 원본은 그대로,
+        표시·목록·레이더에서만 빠진다. 병합 그룹 단위(대표 tid) 적용.
+        """
         if self.analysis is None or si is None:
             return []
-        return list(self.analysis["players"][si]) \
+        rows = list(self.analysis["players"][si]) \
             + self.extra_players.get(int(si), [])
+        if not self.hidden_players:
+            return rows
+        return [p for p in rows
+                if len(p) < 5 or p[4] < 0
+                or self._rep(int(p[4])) not in self.hidden_players]
 
     def _person_px_height(self, x, y):
         """(x, y) 지점에 선 사람(1.8m)의 예상 픽셀 키 — 캘리브레이션 기준.
