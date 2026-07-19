@@ -156,3 +156,8 @@ Thumbs.db
 
 # YOLO 자동 다운로드 가중치
 /*.pt
+
+# 다운로드 중간 파일 (yt-dlp 등)
+*.part
+*.webm
+*.ytdl
