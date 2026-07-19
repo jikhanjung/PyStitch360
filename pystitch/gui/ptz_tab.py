@@ -1129,6 +1129,38 @@ class MatchInfoDialog(QDialog):
                 "pauses": self._pauses}
 
 
+class OcrWorker(QThread):
+    """등번호 OCR (근측) — easyocr 로딩·프레임 시크가 느려 백그라운드."""
+
+    progress = pyqtSignal(int, int, float)
+    log = pyqtSignal(str)
+    done = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, pano_path, analysis, picked):
+        super().__init__()
+        self.args = (pano_path, analysis, picked)
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        pano, analysis, picked = self.args
+        try:
+            from ..core.ocr import run_jersey_ocr
+            out = run_jersey_ocr(
+                pano, analysis, picked,
+                progress=lambda d, t, f: self.progress.emit(d, t, f),
+                cancel=lambda: self._cancel,
+                log=lambda s: self.log.emit(s))
+            self.done.emit(out)
+        except ImportError:
+            self.failed.emit("easyocr 미설치 — pip install easyocr")
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(str(e))
+
+
 class HighlightBatchWorker(QThread):
     """수락 하이라이트 구간들을 개별 클립으로 순차 렌더 (계획 1회 재사용)."""
 
@@ -4115,6 +4147,64 @@ class PtzTab(QWidget):
             self, "리포트",
             f"{len(r['files'])}개 파일 생성:\n{r['dir']}\n\n"
             f"선수 {len(r['rows'])}명 (players.md 요약표 포함)")
+
+    def run_jersey_ocr(self):
+        """분석 메뉴: 등번호 OCR — 근측 절반 선수만 (devlog 040)."""
+        if self.analysis is None or self.pano_path is None:
+            QMessageBox.information(self, "등번호 OCR", "먼저 분석이 필요합니다.")
+            return
+        if self._field_calib is None:
+            QMessageBox.information(self, "등번호 OCR",
+                                    "경기장 캘리브레이션이 필요합니다 "
+                                    "(근측 게이트에 필드 좌표 사용).")
+            return
+        w_old = getattr(self, "_ocr_worker", None)
+        if w_old is not None and w_old.isRunning():
+            w_old.cancel()
+            self.log("[ocr] 취소 요청")
+            return
+        from ..core.ocr import collect_ocr_candidates
+        picked = collect_ocr_candidates(self.analysis, self._field_calib,
+                                        self._role_of, self._rep)
+        if not picked:
+            QMessageBox.information(
+                self, "등번호 OCR",
+                "근측 후보가 없습니다 (필드 Y<0, 박스 높이 ≥90px).")
+            return
+        n_rep = len({r for _, _, r in picked})
+        if QMessageBox.question(
+                self, "등번호 OCR",
+                f"근측 트랙릿 {n_rep}개, 크롭 {len(picked)}장을 인식합니다 "
+                f"(easyocr, 수 분 예상). 진행할까요?") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        w = OcrWorker(str(self.pano_path), self.analysis, picked)
+        w.progress.connect(lambda d, t, f: (
+            self.progress.setRange(0, t), self.progress.setValue(d),
+            self.progress.setFormat(f"OCR %p% ({f:.1f}장/s)")))
+        w.log.connect(self.log)
+        w.done.connect(self._ocr_done)
+        w.failed.connect(lambda m: self.log(f"[ocr] 실패: {m}"))
+        self._ocr_worker = w
+        self.log(f"[ocr] 시작: 근측 트랙릿 {n_rep}개, 크롭 {len(picked)}장")
+        w.start()
+
+    def _ocr_done(self, out):
+        self.progress.setRange(0, 1)
+        self.progress.setValue(1)
+        self.progress.setFormat("OCR 완료")
+        try:
+            from ..core.events import save_events
+            save_events(self.pano_path, ocr_numbers=out)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"[ocr] 저장 실패: {e}")
+        self._ocr_nums = {int(k): v for k, v in out.items()}
+        agree = sum(1 for k, v in self._ocr_nums.items()
+                    if self._num_of(k) == v["num"])
+        conflict = sum(1 for k, v in self._ocr_nums.items()
+                       if self._num_of(k) and self._num_of(k) != v["num"])
+        self.log(f"[ocr] 제안 {len(out)}건 (기존 지정과 일치 {agree}, "
+                 f"충돌 {conflict}) — 선수 우클릭 번호 메뉴에 'OCR 제안'")
 
     # ------------------------------------------------------ 경기 정보/시계
     def edit_match_info(self):
