@@ -15,9 +15,10 @@ from PyQt6.QtCore import QSettings, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QCheckBox
 from PyQt6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
-    QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel,
-    QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar,
-    QPushButton, QSlider, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
+    QColorDialog, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout,
+    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMenu, QMessageBox,
+    QProgressBar, QPushButton, QSlider, QSpinBox, QTabWidget, QVBoxLayout,
+    QWidget,
 )
 
 from ..core.encoders import available_encoders
@@ -26,9 +27,9 @@ from ..core.field import (
     fit_field_calibration, landmark_positions, pano_to_field,
 )
 from ..core.ptz import (
-    accept_ball_tracks, analyze_video, build_plan, classify_teams,
-    ground_positions, link_ball_tracks, ptz_available, render_plan,
-    same_spot_spans, tracklet_colors,
+    accept_ball_tracks, analyze_video, build_plan, build_radar_data,
+    classify_teams, ground_positions, link_ball_tracks, ptz_available,
+    render_plan, same_spot_spans, tracklet_colors,
 )
 from .widgets import FramePane
 
@@ -589,10 +590,11 @@ class PtzRenderWorker(QThread):
     failed = pyqtSignal(str)
 
     def __init__(self, pano_path, out_path, analysis, keyframes, codec, crf,
-                 wide=False, ignores=None, far_zoom=1.0, promotes=None):
+                 wide=False, ignores=None, far_zoom=1.0, promotes=None,
+                 radar=None):
         super().__init__()
         self.args = (pano_path, out_path, analysis, keyframes, codec, crf, wide,
-                     ignores or [], far_zoom, promotes or [])
+                     ignores or [], far_zoom, promotes or [], radar)
         self._cancel = False
 
     def cancel(self):
@@ -600,7 +602,7 @@ class PtzRenderWorker(QThread):
 
     def run(self):
         (pano, out, analysis, kfs, codec, crf, wide, ignores, far_zoom,
-         promotes) = self.args
+         promotes, radar) = self.args
         try:
             out_w, out_h = (2560, 1080) if wide else (1920, 1080)
             plan = build_plan(analysis, analysis["pano_w"], analysis["pano_h"],
@@ -615,7 +617,7 @@ class PtzRenderWorker(QThread):
                         codec=codec, crf=crf,
                         log=lambda s: self.log.emit(s),
                         progress=lambda d, t, f: self.progress.emit(d, t, f),
-                        cancel=lambda: self._cancel)
+                        cancel=lambda: self._cancel, radar=radar)
             if self._cancel:
                 self.failed.emit("취소됨")
             else:
@@ -669,6 +671,7 @@ class PtzTab(QWidget):
         self._linked = None
         self._teams = {}
         self._role_colors: dict[int, tuple] = {}   # 역할별 유니폼 대표색(BGR)
+        self.kit_colors: dict[int, list] = {}      # 사용자 지정 표시 색(BGR)
         self._play_worker = None
         self._playing = False
         self._proxy_worker = None
@@ -742,6 +745,15 @@ class PtzTab(QWidget):
         self.btn_play = _tbtn("▶", "재생/정지 (Space)", self._toggle_play, 0, 0)
         _tbtn("|◀", "이전 공 트랙으로", lambda: self._jump_track(-1), 0, 1)
         _tbtn("▶|", "다음 공 트랙으로", lambda: self._jump_track(1), 0, 2)
+        # 빈 곳 클릭 모드: 공(수동 공 위치, 줌 자동) / KF(크롭 키프레임)
+        self.btn_mode_ball = _tbtn("공", "빈 곳 클릭 = 수동 공 위치 (줌 자동)",
+                                   lambda: self._set_click_mode(True), 0, 3)
+        self.btn_mode_kf = _tbtn("KF", "빈 곳 클릭 = 크롭 키프레임 "
+                                 "(현재 계획 폭 고정)",
+                                 lambda: self._set_click_mode(False), 0, 4)
+        for b in (self.btn_mode_ball, self.btn_mode_kf):
+            b.setCheckable(True)
+        self.btn_mode_ball.setChecked(True)
         for col, (text, tip, d) in enumerate(
                 [("≪", "-10초", -300), ("<", "-1초", -30), ("‹", "-1프레임", -1),
                  ("›", "+1프레임", 1), (">", "+1초", 30), ("≫", "+10초", 300)]):
@@ -782,7 +794,8 @@ class PtzTab(QWidget):
         self.track_list.currentRowChanged.connect(lambda _: self._goto_track())
         for key in (Qt.Key.Key_Right, Qt.Key.Key_Delete):   # → 또는 Del = 오인식
             QShortcut(QKeySequence(key), self.track_list,
-                      activated=self._ignore_selected_track,
+                      activated=lambda: self._ignore_selected_track(
+                          advance=True),   # 키보드 검수: 다음 항목으로 이동
                       context=Qt.ShortcutContext.WidgetShortcut)
         col_ball.addWidget(self.track_list, 1)
         ball_strip.addLayout(col_ball, 2)
@@ -818,9 +831,28 @@ class PtzTab(QWidget):
         w_players = QWidget()
         pl = QVBoxLayout(w_players)
         pl.setContentsMargins(0, 2, 0, 0)
+        # 유니폼 색 범례: 역할별 스와치 버튼(클릭=컬러피커) + 인원수
+        legend = QHBoxLayout()
+        legend.setSpacing(4)
         self.lbl_team_colors = QLabel("팀 색: 분석 후 표시")
-        self.lbl_team_colors.setTextFormat(Qt.TextFormat.RichText)
-        pl.addWidget(self.lbl_team_colors)
+        legend.addWidget(self.lbl_team_colors)
+        self._kit_btns, self._kit_lbls = {}, {}
+        for r in (0, 1, 3, 4, 5):
+            b = QPushButton()
+            b.setFixedSize(26, 18)
+            b.setToolTip(f"{ROLE_NAMES[r]} 표시 색 — 클릭: 색 선택, "
+                         "우클릭: 측정색으로 되돌리기")
+            b.clicked.connect(lambda _=False, rr=r: self._pick_kit_color(rr))
+            b.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            b.customContextMenuRequested.connect(
+                lambda _pos, rr=r: self._reset_kit_color(rr))
+            lb = QLabel("")
+            self._kit_btns[r], self._kit_lbls[r] = b, lb
+            b.hide()
+            legend.addWidget(b)
+            legend.addWidget(lb)
+        legend.addStretch(1)
+        pl.addLayout(legend)
         self.player_list = QListWidget()
         self.player_list.setSelectionMode(
             QListWidget.SelectionMode.ExtendedSelection)
@@ -932,6 +964,17 @@ class PtzTab(QWidget):
         bottom.addWidget(QLabel("CRF/CQ"))
         self.spin_crf = QSpinBox(minimum=10, maximum=35, value=20)
         bottom.addWidget(self.spin_crf)
+        self.check_export_radar = QCheckBox("레이더")
+        self.check_export_radar.setToolTip(
+            "출력 우하단에 반투명 탑다운 레이더(선수·공) 합성 — "
+            "경기장 사각형은 입력한 크기 비율 그대로")
+        self.check_export_radar.setChecked(
+            QSettings("PyStitch360", "PyStitch360")
+            .value("ptz_export_radar", "true") == "true")
+        self.check_export_radar.toggled.connect(
+            lambda v: QSettings("PyStitch360", "PyStitch360")
+            .setValue("ptz_export_radar", "true" if v else "false"))
+        bottom.addWidget(self.check_export_radar)
         self.btn_export = QPushButton("PTZ 내보내기...")
         self.btn_export.setEnabled(False)
         self.btn_export.clicked.connect(self._start_render)
@@ -1068,6 +1111,7 @@ class PtzTab(QWidget):
         self.field_points = {}
         self.line_points = []
         self.extra_players = {}
+        self.kit_colors = {}
         sp = self._sidecar_path()
         doc = None
         if sp.exists():
@@ -1088,6 +1132,8 @@ class PtzTab(QWidget):
             self.extra_players = {int(si): [list(p) for p in rows]
                                   for si, rows in
                                   (doc.get("extra_players") or {}).items()}
+            self.kit_colors = {int(r): [int(v) for v in c] for r, c in
+                               (doc.get("kit_colors") or {}).items()}
             ids = [int(p[4]) for rows in self.extra_players.values()
                    for p in rows]
             self._next_extra_id = max(ids, default=900000) + 1
@@ -1154,7 +1200,8 @@ class PtzTab(QWidget):
                                    "field_points": self.field_points,
                                    "field_size": self.field_size,
                                    "line_points": self.line_points,
-                                   "extra_players": self.extra_players}))
+                                   "extra_players": self.extra_players,
+                                   "kit_colors": self.kit_colors}))
         tmp.replace(sp)
 
     def _write_analysis(self):
@@ -1473,10 +1520,18 @@ class PtzTab(QWidget):
             self._mark_dirty_and_redraw()
             self.log(f"[ptz] 무시 해제 {f/self.fps:.1f}s ({removed}개 구간)")
 
-    def _add_keyframe(self, f, x, y):
+    def _set_click_mode(self, ball: bool):
+        self.btn_mode_ball.setChecked(ball)
+        self.btn_mode_kf.setChecked(not ball)
+
+    def _add_keyframe(self, f, x, y, width=None):
+        """빈 곳 클릭 마크: 3요소 = 공(줌 자동), 4요소 = 크롭 키프레임."""
         self.keyframes = [k for k in self.keyframes
                           if abs(k[0] - f) > 0.5 * self.fps]
-        self.keyframes.append([f, round(x, 1), round(y, 1)])
+        entry = [f, round(x, 1), round(y, 1)]
+        if width is not None:
+            entry.append(round(float(width), 1))
+        self.keyframes.append(entry)
         self.keyframes.sort()
         self._save_keyframes()
         self._refresh_kf_list()
@@ -1485,7 +1540,33 @@ class PtzTab(QWidget):
                                promotes=self.promotes)
         self._plan_dirty()
         self._redraw()
-        self.log(f"[ptz] 키프레임 {f/self.fps:.1f}s → ({x:.0f}, {y:.0f})")
+        kind = "키프레임" if width is not None else "수동 공"
+        self.log(f"[ptz] {kind} {f/self.fps:.1f}s → ({x:.0f}, {y:.0f})")
+
+    def _toggle_kf_type(self, i):
+        """공(3요소) ↔ 크롭 키프레임(4요소, 현재 계획 폭) 전환."""
+        if not (0 <= i < len(self.keyframes)):
+            return
+        k = self.keyframes[i]
+        if len(k) > 3:
+            self.keyframes[i] = k[:3]
+            self.log(f"[ptz] {k[0]/self.fps:.1f}s 키프레임 → 공 (줌 자동)")
+        else:
+            f = int(k[0])
+            if self.plan is None or f >= len(self.plan["crop_w"]):
+                self.log("[ptz] 계획이 아직 없어 폭을 정할 수 없음")
+                return
+            self.keyframes[i] = [k[0], k[1], k[2],
+                                 round(float(self.plan["crop_w"][f]), 1)]
+            self.log(f"[ptz] {k[0]/self.fps:.1f}s 공 → 키프레임 "
+                     f"(폭 {self.keyframes[i][3]:.0f} 고정)")
+        self._save_keyframes()
+        self._refresh_kf_list()
+        self.trackbar.set_data(self.total, self.track_spans,
+                               self.ignores, self.keyframes,
+                               promotes=self.promotes)
+        self._plan_dirty()
+        self._redraw()
 
     def _delete_keyframe_idx(self, i):
         if 0 <= i < len(self.keyframes):
@@ -1743,12 +1824,20 @@ class PtzTab(QWidget):
             if abs(k[0] - f) <= 1.0 * self.fps:
                 kx, ky = float(k[1]), float(k[2])
                 p = (int(kx * sc), int(ky * sc))
-                # 이동 가능 표시: 동서남북 4방향 화살표 마커
-                arm = max(12, int(34 * sc))
                 th = max(2, int(6 * sc))
-                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                    cv2.arrowedLine(frame, p, (p[0] + dx * arm, p[1] + dy * arm),
-                                    (0, 0, 255), th, tipLength=0.45)
+                if len(k) > 3:
+                    # 크롭 키프레임: 동서남북 4방향 화살표 (이동+줌 앵커)
+                    arm = max(12, int(34 * sc))
+                    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        cv2.arrowedLine(frame, p,
+                                        (p[0] + dx * arm, p[1] + dy * arm),
+                                        (0, 0, 255), th, tipLength=0.45)
+                else:
+                    # 수동 공: 주황 이중 링 (공 후보 원과 구별)
+                    cv2.circle(frame, p, max(10, int(26 * sc)),
+                               (0, 140, 255), th)
+                    cv2.circle(frame, p, max(3, int(7 * sc)),
+                               (0, 140, 255), -1)
                 if _is_hover("kf", kx, ky):
                     cv2.circle(frame, p, max(16, int(40 * sc)), (0, 255, 255), 3)
         # 선수 박스(팀 색) + 레이더
@@ -1859,7 +1948,12 @@ class PtzTab(QWidget):
         if o is None:
             if self._box_hit(x, y) is not None:
                 return                      # 박스 테두리 클릭 = 드래그 미수 — 무동작
-            self._add_keyframe(f, x, y)     # 빈 곳 = 키프레임 추가
+            # 빈 곳 = 모드에 따라 수동 공(기본) 또는 크롭 키프레임 추가
+            w = None
+            if self.btn_mode_kf.isChecked() and self.plan is not None \
+                    and int(f) < len(self.plan["crop_w"]):
+                w = float(self.plan["crop_w"][int(f)])
+            self._add_keyframe(f, x, y, width=w)
             return
         if o["kind"] == "kf":               # 키프레임 = 삭제
             self._delete_keyframe_idx(o["i"])
@@ -1882,11 +1976,23 @@ class PtzTab(QWidget):
         x, y = fx * self.pano_w, fy * self.pano_h
         o = self._hit(x, y)
         menu = QMenu(self)
+
+        def _add_kf_here():
+            w = (float(self.plan["crop_w"][int(f)])
+                 if self.plan is not None and int(f) < len(self.plan["crop_w"])
+                 else None)
+            self._add_keyframe(f, x, y, width=w)
+
         if o is None:
-            menu.addAction("여기 키프레임 추가",
+            menu.addAction("여기 수동 공 추가",
                            lambda: self._add_keyframe(f, x, y))
+            menu.addAction("여기 크롭 키프레임 추가", _add_kf_here)
         elif o["kind"] == "kf":
-            menu.addAction("키프레임 삭제",
+            is_kf = len(self.keyframes[o["i"]]) > 3
+            menu.addAction("공으로 전환 (줌 자동)" if is_kf
+                           else "크롭 키프레임으로 전환 (현재 폭 고정)",
+                           lambda: self._toggle_kf_type(o["i"]))
+            menu.addAction("삭제",
                            lambda: self._delete_keyframe_idx(o["i"]))
         else:
             st, ox, oy, si = o["state"], o["x"], o["y"], o["si"]
@@ -1903,7 +2009,7 @@ class PtzTab(QWidget):
                 menu.addAction("이 검출 무시(오인식)",
                                lambda: self._ignore_track_at(f, si, ox, oy))
             menu.addSeparator()
-            menu.addAction("여기 키프레임 추가",
+            menu.addAction("여기 수동 공 추가",
                            lambda: self._add_keyframe(f, x, y))
         tid = self._player_at(x, y)
         if tid is not None:
@@ -1981,6 +2087,17 @@ class PtzTab(QWidget):
     def _refresh_lists(self):
         """위: 공(자동 트랙+수동 키프레임) / 아래: 오인식(무시 구간)."""
         # 위 목록 — 시간순 병합
+        # 재구성 전 선택을 (종류, 시작 프레임) 으로 기억 — 승격/무시로
+        # 목록이 다시 만들어져도 보던 항목을 따라간다 (점프 방지)
+        old_top = getattr(self, "_top", [])
+        cur = self.track_list.currentRow()
+        sel_key = None
+        if 0 <= cur < len(old_top):
+            k, i = old_top[cur]
+            if k == "kf" and i < len(self.keyframes):
+                sel_key = ("kf", self.keyframes[i][0])
+            elif k == "track":
+                sel_key = ("track", None)   # 트랙 인덱스는 재계산됨 — 아래서 위치로
         self._top = ([("track", i) for i in range(len(self.track_spans))]
                      + [("kf", i) for i in range(len(self.keyframes))])
         self._top.sort(key=lambda e: (self.track_spans[e[1]][0] if e[0] == "track"
@@ -1997,11 +2114,23 @@ class PtzTab(QWidget):
             else:
                 k = self.keyframes[i]
                 kf, kx, ky = k[0], k[1], k[2]
-                zoom = f", 폭{k[3]:.0f}" if len(k) > 3 else ""
                 t = kf / self.fps
+                label = (f"◆ 키프레임 ({kx:.0f}, {ky:.0f}, 폭{k[3]:.0f})"
+                         if len(k) > 3 else f"● 수동 공 ({kx:.0f}, {ky:.0f})")
                 self.track_list.addItem(
-                    f"{int(t//60):02d}:{t%60:04.1f}  ● 수동 "
-                    f"({kx:.0f}, {ky:.0f}{zoom})")
+                    f"{int(t//60):02d}:{t%60:04.1f}  {label}")
+        # 선택 복원 (시그널 차단 상태 — 복원이 시크를 유발하지 않게)
+        if sel_key is not None:
+            pos = self.slider.value()
+            for row, (k, i) in enumerate(self._top):
+                if sel_key[0] == "kf" and k == "kf" \
+                        and self.keyframes[i][0] == sel_key[1]:
+                    self.track_list.setCurrentRow(row)
+                    break
+                if sel_key[0] == "track" and k == "track" \
+                        and self.track_spans[i][0] <= pos <= self.track_spans[i][1]:
+                    self.track_list.setCurrentRow(row)
+                    break
         self.track_list.blockSignals(False)
         # 아래 목록 — 오인식만
         self.kf_list.clear()
@@ -2120,18 +2249,27 @@ class PtzTab(QWidget):
         return self.roles.get(tid, self._teams.get(tid, 2))
 
     def _role_color(self, role):
-        """역할의 표시색(BGR) — 실제 유니폼 대표색, 없으면 기본 팔레트."""
+        """역할의 표시색(BGR) — 사용자 지정 > 측정 대표색 > 기본 팔레트."""
+        if role in self.kit_colors:
+            return tuple(self.kit_colors[role])
         return self._role_colors.get(
             role, TEAM_COLORS[min(max(role, 0), len(TEAM_COLORS) - 1)])
 
     def _refresh_team_label(self, log_colors=False):
-        """팀/GK/심판별 대표 유니폼 색 범례 (분석 후 '이 팀이 이 색')."""
+        """팀/GK/심판별 대표 유니폼 색 범례 (분석 후 '이 팀이 이 색').
+
+        스와치 버튼 색 = 표시색(사용자 지정 우선, 없으면 측정 대표색).
+        """
         spans, cols = self._player_cache()
+        for r in self._kit_btns:
+            self._kit_btns[r].hide()
+            self._kit_lbls[r].setText("")
         if not self._teams or not cols:
             self.lbl_team_colors.setText("팀 색: 분석 후 표시")
             return
-        parts, logs = [], []
+        logs = []
         self._role_colors = {}
+        shown = 0
         for r in (0, 1, 3, 4, 5):
             member = [t for t in cols
                       if self._role_of(t) == r and spans.get(t, [0, 0, 0])[2] >= 5]
@@ -2143,18 +2281,43 @@ class PtzTab(QWidget):
                                           int(min(cols[t][1], 255)),
                                           int(min(cols[t][2], 255))]]]),
                               cv2.COLOR_HSV2BGR)[0, 0] for t in member]), axis=0)
-            boosted = _boost_bgr((int(bgr[0]), int(bgr[1]), int(bgr[2])))
-            self._role_colors[r] = boosted
-            hexc = f"#{boosted[2]:02x}{boosted[1]:02x}{boosted[0]:02x}"
-            parts.append(f"{ROLE_NAMES[r]} <span style='background:{hexc};"
-                         f"color:{hexc}'>&nbsp;██&nbsp;</span>"
-                         f" {len(member)}명")
+            self._role_colors[r] = _boost_bgr(
+                (int(bgr[0]), int(bgr[1]), int(bgr[2])))
+            b_, g_, r_ = self._role_color(r)          # 사용자 지정 우선
+            hexc = f"#{r_:02x}{g_:02x}{b_:02x}"
+            self._kit_btns[r].setStyleSheet(
+                f"background-color: {hexc}; border: 1px solid #666;")
+            self._kit_btns[r].show()
+            mark = "✎" if r in self.kit_colors else ""
+            self._kit_lbls[r].setText(f"{ROLE_NAMES[r]}{mark} {len(member)}명")
+            shown += 1
             logs.append(f"{ROLE_NAMES[r]} {hexc} ({len(member)}트랙릿)")
-        self.lbl_team_colors.setText("유니폼 색:  " + " &nbsp; ".join(parts)
-                                     if parts else "팀 색: 분석 후 표시")
-        self.radar.palette = dict(self._role_colors)
+        self.lbl_team_colors.setText("유니폼 색:" if shown
+                                     else "팀 색: 분석 후 표시")
+        self.radar.palette = {r: self._role_color(r) for r in range(6)}
         if log_colors and logs:
             self.log("[ptz] 팀 색 분류: " + ", ".join(logs))
+
+    def _pick_kit_color(self, role):
+        """범례 스와치 클릭 → 컬러피커로 역할 표시 색 지정."""
+        b, g, r = self._role_color(role)
+        c = QColorDialog.getColor(QColor(r, g, b), self,
+                                  f"{ROLE_NAMES[role]} 표시 색")
+        if not c.isValid():
+            return
+        self.kit_colors[role] = [c.blue(), c.green(), c.red()]
+        self._kit_colors_changed()
+        self.log(f"[ptz] {ROLE_NAMES[role]} 표시 색 지정: {c.name()}")
+
+    def _reset_kit_color(self, role):
+        if self.kit_colors.pop(role, None) is not None:
+            self._kit_colors_changed()
+            self.log(f"[ptz] {ROLE_NAMES[role]} 표시 색 → 측정색으로 복귀")
+
+    def _kit_colors_changed(self):
+        self._save_keyframes()
+        self._refresh_team_label()
+        self._redraw()
 
     def _refresh_player_list(self):
         """선수 트랙릿 목록: 유니폼 색 스와치 + 역할 + 구간 (검출 수 순)."""
@@ -2230,6 +2393,7 @@ class PtzTab(QWidget):
         if scope in ("roles", "all"):
             self.roles = {}
             self.extra_players = {}
+            self.kit_colors = {}
             self._pcache_id = None
         if scope in ("field", "all"):
             self.field_points = {}
@@ -2696,9 +2860,13 @@ class PtzTab(QWidget):
         row = self.track_list.currentRow()
         if 0 <= row < len(getattr(self, "_top", [])):
             kind, i = self._top[row]
-            f = (self.track_spans[i][0] if kind == "track"
-                 else self.keyframes[i][0])
-            self.slider.setValue(int(f))
+            if kind == "track":
+                f0, f1 = self.track_spans[i]
+                if f0 <= self.slider.value() <= f1:
+                    return          # 이미 그 트랙 안 — 시작으로 되감지 않음
+                self.slider.setValue(int(f0))
+            else:
+                self.slider.setValue(int(self.keyframes[i][0]))
 
     def _jump_track(self, direction: int):
         """현재 위치 기준 이전(-1)/다음(+1) 수락 트랙 시작으로 이동."""
@@ -2720,15 +2888,17 @@ class PtzTab(QWidget):
         else:
             self._ignore_current_track()
 
-    def _ignore_selected_track(self):
+    def _ignore_selected_track(self, advance=False):
         """위 목록에서 Del — 자동 트랙은 오인식으로, 수동 지정은 삭제."""
         row = self.track_list.currentRow()
         if not (0 <= row < len(getattr(self, "_top", []))):
             return
         kind, i = self._top[row]
         if kind == "track":
-            self.slider.setValue(int(self.track_spans[i][0]))
-            self._ignore_current_track()
+            # 재생 위치는 건드리지 않고 그 트랙만 무시 — 정적 미끼는
+            # 대개 영상 시작부터 있어서 시작으로 점프하면 처음으로 튄다
+            self._ignore_current_track(anchor_f=int(self.track_spans[i][0]),
+                                       advance=advance)
         else:
             del self.keyframes[i]
             self._save_keyframes()
@@ -2739,9 +2909,13 @@ class PtzTab(QWidget):
             self._plan_dirty()
             self._redraw()
 
-    def _ignore_current_track(self):
-        """현재 시각을 덮는 수락 트랙을 통째로 무시 목록에 추가."""
-        f = self.slider.value()
+    def _ignore_current_track(self, anchor_f=None, advance=False):
+        """anchor_f(기본: 현재 시각)를 덮는 수락 트랙을 통째로 무시.
+
+        advance=True(키보드 검수 Del/→)일 때만 다음 항목으로 이동까지 —
+        미리보기/버튼 경로에서는 보던 위치를 유지한다.
+        """
+        f = self.slider.value() if anchor_f is None else anchor_f
         for f0, f1 in self.track_spans:
             if f0 <= f <= f1:
                 QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -2768,14 +2942,18 @@ class PtzTab(QWidget):
                 extra = f" (같은 자리 반복 포함 {added}개 구간)" if added > 1 else ""
                 self.log(f"[ptz] 트랙 무시: {f0/self.fps:.1f}s ~ "
                          f"{f1/self.fps:.1f}s{extra}")
-                # 검수 흐름: 다음 항목 자동 선택 + 이동
+                # 다음 항목 자동 선택 (시크 없이) — 이동은 키보드 검수만
                 def _start(e):
                     return (self.track_spans[e[1]][0] if e[0] == "track"
                             else self.keyframes[e[1]][0])
                 nxt = [r for r, e in enumerate(self._top) if _start(e) > f0]
                 row = nxt[0] if nxt else len(self._top) - 1
                 if row >= 0:
+                    self.track_list.blockSignals(True)
                     self.track_list.setCurrentRow(row)
+                    self.track_list.blockSignals(False)
+                    if advance:
+                        self._goto_track()
                 return
         QMessageBox.information(self, "무시", "현재 시각을 덮는 공 트랙이 없습니다.")
 
@@ -2796,13 +2974,26 @@ class PtzTab(QWidget):
             return
         codec = self.encoders[self.combo_codec.currentText()]
         kfs = [tuple(k) for k in self.keyframes]
+        radar = None
+        if self.check_export_radar.isChecked():
+            spans, _ = self._player_cache()
+            teams = {tid: self._role_of(tid) for tid in spans}
+            radar = build_radar_data(
+                self.analysis, teams, calib=self._field_calib,
+                field_size=tuple(self.field_size),
+                extra_players=self.extra_players,
+                palette={r: self._role_color(r) for r in range(6)})
+            self.log("[ptz] 레이더 오버레이 포함 "
+                     + ("(경기장 절대 좌표)" if self._field_calib is not None
+                        else "(캘리브레이션 없음 — 근사 좌표)"))
         self.log(f"[ptz] 내보내기 시작: {'와이드' if wide else 'PTZ'} 모드, "
                  f"키프레임 {len(kfs)}개 반영")
         w = PtzRenderWorker(str(self.pano_path), out, self.analysis, kfs,
                             codec, self.spin_crf.value(), wide=wide,
                             ignores=[tuple(r) for r in self.ignores],
                             far_zoom=self.spin_far_zoom.value(),
-                            promotes=[tuple(p) for p in self.promotes])
+                            promotes=[tuple(p) for p in self.promotes],
+                            radar=radar)
         w.log.connect(self.log)
         w.progress.connect(self._render_progress)
         w.finished_ok.connect(self._render_done)

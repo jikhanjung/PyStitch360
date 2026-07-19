@@ -879,10 +879,90 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
     return {"cx": cx, "cy": cy, "crop_w": cw, "top_margin": top_margin}
 
 
+def build_radar_data(analysis, teams, calib=None, field_size=(105.0, 68.0),
+                     extra_players=None, palette=None):
+    """내보내기 레이더용 샘플별 필드 좌표 데이터.
+
+    teams = {track_id: 역할} (사용자 역할 오버라이드 포함), calib 가 있으면
+    경기장 절대 좌표(pano_to_field), 없으면 카메라 기준 근사(가정 위치).
+    반환: {frames, points, balls, length, width, palette}.
+    """
+    from .field import pano_to_field
+    pano_w, pano_h = analysis["pano_w"], analysis["pano_h"]
+    frames = np.asarray(analysis["frames"], dtype=np.int64)
+    cam = (0.0, -(field_size[1] / 2.0 + 5.0))
+    pts, balls = [], []
+    for si, prow in enumerate(analysis["players"]):
+        rows = list(prow) + ((extra_players or {}).get(si, []))
+        out = []
+        if calib is not None:
+            feet = [(p[0], p[1] + p[3] / 2.0,
+                     int(p[4]) if len(p) >= 5 else -1)
+                    for p in rows if len(p) >= 4]
+            if feet:
+                fc = pano_to_field(calib, [(a, b) for a, b, _ in feet])
+                for (gx, gy), (_, _, tid) in zip(fc, feet):
+                    if np.isfinite(gx):
+                        out.append((float(gx), float(gy),
+                                    int(teams.get(tid, 2))))
+        else:
+            for X, Y, tid, j in ground_positions(rows, pano_w, pano_h):
+                out.append((cam[0] + X, cam[1] + Y, int(teams.get(tid, 2))))
+        pts.append(out)
+        bb = analysis["balls"][si] if si < len(analysis["balls"]) else None
+        bg = None
+        if bb is not None:
+            if calib is not None:
+                g = pano_to_field(calib, [[bb[0], bb[1]]])[0]
+                if np.isfinite(g[0]):
+                    bg = (float(g[0]), float(g[1]))
+            else:
+                g = ground_positions([[bb[0], bb[1], 0.0, 0.0]],
+                                     pano_w, pano_h)
+                if g:
+                    bg = (cam[0] + g[0][0], cam[1] + g[0][1])
+        balls.append(bg)
+    return {"frames": frames, "points": pts, "balls": balls,
+            "length": float(field_size[0]), "width": float(field_size[1]),
+            "palette": palette or {}}
+
+
+def draw_radar_panel(radar, si, panel_w):
+    """샘플 si 의 탑다운 레이더 패널 (BGR). 등방 축척 — 경기장 사각형이
+    입력한 실측 크기(예: 100×62m) 비율 그대로 그려진다."""
+    L, Wd = radar["length"], radar["width"]
+    mx = 4.0                                  # 바깥 여백 (m)
+    s = panel_w / (L + 2 * mx)                # px/m (가로=세로 동일)
+    ph = int(round((Wd + 2 * mx) * s)) & ~1
+    img = np.full((max(ph, 2), panel_w, 3), (26, 52, 30), np.uint8)
+
+    def px(X, Y):
+        return (int(round((X + L / 2 + mx) * s)),
+                int(round((Wd / 2 + mx - Y) * s)))
+
+    wcol = (235, 235, 235)
+    lw = max(1, panel_w // 300)
+    cv2.rectangle(img, px(-L / 2, Wd / 2), px(L / 2, -Wd / 2), wcol, lw)
+    cv2.line(img, px(0, -Wd / 2), px(0, Wd / 2), wcol, lw)
+    cv2.circle(img, px(0, 0), int(round(9.15 * s)), wcol, lw)
+    pal = radar.get("palette", {})
+    r_dot = max(2, panel_w // 110)
+    for X, Y, role in radar["points"][si]:
+        cv2.circle(img, px(X, Y), r_dot,
+                   tuple(int(v) for v in pal.get(role, (160, 160, 160))), -1)
+    if radar["balls"][si] is not None:
+        cv2.circle(img, px(*radar["balls"][si]), max(2, r_dot - 1),
+                   (255, 255, 255), -1)
+    return img
+
+
 def render_plan(pano_path, out_path, plan, out_w=1920, out_h=1080,
                 codec="libx264", crf=20, log=print, progress=None,
-                cancel=None):
-    """2패스: 계획대로 크롭(필요 시 줌아웃 다운스케일)해 인코딩. fps 반환."""
+                cancel=None, radar=None, radar_alpha=0.55):
+    """2패스: 계획대로 크롭(필요 시 줌아웃 다운스케일)해 인코딩. fps 반환.
+
+    radar(build_radar_data 결과)가 있으면 우하단에 반투명 탑다운
+    레이더를 합성한다."""
     import subprocess
     import time
 
@@ -900,6 +980,9 @@ def render_plan(pano_path, out_path, plan, out_w=1920, out_h=1080,
     enc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     cx, cy, cw = plan["cx"], plan["cy"], plan["crop_w"]
     top_margin = int(plan.get("top_margin", 0))
+    r_frames = radar["frames"] if radar is not None else None
+    r_cache = {"si": -1, "img": None}
+    panel_w = (out_w // 5) & ~1
     t0 = time.perf_counter()
     done = 0
     try:
@@ -920,6 +1003,23 @@ def render_plan(pano_path, out_path, plan, out_w=1920, out_h=1080,
             if w != out_w:
                 interp = cv2.INTER_AREA if w > out_w else cv2.INTER_CUBIC
                 crop = cv2.resize(crop, (out_w, out_h), interpolation=interp)
+            if radar is not None and len(r_frames):
+                si = int(np.searchsorted(r_frames, i))
+                si = min(si, len(r_frames) - 1)
+                if si > 0 and abs(int(r_frames[si - 1]) - i) \
+                        <= abs(int(r_frames[si]) - i):
+                    si -= 1
+                if si != r_cache["si"]:
+                    r_cache = {"si": si,
+                               "img": draw_radar_panel(radar, si, panel_w)}
+                pimg = r_cache["img"]
+                ph_, pw_ = pimg.shape[:2]
+                mgn = out_w // 96
+                crop = np.ascontiguousarray(crop)
+                roi = crop[out_h - mgn - ph_:out_h - mgn,
+                           out_w - mgn - pw_:out_w - mgn]
+                cv2.addWeighted(pimg, radar_alpha, roi, 1.0 - radar_alpha,
+                                0.0, dst=roi)
             enc.stdin.write(np.ascontiguousarray(crop).tobytes())
             done += 1
             if done % 90 == 0 and progress is not None:

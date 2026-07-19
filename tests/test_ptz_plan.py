@@ -288,6 +288,23 @@ def test_tracklet_colors_circular_hue():
     assert 150 <= s <= 210 and 130 <= v <= 170
 
 
+def test_radar_panel_aspect_and_data():
+    """내보내기 레이더: 경기장 사각형이 입력 크기(100×62) 비율 그대로."""
+    from pystitch.core.ptz import build_radar_data, draw_radar_panel
+    frames = [0, 3]
+    a = {"frames": frames, "balls": [[100.0, 900.0, 0.9], None],
+         "players": [[[100.0, 900.0, 30.0, 80.0, 1]], []],
+         "pano_w": PANO_W, "pano_h": PANO_H}
+    radar = build_radar_data(a, {1: 0}, field_size=(100.0, 62.0),
+                             palette={0: (0, 0, 255)})
+    img = draw_radar_panel(radar, 0, 384)
+    assert img.shape[1] == 384
+    # 등방 축척: 세로/가로 = (폭+여백)/(길이+여백)
+    assert abs(img.shape[0] / 384 - (62 + 8) / (100 + 8)) < 0.02
+    assert len(radar["points"][0]) == 1 and radar["balls"][0] is not None
+    assert radar["points"][1] == [] and radar["balls"][1] is None
+
+
 def test_ground_positions_geometry():
     """지면 투영 기하: 화면 중앙 열은 X=0, 아래 행일수록 가깝고 대칭."""
     from pystitch.core.ptz import ground_positions
