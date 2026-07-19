@@ -347,3 +347,11 @@ def load_events(video_path):
     if not p.exists():
         return []
     return json.loads(p.read_text()).get("kickoffs", [])
+
+
+def load_events_doc(video_path) -> dict:
+    """이벤트 문서 전체 (kickoffs, airborne, linesman_signals, highlights…)."""
+    p = events_json_path(video_path)
+    if not p.exists():
+        return {}
+    return json.loads(p.read_text())

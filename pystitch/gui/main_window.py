@@ -93,6 +93,11 @@ class MainWindow(QMainWindow):
         a.addAction("킥오프 검출 (호각 × 대형)",
                     lambda: self.ptz_tab.detect_events())
         a.addSeparator()
+        a.addAction("하이라이트 후보 생성 (이벤트 융합)",
+                    lambda: self.ptz_tab.detect_highlights())
+        a.addAction("하이라이트 일괄 내보내기...",
+                    lambda: self.ptz_tab.export_highlights())
+        a.addSeparator()
         a.addAction("공/키프레임 편집 초기화",
                     lambda: self.ptz_tab.reset_edits("ball"))
         a.addAction("선수 역할 지정 초기화",

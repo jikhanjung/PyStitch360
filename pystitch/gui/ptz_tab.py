@@ -223,6 +223,7 @@ class TimelineView(QWidget):
         self._whistle = None         # (hop_s, 프로미넌스 배열, 이벤트)
         self.events = []             # [(frame, label, kind)] kind: auto|user
         self.airborne = []           # [(f0, f1, apex_z)] 공중 구간
+        self.highlights = []         # [(f0, f1, state, label)] 하이라이트 구간
         self._press = None
         self._resize = None          # 레인 경계 드래그 상태
 
@@ -237,6 +238,11 @@ class TimelineView(QWidget):
     def set_airborne(self, segs):
         """공중 구간 [(f0, f1, apex_z)] — '뜬 공' 레인."""
         self.airborne = list(segs)
+        self.update()
+
+    def set_highlights(self, hls):
+        """하이라이트 구간 [(f0, f1, state, label)] — 이벤트 레인 바."""
+        self.highlights = list(hls)
         self.update()
 
     def _emit_view(self):
@@ -484,6 +490,26 @@ class TimelineView(QWidget):
                 # 긴 호각(킥오프·종료 후보)은 위 눈금까지 강조
                 if t1_ - t0_ >= 0.8:
                     p.drawLine(x_, y + 1, x_ + w_, y + 1)
+        # 이벤트 레인 배경: 하이라이트 구간 바 (후보=호박, 수락=초록, 제외=회색)
+        if self.highlights and self.total > 1:
+            y, lh = self._lane_rect(7)
+            for i, (f0, f1, state, label) in enumerate(self.highlights):
+                x0_, x1_ = self._x(f0), self._x(f1)
+                if x1_ < self.GUTTER or x0_ > W:
+                    continue
+                c = {"accept": QColor(110, 210, 70, 170),
+                     "reject": QColor(130, 130, 130, 80)}.get(
+                    state, QColor(255, 176, 32, 150))
+                r = (max(x0_, self.GUTTER), y + 2,
+                     max(3, x1_ - max(x0_, self.GUTTER)), lh - 4)
+                p.fillRect(*r, c)
+                if self.selected == ("hl", i):
+                    p.setPen(QColor(255, 255, 255))
+                    p.drawRect(r[0], r[1], r[2] - 1, r[3] - 1)
+                if x1_ - x0_ > 44 and state != "reject":
+                    p.setPen(QColor(35, 28, 8))
+                    p.drawText(QRect(r[0] + 3, y, x1_ - r[0] - 4, lh),
+                               Qt.AlignmentFlag.AlignVCenter, label)
         # 이벤트 레인: 자동(킥오프)=초록, 사용자=시안 마커 + 라벨
         if self.events and self.total > 1:
             y, lh = self._lane_rect(7)
@@ -563,7 +589,11 @@ class TimelineView(QWidget):
                 d = abs(self._x(f_) - x)
                 if d < bd:
                     best, bd = ("event", i), d
-            return best
+            if best is not None:
+                return best
+            for i, (f0, f1, state, label) in enumerate(self.highlights):
+                if f0 <= f <= f1:
+                    return ("hl", i)
         return None
 
     def mousePressEvent(self, ev):
@@ -1056,6 +1086,141 @@ class ExportDialog(QDialog):
                 "path": self.edit_path.text().strip()}
 
 
+class HighlightBatchWorker(QThread):
+    """수락 하이라이트 구간들을 개별 클립으로 순차 렌더 (계획 1회 재사용)."""
+
+    progress = pyqtSignal(int, int, float)   # (전체 누적, 전체 프레임, fps)
+    log = pyqtSignal(str)
+    finished_ok = pyqtSignal(int, str)       # (완료 개수, 출력 폴더)
+    failed = pyqtSignal(str)
+
+    def __init__(self, pano_path, out_dir, stem, analysis, keyframes, codec,
+                 crf, ignores=None, far_zoom=1.0, promotes=None, radar=None,
+                 segments=()):
+        super().__init__()
+        self.args = (pano_path, out_dir, stem, analysis, keyframes, codec,
+                     crf, ignores or [], far_zoom, promotes or [], radar,
+                     list(segments))
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        (pano, out_dir, stem, analysis, kfs, codec, crf, ignores, far_zoom,
+         promotes, radar, segs) = self.args
+        try:
+            out_w, out_h = 1920, 1080
+            plan = build_plan(analysis, analysis["pano_w"], analysis["pano_h"],
+                              out_w=out_w, out_h=out_h, keyframes=kfs,
+                              ignore_ranges=ignores, force_ranges=promotes,
+                              far_zoom=far_zoom,
+                              log=lambda s: self.log.emit(s))
+            total = sum(e - s for s, e, _ in segs)
+            base = 0
+            for k, (s, e, name) in enumerate(segs, 1):
+                if self._cancel:
+                    break
+                out = Path(out_dir) / f"{stem}_h{k:02d}_{name}.mp4"
+                self.log.emit(f"[hl] {k}/{len(segs)} 렌더: {out.name}")
+                render_plan(pano, out, plan, out_w=out_w, out_h=out_h,
+                            codec=codec, crf=crf,
+                            log=lambda s: self.log.emit(s),
+                            progress=lambda d, _t, f, b=base:
+                                self.progress.emit(b + d, total, f),
+                            cancel=lambda: self._cancel, radar=radar,
+                            start=s, end=e)
+                base += e - s
+            if self._cancel:
+                self.failed.emit("취소됨")
+            else:
+                self.finished_ok.emit(len(segs), str(out_dir))
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(str(e))
+
+
+class HighlightExportDialog(QDialog):
+    """하이라이트 일괄 내보내기 — 구간 체크 목록·출력 폴더·코덱/CRF/미니맵."""
+
+    def __init__(self, parent, highlights, fps, encoders, crf, radar_on,
+                 default_dir):
+        super().__init__(parent)
+        self.setWindowTitle("하이라이트 일괄 내보내기")
+        self.fps = fps
+        form = QFormLayout(self)
+
+        self.list = QListWidget()
+        any_accept = any(h.get("state") == "accept" for h in highlights)
+        for h in highlights:
+            dur = h["t1"] - h["t0"]
+            it = QListWidgetItem(
+                f"{ExportDialog._hms(h['t0'])} ~ {ExportDialog._hms(h['t1'])}"
+                f"  ({dur:.0f}초)  {h.get('label', '')}"
+                f"  점수 {h.get('score', 0):.1f}"
+                + ("  [수락]" if h.get("state") == "accept" else ""))
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            # 수락 항목이 하나라도 있으면 수락만 체크, 없으면 전부 체크
+            it.setCheckState(Qt.CheckState.Checked
+                             if h.get("state") == "accept" or not any_accept
+                             else Qt.CheckState.Unchecked)
+            self.list.addItem(it)
+        self.list.setMinimumHeight(180)
+        form.addRow("구간", self.list)
+
+        dir_row = QHBoxLayout()
+        self.edit_dir = QLineEdit(default_dir)
+        dir_row.addWidget(self.edit_dir, 1)
+        b = QPushButton("찾아보기...")
+        b.clicked.connect(self._browse)
+        dir_row.addWidget(b)
+        form.addRow("출력 폴더", dir_row)
+
+        self.combo_codec = QComboBox()
+        self.combo_codec.addItems(list(encoders))
+        saved = QSettings("PyStitch360", "PyStitch360").value(
+            "ptz_export_codec", "")
+        labels = list(encoders)
+        if saved in labels:
+            self.combo_codec.setCurrentIndex(labels.index(saved))
+        else:
+            for idx, lbl in enumerate(labels):
+                if encoders[lbl] == "hevc_nvenc":
+                    self.combo_codec.setCurrentIndex(idx)
+                    break
+        form.addRow("코덱", self.combo_codec)
+
+        self.spin_crf = QSpinBox(minimum=10, maximum=35, value=crf)
+        form.addRow("CRF/CQ", self.spin_crf)
+        self.check_radar = QCheckBox("우하단 반투명 탑다운 미니맵 (선수·공)")
+        self.check_radar.setChecked(radar_on)
+        form.addRow("미니맵", self.check_radar)
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                              | QDialogButtonBox.StandardButton.Cancel)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("일괄 내보내기")
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+        self.resize(640, self.sizeHint().height())
+
+    def _browse(self):
+        d = QFileDialog.getExistingDirectory(self, "출력 폴더",
+                                             self.edit_dir.text())
+        if d:
+            self.edit_dir.setText(d)
+
+    def config(self):
+        """선택 결과: {indices, dir, codec_name, crf, radar}."""
+        QSettings("PyStitch360", "PyStitch360").setValue(
+            "ptz_export_codec", self.combo_codec.currentText())
+        idx = [i for i in range(self.list.count())
+               if self.list.item(i).checkState() == Qt.CheckState.Checked]
+        return {"indices": idx, "dir": self.edit_dir.text().strip(),
+                "codec_name": self.combo_codec.currentText(),
+                "crf": self.spin_crf.value(),
+                "radar": self.check_radar.isChecked()}
+
+
 class PtzTab(QWidget):
     """가상 PTZ 탭. log_fn 은 메인 윈도우 로그 박스."""
 
@@ -1076,6 +1241,7 @@ class PtzTab(QWidget):
         self.export_range: list = [None, None]   # 내보내기 IN/OUT 프레임
         self.team_names = ["팀1", "팀2"]  # 사용자 입력 팀 이름
         self.user_events: list[list] = []  # [[frame, label]] 사용자 이벤트
+        self.highlights: list[dict] = []   # .events.json "highlights" 문서
         self.roles: dict[int, int] = {}   # {track_id: 역할} 사용자 지정 (GK 등)
         self.field_points: dict[str, list] = {}   # {랜드마크키: [x, y]}
         self.line_points: list[list] = []  # 흰 선 검출 샘플 [x, y] (사이드라인)
@@ -1504,20 +1670,38 @@ class PtzTab(QWidget):
         self._update_export_enabled()
 
     def _refresh_events(self):
-        """자동(킥오프, .events.json) + 사용자 이벤트 → 타임라인 레인."""
+        """자동(킥오프)·사용자 이벤트 + 하이라이트(.events.json) → 타임라인."""
         items = []
+        doc = {}
         try:
-            from ..core.events import load_events
-            for k in load_events(self.pano_path):
-                items.append((int(k["t"] * self.fps),
-                              "킥오프" + (" ●" if k.get("long_whistle")
-                                         else ""), "auto"))
+            from ..core.events import load_events_doc
+            doc = load_events_doc(self.pano_path)
         except Exception as e:  # noqa: BLE001
             self.log(f"[ptz] 이벤트 파일 무시: {e}")
+        for k in doc.get("kickoffs", []):
+            items.append((int(k["t"] * self.fps),
+                          "킥오프" + (" ●" if k.get("long_whistle")
+                                     else ""), "auto"))
         for f, label in self.user_events:
             items.append((int(f), label, "user"))
         items.sort()
         self.trackbar.set_events(items)
+        self.highlights = doc.get("highlights", [])
+        self._refresh_highlight_lane()
+
+    def _refresh_highlight_lane(self):
+        self.trackbar.set_highlights(
+            [(int(h["t0"] * self.fps), int(h["t1"] * self.fps),
+              h.get("state", "cand"), h.get("label", ""))
+             for h in self.highlights])
+
+    def _save_highlights(self):
+        try:
+            from ..core.events import save_events
+            save_events(self.pano_path, highlights=self.highlights)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"[hl] 저장 실패: {e}")
+        self._refresh_highlight_lane()
 
     def _proxy_path(self) -> Path:
         return self.pano_path.with_suffix(".scrub.mp4")
@@ -3135,6 +3319,168 @@ class PtzTab(QWidget):
         times = ", ".join(self._hms(t) for t, _, _ in ks) or "없음"
         self.log(f"[events] 킥오프 {len(ks)}개: {times}")
 
+    def detect_highlights(self):
+        """분석 메뉴: 이벤트 융합 → 하이라이트 후보 (.events.json, 비파괴)."""
+        if self.analysis is None or self.pano_path is None:
+            QMessageBox.information(self, "하이라이트", "먼저 분석이 필요합니다.")
+            return
+        from ..core.audio import load_whistle_track
+        from ..core.events import load_events_doc, save_events
+        from ..core.highlights import (
+            airborne_box_events, ball_speed_events, build_highlights,
+            carry_states,
+        )
+        with self._busy("하이라이트 후보 생성 (이벤트 융합)"):
+            doc = load_events_doc(self.pano_path)
+            _, whistles = load_whistle_track(self.pano_path)
+            air_ev, speed_ev = [], []
+            if self._field_calib is not None:
+                calib = self._field_calib
+                air = doc.get("airborne") or {}
+                air_ev = airborne_box_events(air.get("segments") or [],
+                                             calib["length"], calib["width"])
+                if self._accepted_ball is not None:
+                    acc = np.asarray(self._accepted_ball, dtype=float)
+                    fin = np.isfinite(acc[:, 0])
+                    g = np.full((len(acc), 2), np.nan)
+                    if fin.any():
+                        g[fin] = pano_to_field(calib, acc[fin])
+                    t = np.asarray(self.analysis["frames"], float) / self.fps
+                    speed_ev = ball_speed_events(t, g)
+            segs = build_highlights(
+                self.total / self.fps,
+                kickoffs=doc.get("kickoffs") or [],
+                whistles=whistles or [],
+                signals=doc.get("linesman_signals") or [],
+                air_events=air_ev, speed_events=speed_ev,
+                user_events=[(f / self.fps, lb) for f, lb in self.user_events])
+            self.highlights = carry_states(segs, self.highlights)
+            save_events(self.pano_path, highlights=self.highlights)
+        self._refresh_highlight_lane()
+        n_acc = sum(1 for h in self.highlights if h.get("state") == "accept")
+        srcs = (f"킥오프 {len(doc.get('kickoffs') or [])}, 기 신호 "
+                f"{sum(1 for s in doc.get('linesman_signals') or [] if (s.get('near') or {}).get('signal') in ('foul', 'offside'))}, "
+                f"공중볼→박스 {len(air_ev)}, 속도 급증 {len(speed_ev)}, "
+                f"사용자 {len(self.user_events)}")
+        self.log(f"[hl] 하이라이트 후보 {len(self.highlights)}개 "
+                 f"(수락 {n_acc}) — 소스: {srcs}")
+        self.log("[hl] 이벤트 레인의 호박색 바 우클릭 → 수락/제외/경계 조정")
+        if self._field_calib is None:
+            self.log("[hl] 경기장 캘리브레이션 없음 — 공중볼/속도 규칙 생략됨")
+
+    # ------------------------------------------------------ 하이라이트 검수
+    def _set_hl_state(self, i, state):
+        if not 0 <= i < len(self.highlights):
+            return
+        h = self.highlights[i]
+        h["state"] = state
+        self._save_highlights()
+        name = {"accept": "수락", "reject": "제외", "cand": "후보로 되돌림"}
+        self.log(f"[hl] {name[state]}: {h.get('label', '')} "
+                 f"{self._hms(h['t0'])}~{self._hms(h['t1'])}")
+
+    def _hl_to_marks(self, i):
+        """하이라이트 경계 → IN/OUT 마커 (미리보기·경계 조정용)."""
+        h = self.highlights[i]
+        self._set_export_mark("in", int(h["t0"] * self.fps))
+        self._set_export_mark("out", int(h["t1"] * self.fps))
+        self.slider.setValue(int(h["t0"] * self.fps))
+
+    def _marks_to_hl(self, i):
+        """현재 IN/OUT 마커 → 하이라이트 경계 (조정 커밋)."""
+        r = self._norm_export_range()
+        if r is None:
+            return
+        h = self.highlights[i]
+        h["t0"], h["t1"] = round(r[0] / self.fps, 2), round(r[1] / self.fps, 2)
+        self._save_highlights()
+        self.log(f"[hl] 경계 갱신: {h.get('label', '')} "
+                 f"{self._hms(h['t0'])}~{self._hms(h['t1'])}")
+
+    def _del_highlight(self, i):
+        if 0 <= i < len(self.highlights):
+            h = self.highlights.pop(i)
+            self._save_highlights()
+            self.log(f"[hl] 삭제: {h.get('label', '')} "
+                     f"{self._hms(h['t0'])}~{self._hms(h['t1'])}")
+
+    def export_highlights(self):
+        """분석 메뉴: 검수된 하이라이트 구간들을 개별 클립으로 일괄 렌더."""
+        if self.analysis is None or self.pano_path is None:
+            QMessageBox.information(self, "하이라이트", "먼저 분석이 필요합니다.")
+            return
+        if self._render_worker is not None and self._render_worker.isRunning():
+            QMessageBox.information(self, "하이라이트",
+                                    "내보내기가 이미 진행 중입니다.")
+            return
+        cands = [h for h in self.highlights if h.get("state") != "reject"]
+        if not cands:
+            QMessageBox.information(
+                self, "하이라이트",
+                "내보낼 하이라이트가 없습니다 — 분석 메뉴에서 "
+                "\"하이라이트 후보 생성\"을 먼저 실행하세요.")
+            return
+        self._stop_play()
+        st = QSettings("PyStitch360", "PyStitch360")
+        dlg = HighlightExportDialog(
+            self, cands, self.fps, self.encoders,
+            int(st.value("ptz_export_crf", 20)),
+            st.value("ptz_export_radar", "true") == "true",
+            str(self.pano_path.parent))
+        if not dlg.exec():
+            return
+        cfg = dlg.config()
+        if not cfg["indices"] or not cfg["dir"]:
+            return
+        st.setValue("ptz_export_crf", cfg["crf"])
+        st.setValue("ptz_export_radar", "true" if cfg["radar"] else "false")
+        import re
+        segs = []
+        for i in cfg["indices"]:
+            h = cands[i]
+            name = re.sub(r'[\\/:*?"<>|\s]+', "_",
+                          h.get("label", "")).strip("_") or "장면"
+            segs.append((int(h["t0"] * self.fps), int(h["t1"] * self.fps),
+                         name))
+        radar = None
+        if cfg["radar"]:
+            spans, _ = self._player_cache()
+            teams = {tid: self._role_of(tid) for tid in spans}
+            radar = build_radar_data(
+                self.analysis, teams, calib=self._field_calib,
+                field_size=tuple(self.field_size),
+                extra_players=self.extra_players,
+                palette={r: self._role_color(r) for r in range(6)})
+        dur = sum(e - s for s, e, _ in segs) / self.fps
+        self.log(f"[hl] 일괄 내보내기 시작: {len(segs)}개 구간, "
+                 f"총 {dur/60:.1f}분 → {cfg['dir']}")
+        w = HighlightBatchWorker(
+            str(self.pano_path), cfg["dir"], self.pano_path.stem,
+            self.analysis, [tuple(k) for k in self.keyframes],
+            self.encoders[cfg["codec_name"]], cfg["crf"],
+            ignores=[tuple(r) for r in self.ignores],
+            far_zoom=self.spin_far_zoom.value(),
+            promotes=[tuple(p) for p in self.promotes],
+            radar=radar, segments=segs)
+        w.log.connect(self.log)
+        w.progress.connect(self._render_progress)
+        w.finished_ok.connect(self._batch_done)
+        w.failed.connect(self._render_failed)
+        self._render_worker = w
+        self.btn_export.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
+        self.progress.setRange(0, 0)
+        self.progress.setFormat("준비 중...")
+        w.start()
+
+    def _batch_done(self, n, out_dir):
+        self.btn_export.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+        self.progress.setFormat("완료")
+        self.log(f"[hl] 일괄 내보내기 완료: {n}개 클립 → {out_dir}")
+        QMessageBox.information(self, "하이라이트",
+                                f"{n}개 클립 저장 완료:\n{out_dir}")
+
     def reset_edits(self, scope="all"):
         """사용자 편집 무효화 → 순수 분석 원본 상태 (분석 메뉴에서 호출).
 
@@ -3223,6 +3569,33 @@ class PtzTab(QWidget):
         for i in near:
             menu.addAction(f"이벤트 '{self.user_events[i][1]}' 삭제",
                            lambda _=False, ii=i: self._del_user_event(ii))
+        hl = [i for i, h in enumerate(self.highlights)
+              if h["t0"] * self.fps <= f <= h["t1"] * self.fps]
+        for i in hl:
+            h = self.highlights[i]
+            tag = (f"'{h.get('label', '')}' "
+                   f"{self._hms(h['t0'])}~{self._hms(h['t1'])}")
+            menu.addSeparator()
+            st = h.get("state", "cand")
+            if st != "accept":
+                menu.addAction(f"하이라이트 수락 — {tag}",
+                               lambda _=False, ii=i:
+                               self._set_hl_state(ii, "accept"))
+            if st != "reject":
+                menu.addAction(f"하이라이트 제외 — {tag}",
+                               lambda _=False, ii=i:
+                               self._set_hl_state(ii, "reject"))
+            if st != "cand":
+                menu.addAction(f"하이라이트 후보로 되돌림 — {tag}",
+                               lambda _=False, ii=i:
+                               self._set_hl_state(ii, "cand"))
+            menu.addAction("IN/OUT 마커 ← 하이라이트 경계 (조정 시작)",
+                           lambda _=False, ii=i: self._hl_to_marks(ii))
+            if self._norm_export_range():
+                menu.addAction("하이라이트 경계 ← 현재 IN/OUT 마커 (조정 커밋)",
+                               lambda _=False, ii=i: self._marks_to_hl(ii))
+            menu.addAction(f"하이라이트 삭제 — {tag}",
+                           lambda _=False, ii=i: self._del_highlight(ii))
         menu.addSeparator()
         menu.addAction("여기로 이동", lambda: self.slider.setValue(int(f)))
         menu.exec(gpos)
@@ -3286,6 +3659,10 @@ class PtzTab(QWidget):
             evs = self.trackbar.events
             if 0 <= key < len(evs):
                 self.slider.setValue(int(evs[key][0]))
+        elif kind == "hl":
+            if 0 <= key < len(self.highlights):
+                self.slider.setValue(
+                    int(self.highlights[key]["t0"] * self.fps))
 
     def _assign_selected_role(self, role):
         rows = getattr(self, "_player_rows", [])
