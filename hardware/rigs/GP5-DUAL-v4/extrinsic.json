@@ -1,0 +1,44 @@
+{
+  "rig_id": "GP5-DUAL-v4",
+  "revision_note": "v3 + roof plate on both cradles (shutter finger hole); sun/rain shade and extra stiffness",
+  "camera": {
+    "manufacturer": "GoPro",
+    "model": "HERO5 Black",
+    "count": 2,
+    "recording_mode": "4K_16:9_29.97_wide_eis_off",
+    "lens_profile": "GoPro_HERO5_Black_Wide_4K_16x9"
+  },
+  "extrinsic_nominal": {
+    "yaw_split_deg": 68.8,
+    "per_camera": {
+      "left": {
+        "yaw_deg": -34.4,
+        "pitch_deg": -18.0,
+        "roll_deg": 180.0,
+        "orientation": "upside-down (set GoPro rotation to Down)"
+      },
+      "right": {
+        "yaw_deg": 34.4,
+        "pitch_deg": -18.0,
+        "roll_deg": 0.0,
+        "orientation": "upright"
+      }
+    },
+    "baseline_mm": 72.12,
+    "lens_height_delta_mm": -0.0,
+    "lens_offset_in_body_mm": {
+      "from_side_edge": 14.5,
+      "from_top_edge": 14.5
+    },
+    "optical_center_height_above_base_mm": 40.88,
+    "conventions": {
+      "yaw": "positive = clockwise seen from above (right camera positive)",
+      "pitch": "negative = tilted down",
+      "optical_center": "nominal lens center in the body corner; refine per session",
+      "lens_side": "lens on the body's left seen from behind (front view: right) \u2014 confirmed on real camera"
+    }
+  },
+  "mount": "1/4-20 captive hex nut, base center",
+  "source_calibration": "yaw_split_deg 68.68-68.83 from project JSONs; pitch from devlog/20260717_P01 (~18 deg down)",
+  "note": "Design-nominal values \u2014 use as the initial alignment; per-session auto alignment still refines the delta."
+}

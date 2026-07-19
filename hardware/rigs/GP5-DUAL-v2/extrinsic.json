@@ -1,0 +1,28 @@
+{
+  "rig_id": "GP5-DUAL-v2",
+  "revision_note": "rearload: camera slides in from the back, open rear",
+  "camera": {
+    "manufacturer": "GoPro",
+    "model": "HERO5 Black",
+    "count": 2,
+    "recording_mode": "4K_16:9_29.97_wide_eis_off",
+    "lens_profile": "GoPro_HERO5_Black_Wide_4K_16x9"
+  },
+  "extrinsic_nominal": {
+    "yaw_split_deg": 68.8,
+    "left_yaw_deg": -34.4,
+    "right_yaw_deg": 34.4,
+    "pitch_deg": -18.0,
+    "roll_deg": 0.0,
+    "baseline_mm": 101.0,
+    "optical_center_height_above_base_mm": 33.19,
+    "conventions": {
+      "yaw": "positive = clockwise seen from above (right camera positive)",
+      "pitch": "negative = tilted down",
+      "optical_center": "nominal camera front-face center; refine per session"
+    }
+  },
+  "mount": "1/4-20 captive hex nut, base center",
+  "source_calibration": "yaw_split_deg 68.68-68.83 from project JSONs; pitch from devlog/20260717_P01 (~18 deg down)",
+  "note": "Design-nominal values \u2014 use as the initial alignment; per-session auto alignment still refines the delta."
+}
