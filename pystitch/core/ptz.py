@@ -1178,15 +1178,56 @@ def draw_radar_panel(radar, si, panel_w):
     return img
 
 
+def clock_string(clock, frame):
+    """파노라마 프레임 → "1H 12:34" (+스코어) 경기 시계 문자열.
+
+    clock = {anchor_f, fps, base_s, tag, pauses[[f0,f1]], score}.
+    앵커(킥오프) 이전은 base_s 에 고정, 중단 구간(pauses)에서는 시계가
+    멈춘다 (hydration break 등). score = (팀A, 팀B, [[f, 1|2]]) 이면
+    frame 까지의 골 수를 세어 "A 1-0 B" 를 덧붙인다 — 득점 순간부터
+    스코어가 바뀐다.
+    """
+    fps = clock["fps"]
+    anchor = clock["anchor_f"]
+    el = max(0.0, (frame - anchor) / fps)
+    for p0, p1 in clock.get("pauses") or []:
+        el -= max(0.0, (min(frame, p1) - max(anchor, p0)) / fps)
+    t = clock.get("base_s", 0.0) + max(0.0, el)
+    s = f"{clock.get('tag', '')} {int(t // 60):02d}:{int(t % 60):02d}".strip()
+    sc = clock.get("score")
+    if sc:
+        a, b, goals = sc
+        ga = sum(1 for f_, tm in goals if f_ <= frame and tm == 1)
+        gb = sum(1 for f_, tm in goals if f_ <= frame and tm == 2)
+        s += f"  {a} {ga}-{gb} {b}"
+    return s
+
+
+def _draw_clock(img, text, out_w, out_h, alpha=0.55):
+    """좌상단 반투명 박스 + 흰 글자 시계 (미니맵과 동일한 스케일 규칙)."""
+    scale = out_h / 1080.0
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    fs, th = 0.9 * scale, max(2, int(round(2 * scale)))
+    (tw, tht), base = cv2.getTextSize(text, font, fs, th)
+    mgn = out_w // 96
+    pad = int(round(8 * scale))
+    roi = img[mgn:mgn + tht + base + 2 * pad, mgn:mgn + tw + 2 * pad]
+    cv2.addWeighted(np.zeros_like(roi), alpha, roi, 1.0 - alpha, 0.0, dst=roi)
+    cv2.putText(img, text, (mgn + pad, mgn + pad + tht), font, fs,
+                (255, 255, 255), th, cv2.LINE_AA)
+
+
 def render_plan(pano_path, out_path, plan, out_w=1920, out_h=1080,
                 codec="libx264", crf=20, log=print, progress=None,
                 cancel=None, radar=None, radar_alpha=0.55,
-                start=0, end=None):
+                start=0, end=None, clock=None):
     """2패스: 계획대로 크롭(필요 시 줌아웃 다운스케일)해 인코딩. fps 반환.
 
     radar(build_radar_data 결과)가 있으면 우하단에 반투명 탑다운
     레이더를 합성한다. start/end(프레임)로 구간 내보내기 — 오디오도
-    같은 오프셋으로 잘라 맞춘다."""
+    같은 오프셋으로 잘라 맞춘다. clock(clock_string 입력)이 있으면
+    좌상단에 경기 시계(+스코어)를 얹는다 — cv2 폰트 제약으로 ASCII
+    (1H/2H, 팀 이름은 호출부에서 ASCII 보장)."""
     import subprocess
     import time
 
@@ -1251,6 +1292,9 @@ def render_plan(pano_path, out_path, plan, out_w=1920, out_h=1080,
                            out_w - mgn - pw_:out_w - mgn]
                 cv2.addWeighted(pimg, radar_alpha, roi, 1.0 - radar_alpha,
                                 0.0, dst=roi)
+            if clock is not None:
+                crop = np.ascontiguousarray(crop)
+                _draw_clock(crop, clock_string(clock, i), out_w, out_h)
             enc.stdin.write(np.ascontiguousarray(crop).tobytes())
             done += 1
             if done % 90 == 0 and progress is not None:

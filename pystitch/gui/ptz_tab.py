@@ -227,6 +227,7 @@ class TimelineView(QWidget):
         self.events = []             # [(frame, label, kind)] kind: auto|user
         self.airborne = []           # [(f0, f1, apex_z)] 공중 구간
         self.highlights = []         # [(f0, f1, state, label)] 하이라이트 구간
+        self.pauses = []             # [(f0, f1)] 경기 중단 (시계 정지) 구간
         self._press = None
         self._resize = None          # 레인 경계 드래그 상태
 
@@ -246,6 +247,11 @@ class TimelineView(QWidget):
     def set_highlights(self, hls):
         """하이라이트 구간 [(f0, f1, state, label)] — 이벤트 레인 바."""
         self.highlights = list(hls)
+        self.update()
+
+    def set_pauses(self, pauses):
+        """경기 중단 구간 [(f0, f1)] — 회색 세로 밴드 (시계 정지)."""
+        self.pauses = list(pauses)
         self.update()
 
     def _emit_view(self):
@@ -528,6 +534,18 @@ class TimelineView(QWidget):
                     p.drawRect(x_ - 4, y + 1, 8, lh - 2)
                 p.drawText(QRect(x_ + 5, y, 140, lh),
                            Qt.AlignmentFlag.AlignVCenter, label)
+        # 경기 중단 구간: 회색 세로 밴드 (시계 정지 — hydration break 등)
+        if self.pauses and self.total > 1:
+            for f0, f1 in self.pauses:
+                x0_, x1_ = self._x(f0), self._x(f1)
+                if x1_ < self.GUTTER or x0_ > W:
+                    continue
+                p.fillRect(max(x0_, self.GUTTER), self.RULER,
+                           max(2, x1_ - max(x0_, self.GUTTER)),
+                           self.height() - self.RULER,
+                           QColor(150, 150, 160, 45))
+                p.setPen(QColor(170, 170, 180))
+                p.drawText(max(x0_, self.GUTTER) + 3, self.RULER + 11, "II")
         # 내보내기 구간: 바깥은 어둡게, IN/OUT 브래킷 표시
         if self.mark_in is not None or self.mark_out is not None:
             fi = 0 if self.mark_in is None else self.mark_in
@@ -945,10 +963,11 @@ class PtzRenderWorker(QThread):
 
     def __init__(self, pano_path, out_path, analysis, keyframes, codec, crf,
                  wide=False, ignores=None, far_zoom=1.0, promotes=None,
-                 radar=None, start=0, end=None):
+                 radar=None, start=0, end=None, clock=None):
         super().__init__()
         self.args = (pano_path, out_path, analysis, keyframes, codec, crf, wide,
-                     ignores or [], far_zoom, promotes or [], radar, start, end)
+                     ignores or [], far_zoom, promotes or [], radar, start, end,
+                     clock)
         self._cancel = False
 
     def cancel(self):
@@ -956,7 +975,7 @@ class PtzRenderWorker(QThread):
 
     def run(self):
         (pano, out, analysis, kfs, codec, crf, wide, ignores, far_zoom,
-         promotes, radar, start, end) = self.args
+         promotes, radar, start, end, clock) = self.args
         try:
             out_w, out_h = (2560, 1080) if wide else (1920, 1080)
             plan = build_plan(analysis, analysis["pano_w"], analysis["pano_h"],
@@ -972,7 +991,7 @@ class PtzRenderWorker(QThread):
                         log=lambda s: self.log.emit(s),
                         progress=lambda d, t, f: self.progress.emit(d, t, f),
                         cancel=lambda: self._cancel, radar=radar,
-                        start=start, end=end)
+                        start=start, end=end, clock=clock)
             if self._cancel:
                 self.failed.emit("취소됨")
             else:
@@ -985,7 +1004,8 @@ class ExportDialog(QDialog):
     """PTZ 내보내기 설정 대화창 — 구간(IN/OUT 마커 기준)·모드·코덱·미니맵."""
 
     def __init__(self, parent, total, fps, export_range, mode_idx,
-                 encoders, crf, radar_on, default_dir, default_stem):
+                 encoders, crf, radar_on, default_dir, default_stem,
+                 clock_on=None):
         super().__init__(parent)
         self.setWindowTitle("PTZ 내보내기")
         self.fps = fps
@@ -1033,6 +1053,16 @@ class ExportDialog(QDialog):
         self.check_radar = QCheckBox("우하단 반투명 탑다운 미니맵 (선수·공)")
         self.check_radar.setChecked(radar_on)
         form.addRow("미니맵", self.check_radar)
+
+        self.check_clock = QCheckBox("좌상단 경기 시계 (분:초 누적, "
+                                     "골1/골2 이벤트로 스코어)")
+        if clock_on is None:
+            self.check_clock.setEnabled(False)
+            self.check_clock.setToolTip(
+                "분석 메뉴 \"경기 정보\"에서 킥오프 앵커를 지정하세요")
+        else:
+            self.check_clock.setChecked(bool(clock_on))
+        form.addRow("경기 시계", self.check_clock)
 
         path_row = QHBoxLayout()
         self.edit_path = QLineEdit(self._default_path())
@@ -1086,7 +1116,91 @@ class ExportDialog(QDialog):
                 "codec_name": self.combo_codec.currentText(),
                 "crf": self.spin_crf.value(),
                 "radar": self.check_radar.isChecked(),
+                "clock": self.check_clock.isChecked(),
                 "path": self.edit_path.text().strip()}
+
+
+class MatchInfoDialog(QDialog):
+    """경기 정보 — 시계 앵커(킥오프)·전/후반·하프 길이·중단 구간 요약.
+
+    시계는 축구 관례의 분:초 누적 표기 (후반 30분 하프면 30:00부터,
+    연장 포함 90/120분도 분 단위로 계속 커진다).
+    """
+
+    def __init__(self, parent, fps, total, kickoffs, info, cur_frame):
+        super().__init__(parent)
+        self.setWindowTitle("경기 정보")
+        info = info or {}
+        self.fps = fps
+        form = QFormLayout(self)
+
+        self.combo_half = QComboBox()
+        self.combo_half.addItems(["전반", "후반"])
+        self.combo_half.setCurrentIndex(1 if info.get("half", 1) == 2 else 0)
+        form.addRow("이 영상의 하프", self.combo_half)
+
+        self.spin_len = QDoubleSpinBox(minimum=5.0, maximum=90.0,
+                                       value=float(info.get("half_len_min",
+                                                            45.0)))
+        self.spin_len.setSuffix(" 분")
+        self.spin_len.setDecimals(0)
+        form.addRow("하프 길이", self.spin_len)
+
+        self.combo_anchor = QComboBox()
+        self._anchor_frames: list = []
+        for k in kickoffs:
+            self.combo_anchor.addItem(
+                f"킥오프 {ExportDialog._hms(k['t'])} (신뢰도 {k['score']:.2f})")
+            self._anchor_frames.append(int(k["t"] * fps))
+        self.combo_anchor.addItem(
+            f"현재 프레임 {ExportDialog._hms(cur_frame / fps)}")
+        self._anchor_frames.append(int(cur_frame))
+        self.combo_anchor.addItem("지정 안 함 (시계 사용 불가)")
+        self._anchor_frames.append(None)
+        saved = info.get("anchor_f")
+        if saved is not None:
+            best = min(range(len(self._anchor_frames) - 1),
+                       key=lambda i: abs(self._anchor_frames[i] - saved),
+                       default=None)
+            if best is not None \
+                    and abs(self._anchor_frames[best] - saved) > 2 * fps:
+                # 저장된 앵커가 목록에 없음 — 그대로 보존하는 항목 추가
+                self.combo_anchor.insertItem(
+                    0, f"저장된 앵커 {ExportDialog._hms(saved / fps)}")
+                self._anchor_frames.insert(0, int(saved))
+                best = 0
+            self.combo_anchor.setCurrentIndex(best if best is not None else 0)
+        else:
+            self.combo_anchor.setCurrentIndex(len(self._anchor_frames) - 1)
+        form.addRow("킥오프 앵커 (시계 0점)", self.combo_anchor)
+
+        self.check_cum = QCheckBox("후반 시계에 전반 시간 누적 "
+                                   "(하프 길이만큼 더해 30:00/45:00부터)")
+        self.check_cum.setChecked(bool(info.get("cumulative", True)))
+        form.addRow("", self.check_cum)
+
+        n_pause = len(info.get("pauses") or [])
+        form.addRow("중단 구간", QLabel(
+            f"{n_pause}개 — 타임라인 우클릭 \"IN/OUT → 경기 중단\"으로 "
+            "추가/삭제 (중단 동안 시계 정지)"))
+        form.addRow("스코어", QLabel(
+            "사용자 이벤트 라벨 \"골1\"/\"골2\" = 팀1/팀2 득점으로 집계 "
+            "→ 시계 옆에 표시"))
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                              | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+        self._pauses = [list(p) for p in info.get("pauses") or []]
+
+    def config(self) -> dict:
+        return {"half": self.combo_half.currentIndex() + 1,
+                "half_len_min": float(self.spin_len.value()),
+                "anchor_f": self._anchor_frames[
+                    self.combo_anchor.currentIndex()],
+                "cumulative": self.check_cum.isChecked(),
+                "pauses": self._pauses}
 
 
 class HighlightBatchWorker(QThread):
@@ -1099,11 +1213,11 @@ class HighlightBatchWorker(QThread):
 
     def __init__(self, pano_path, out_dir, stem, analysis, keyframes, codec,
                  crf, ignores=None, far_zoom=1.0, promotes=None, radar=None,
-                 segments=()):
+                 segments=(), clock=None):
         super().__init__()
         self.args = (pano_path, out_dir, stem, analysis, keyframes, codec,
                      crf, ignores or [], far_zoom, promotes or [], radar,
-                     list(segments))
+                     list(segments), clock)
         self._cancel = False
 
     def cancel(self):
@@ -1111,7 +1225,7 @@ class HighlightBatchWorker(QThread):
 
     def run(self):
         (pano, out_dir, stem, analysis, kfs, codec, crf, ignores, far_zoom,
-         promotes, radar, segs) = self.args
+         promotes, radar, segs, clock) = self.args
         try:
             out_w, out_h = 1920, 1080
             plan = build_plan(analysis, analysis["pano_w"], analysis["pano_h"],
@@ -1132,7 +1246,7 @@ class HighlightBatchWorker(QThread):
                             progress=lambda d, _t, f, b=base:
                                 self.progress.emit(b + d, total, f),
                             cancel=lambda: self._cancel, radar=radar,
-                            start=s, end=e)
+                            start=s, end=e, clock=clock)
                 base += e - s
             if self._cancel:
                 self.failed.emit("취소됨")
@@ -1146,7 +1260,7 @@ class HighlightExportDialog(QDialog):
     """하이라이트 일괄 내보내기 — 구간 체크 목록·출력 폴더·코덱/CRF/미니맵."""
 
     def __init__(self, parent, highlights, fps, encoders, crf, radar_on,
-                 default_dir):
+                 default_dir, clock_on=None):
         super().__init__(parent)
         self.setWindowTitle("하이라이트 일괄 내보내기")
         self.fps = fps
@@ -1197,6 +1311,14 @@ class HighlightExportDialog(QDialog):
         self.check_radar = QCheckBox("우하단 반투명 탑다운 미니맵 (선수·공)")
         self.check_radar.setChecked(radar_on)
         form.addRow("미니맵", self.check_radar)
+        self.check_clock = QCheckBox("좌상단 경기 시계 (분:초 누적)")
+        if clock_on is None:
+            self.check_clock.setEnabled(False)
+            self.check_clock.setToolTip(
+                "분석 메뉴 \"경기 정보\"에서 킥오프 앵커를 지정하세요")
+        else:
+            self.check_clock.setChecked(bool(clock_on))
+        form.addRow("경기 시계", self.check_clock)
 
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
                               | QDialogButtonBox.StandardButton.Cancel)
@@ -1221,7 +1343,8 @@ class HighlightExportDialog(QDialog):
         return {"indices": idx, "dir": self.edit_dir.text().strip(),
                 "codec_name": self.combo_codec.currentText(),
                 "crf": self.spin_crf.value(),
-                "radar": self.check_radar.isChecked()}
+                "radar": self.check_radar.isChecked(),
+                "clock": self.check_clock.isChecked()}
 
 
 class PtzTab(QWidget):
@@ -1245,6 +1368,7 @@ class PtzTab(QWidget):
         self.team_names = ["팀1", "팀2"]  # 사용자 입력 팀 이름
         self.user_events: list[list] = []  # [[frame, label]] 사용자 이벤트
         self.highlights: list[dict] = []   # .events.json "highlights" 문서
+        self.match_info: dict | None = None  # 경기 정보 (하프·앵커·중단)
         self.roles: dict[int, int] = {}   # {track_id: 역할} 사용자 지정 (GK 등)
         self.field_points: dict[str, list] = {}   # {랜드마크키: [x, y]}
         self.line_points: list[list] = []  # 흰 선 검출 샘플 [x, y] (사이드라인)
@@ -1691,6 +1815,8 @@ class PtzTab(QWidget):
         self.trackbar.set_events(items)
         self.highlights = doc.get("highlights", [])
         self._refresh_highlight_lane()
+        self.trackbar.set_pauses(
+            (self.match_info or {}).get("pauses") or [])
 
     def _refresh_highlight_lane(self):
         self.trackbar.set_highlights(
@@ -1781,6 +1907,8 @@ class PtzTab(QWidget):
         self.line_points = []
         self.extra_players = {}
         self.kit_colors = {}
+        self.user_events = []
+        self.match_info = None
         sp = self._sidecar_path()
         doc = None
         if sp.exists():
@@ -1814,6 +1942,7 @@ class PtzTab(QWidget):
                 self.team_names = [str(tn[0]), str(tn[1])]
             self.user_events = [[int(e[0]), str(e[1])]
                                 for e in doc.get("user_events", [])]
+            self.match_info = doc.get("match_info")
             ids = [int(p[4]) for rows in self.extra_players.values()
                    for p in rows]
             self._next_extra_id = max(ids, default=900000) + 1
@@ -1885,7 +2014,8 @@ class PtzTab(QWidget):
                                    "kit_colors": self.kit_colors,
                                    "export_range": self.export_range,
                                    "team_names": self.team_names,
-                                   "user_events": self.user_events}))
+                                   "user_events": self.user_events,
+                                   "match_info": self.match_info}))
         tmp.replace(sp)
 
     def _write_analysis(self):
@@ -3453,11 +3583,14 @@ class PtzTab(QWidget):
             return
         self._stop_play()
         st = QSettings("PyStitch360", "PyStitch360")
+        clock_avail = self._clock_config() is not None
         dlg = HighlightExportDialog(
             self, cands, self.fps, self.encoders,
             int(st.value("ptz_export_crf", 20)),
             st.value("ptz_export_radar", "true") == "true",
-            str(self.pano_path.parent))
+            str(self.pano_path.parent),
+            clock_on=(st.value("ptz_export_clock", "true") == "true"
+                      if clock_avail else None))
         if not dlg.exec():
             return
         cfg = dlg.config()
@@ -3465,6 +3598,8 @@ class PtzTab(QWidget):
             return
         st.setValue("ptz_export_crf", cfg["crf"])
         st.setValue("ptz_export_radar", "true" if cfg["radar"] else "false")
+        if clock_avail:
+            st.setValue("ptz_export_clock", "true" if cfg["clock"] else "false")
         import re
         segs = []
         for i in cfg["indices"]:
@@ -3492,7 +3627,8 @@ class PtzTab(QWidget):
             ignores=[tuple(r) for r in self.ignores],
             far_zoom=self.spin_far_zoom.value(),
             promotes=[tuple(p) for p in self.promotes],
-            radar=radar, segments=segs)
+            radar=radar, segments=segs,
+            clock=self._clock_config() if cfg["clock"] else None)
         w.log.connect(self.log)
         w.progress.connect(self._render_progress)
         w.finished_ok.connect(self._batch_done)
@@ -3503,6 +3639,87 @@ class PtzTab(QWidget):
         self.progress.setRange(0, 0)
         self.progress.setFormat("준비 중...")
         w.start()
+
+    # ------------------------------------------------------ 경기 정보/시계
+    def edit_match_info(self):
+        """분석 메뉴: 경기 정보 (시계 앵커·하프·중단 구간) 입력."""
+        if self.pano_path is None:
+            QMessageBox.information(self, "경기 정보", "열린 파노라마가 없습니다.")
+            return
+        kicks = []
+        try:
+            from ..core.events import load_events
+            kicks = load_events(self.pano_path)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"[clock] 킥오프 목록 무시: {e}")
+        dlg = MatchInfoDialog(self, self.fps, self.total, kicks,
+                              self.match_info, int(self.slider.value()))
+        if not dlg.exec():
+            return
+        self.match_info = dlg.config()
+        self._save_keyframes()
+        mi = self.match_info
+        anchor = ("미지정" if mi["anchor_f"] is None
+                  else self._hms(mi["anchor_f"] / self.fps))
+        self.log(f"[clock] 경기 정보: {'후반' if mi['half'] == 2 else '전반'} "
+                 f"{mi['half_len_min']:.0f}분, 앵커 {anchor}, "
+                 f"중단 {len(mi.get('pauses') or [])}개")
+
+    def _clock_config(self):
+        """render_plan 용 시계 설정 — 앵커 미지정이면 None.
+
+        표기는 분:초 누적 (후반 +하프길이, 연장 90/120분도 분이 계속
+        커짐). cv2 폰트 제약으로 태그는 1H/2H, 비ASCII 팀 이름은 T1/T2.
+        """
+        mi = self.match_info or {}
+        if mi.get("anchor_f") is None:
+            return None
+        half = 2 if int(mi.get("half", 1)) == 2 else 1
+        base = (float(mi.get("half_len_min", 45.0)) * 60.0
+                if half == 2 and mi.get("cumulative", True) else 0.0)
+        goals = []
+        for f, lb in self.user_events:
+            lb = str(lb).replace(" ", "")
+            if lb == "골1":
+                goals.append([int(f), 1])
+            elif lb == "골2":
+                goals.append([int(f), 2])
+        score = None
+        if goals:
+            names = [n.strip() if n.strip() and n.isascii() else f"T{i + 1}"
+                     for i, n in enumerate(self.team_names)]
+            score = (names[0], names[1], goals)
+        return {"anchor_f": int(mi["anchor_f"]), "fps": self.fps,
+                "base_s": base, "tag": "2H" if half == 2 else "1H",
+                "pauses": [[int(a), int(b)]
+                           for a, b in mi.get("pauses") or []],
+                "score": score}
+
+    def _add_pause_range(self):
+        """IN/OUT 마커 구간 → 경기 중단 (시계 정지, hydration break 등)."""
+        r = self._norm_export_range()
+        if r is None:
+            return
+        mi = self.match_info or {"half": 1, "half_len_min": 45.0,
+                                 "anchor_f": None, "cumulative": True,
+                                 "pauses": []}
+        mi.setdefault("pauses", []).append([int(r[0]), int(r[1])])
+        mi["pauses"].sort()
+        self.match_info = mi
+        self._save_keyframes()
+        self.trackbar.set_pauses(mi["pauses"])
+        self.log(f"[clock] 경기 중단 구간 추가: "
+                 f"{self._hms(r[0] / self.fps)}~{self._hms(r[1] / self.fps)}"
+                 f" (시계 정지, 총 {len(mi['pauses'])}개)")
+
+    def _del_pause(self, i):
+        pauses = (self.match_info or {}).get("pauses") or []
+        if 0 <= i < len(pauses):
+            p0, p1 = pauses.pop(i)
+            self._save_keyframes()
+            self.trackbar.set_pauses(pauses)
+            self.log(f"[clock] 경기 중단 구간 삭제: "
+                     f"{self._hms(p0 / self.fps)}~{self._hms(p1 / self.fps)}")
 
     def _batch_done(self, n, out_dir):
         self.btn_export.setEnabled(True)
@@ -3606,6 +3823,15 @@ class PtzTab(QWidget):
         if self._norm_export_range():
             menu.addAction("IN/OUT 마커 구간 → 새 하이라이트...",
                            lambda: self._add_manual_highlight(None))
+            menu.addAction("IN/OUT → 경기 중단 구간 (시계 정지)",
+                           self._add_pause_range)
+        for i, (p0, p1) in enumerate(
+                (self.match_info or {}).get("pauses") or []):
+            if p0 <= f <= p1:
+                menu.addAction(
+                    f"경기 중단 구간 삭제 — {self._hms(p0 / self.fps)}~"
+                    f"{self._hms(p1 / self.fps)}",
+                    lambda _=False, ii=i: self._del_pause(ii))
         hl = [i for i, h in enumerate(self.highlights)
               if h["t0"] * self.fps <= f <= h["t1"] * self.fps]
         for i in hl:
@@ -4283,12 +4509,15 @@ class PtzTab(QWidget):
             return
         self._stop_play()
         st = QSettings("PyStitch360", "PyStitch360")
+        clock_avail = self._clock_config() is not None
         dlg = ExportDialog(
             self, self.total, self.fps, self._norm_export_range(),
             self.combo_mode.currentIndex(), self.encoders,
             int(st.value("ptz_export_crf", 20)),
             st.value("ptz_export_radar", "true") == "true",
-            str(self.pano_path.parent), self.pano_path.stem)
+            str(self.pano_path.parent), self.pano_path.stem,
+            clock_on=(st.value("ptz_export_clock", "true") == "true"
+                      if clock_avail else None))
         if not dlg.exec():
             return
         cfg = dlg.config()
@@ -4296,6 +4525,8 @@ class PtzTab(QWidget):
             return
         st.setValue("ptz_export_crf", cfg["crf"])
         st.setValue("ptz_export_radar", "true" if cfg["radar"] else "false")
+        if clock_avail:
+            st.setValue("ptz_export_clock", "true" if cfg["clock"] else "false")
         wide = cfg["wide"]
         self.combo_mode.setCurrentIndex(1 if wide else 0)  # 미리보기 일치
         codec = self.encoders[cfg["codec_name"]]
@@ -4317,12 +4548,18 @@ class PtzTab(QWidget):
                  f"구간 {self._hms(cfg['start']/self.fps)}~"
                  f"{self._hms(cfg['end']/self.fps)} ({dur/60:.1f}분), "
                  f"키프레임 {len(kfs)}개 반영")
+        clock = self._clock_config() if cfg["clock"] else None
+        if clock is not None:
+            self.log(f"[ptz] 경기 시계 포함 ({clock['tag']}, "
+                     f"중단 {len(clock['pauses'])}개"
+                     + (", 스코어" if clock["score"] else "") + ")")
         w = PtzRenderWorker(str(self.pano_path), cfg["path"], self.analysis,
                             kfs, codec, cfg["crf"], wide=wide,
                             ignores=[tuple(r) for r in self.ignores],
                             far_zoom=self.spin_far_zoom.value(),
                             promotes=[tuple(p) for p in self.promotes],
-                            radar=radar, start=cfg["start"], end=cfg["end"])
+                            radar=radar, start=cfg["start"], end=cfg["end"],
+                            clock=clock)
         w.log.connect(self.log)
         w.progress.connect(self._render_progress)
         w.finished_ok.connect(self._render_done)

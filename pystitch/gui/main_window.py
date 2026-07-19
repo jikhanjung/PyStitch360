@@ -97,6 +97,8 @@ class MainWindow(QMainWindow):
                     lambda: self.ptz_tab.detect_highlights())
         a.addAction("하이라이트 일괄 내보내기...",
                     lambda: self.ptz_tab.export_highlights())
+        a.addAction("경기 정보 (시계 앵커·중단 구간)...",
+                    lambda: self.ptz_tab.edit_match_info())
         a.addSeparator()
         a.addAction("공/키프레임 편집 초기화",
                     lambda: self.ptz_tab.reset_edits("ball"))
