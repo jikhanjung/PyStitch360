@@ -30,8 +30,8 @@ from ..core.field import (
 from ..core.ptz import (
     accept_ball_tracks, analyze_video, build_plan, build_radar_data,
     classify_teams, gapfill_analysis, gapfill_targets, ground_positions,
-    link_ball_tracks, ptz_available, render_plan, same_spot_spans,
-    tracklet_colors,
+    link_ball_tracks, propagate_seed, ptz_available, render_plan,
+    same_spot_spans, tracklet_colors,
 )
 from .widgets import FramePane
 
@@ -694,6 +694,34 @@ class GapfillWorker(QThread):
             self.failed.emit(str(e))
 
 
+class SeedWorker(QThread):
+    """시드 전파: 수동 공/선수 인식을 앞뒤 샘플로 확장 (propagate_seed)."""
+
+    done = pyqtSignal(str, list, object)   # kind, matches, ctx(tid 등)
+    failed = pyqtSignal(str)
+    log = pyqtSignal(str)
+
+    def __init__(self, pano_path, analysis, f0, x0, y0, kind,
+                 weights=None, ctx=None):
+        super().__init__()
+        self.args = (pano_path, analysis, f0, x0, y0, kind, weights, ctx)
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        pano, analysis, f0, x0, y0, kind, weights, ctx = self.args
+        try:
+            m = propagate_seed(pano, analysis, f0, x0, y0, kind=kind,
+                               weights=weights,
+                               cancel=lambda: self._cancel,
+                               log=lambda s: self.log.emit(s))
+            self.done.emit(kind, m, ctx)
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(str(e))
+
+
 class PlanWorker(QThread):
     """크롭 계획 미리보기 재계산 (키프레임/무시 변경 시 백그라운드)."""
 
@@ -1005,6 +1033,7 @@ class PtzTab(QWidget):
         self._lm_drag = None              # 드래그 중인 랜드마크 키
         self._analyze_worker = None
         self._gapfill_worker = None
+        self._seed_worker = None
         self._render_worker = None
         self._plan_worker = None
         self._link_worker = None
@@ -2374,6 +2403,12 @@ class PtzTab(QWidget):
             menu.addAction("여기 크롭 키프레임 추가", _add_kf_here)
         elif o["kind"] == "kf":
             is_kf = len(self.keyframes[o["i"]]) > 3
+            if not is_kf:
+                k = self.keyframes[o["i"]]
+                menu.addAction("앞뒤로 추적 확장 (±4s)",
+                               lambda: self._propagate(
+                                   int(k[0]), float(k[1]), float(k[2]),
+                                   "ball"))
             menu.addAction("공으로 전환 (줌 자동)" if is_kf
                            else "크롭 키프레임으로 전환 (현재 폭 고정)",
                            lambda: self._toggle_kf_type(o["i"]))
@@ -2409,6 +2444,18 @@ class PtzTab(QWidget):
                               lambda _=False, t=tid: self._set_role(t, None))
             if tid >= 900001:
                 sub.addSeparator()
+                row = next((p for si_ in self.extra_players
+                            for p in self.extra_players[si_]
+                            if p[4] == tid), None)
+                if row is not None:
+                    si_seed = next(si_ for si_ in self.extra_players
+                                   if any(p[4] == tid for p in
+                                          self.extra_players[si_]))
+                    f_seed = int(self.analysis["frames"][si_seed])
+                    sub.addAction("앞뒤로 추적 확장 (±4s)",
+                                  lambda _=False, ff=f_seed, rr=row, t=tid:
+                                  self._propagate(ff, rr[0], rr[1],
+                                                  "person", ctx=t))
                 sub.addAction("이 수동 검출 삭제",
                               lambda _=False, t=tid: self._delete_extra(t))
         if self.analysis is not None and self._current_sample() is not None:
@@ -3391,6 +3438,60 @@ class PtzTab(QWidget):
                            self._set_role(t, r_))
         menu.addAction("역할 없이 두기", lambda: None)
         menu.exec(gpos)
+
+    def _propagate(self, f, x, y, kind, ctx=None):
+        """시드 전파 시작 — 수동 인식을 앞뒤 ±4s 로 확장."""
+        if self.analysis is None:
+            return
+        if self._seed_worker is not None and self._seed_worker.isRunning():
+            self.log("[seed] 이미 실행 중")
+            return
+        w = SeedWorker(str(self.pano_path), self.analysis, f, x, y, kind,
+                       weights=self._model_weights(), ctx=ctx)
+        w.log.connect(self.log)
+        w.done.connect(self._seed_done)
+        w.failed.connect(lambda e: self.log(f"[seed] 실패: {e}"))
+        self._seed_worker = w
+        self.log(f"[seed] {'공' if kind == 'ball' else '선수'} 추적 확장 "
+                 f"시작 ({f/self.fps:.1f}s ±4s)...")
+        w.start()
+
+    def _seed_done(self, kind, matches, ctx):
+        if not matches:
+            self.log("[seed] 연결된 샘플 없음")
+            return
+        if kind == "ball":
+            nb = 0
+            for si, x, y, w_, h_, c in matches:
+                cands = self.analysis["ball_cands"][si]
+                if any(np.hypot(x - p[0], y - p[1]) <= 30 for p in cands):
+                    continue
+                cands.append([x, y, max(0.26, c), w_, h_, c])
+                if self.analysis["balls"][si] is None:
+                    self.analysis["balls"][si] = [x, y, max(0.26, c), w_, h_]
+                nb += 1
+            self._write_analysis()
+            self.log(f"[seed] 공 {nb}샘플 주입 — 트랙 재연결")
+            self._start_link()
+        else:
+            tid = int(ctx)
+            np_ = 0
+            for si, x, y, w_, h_, c in matches:
+                rows = self.extra_players.setdefault(int(si), [])
+                if any(p[4] == tid or np.hypot(x - p[0], y - p[1])
+                       < max(w_ / 2, 20) for p in rows):
+                    continue
+                if any(len(p) >= 5 and
+                       (p[0] - x) ** 2 + (p[1] - y) ** 2 < (p[3] / 2) ** 2
+                       for p in self.analysis["players"][si]):
+                    continue                 # 분석 검출과 중복
+                rows.append([x, y, w_, h_, tid])
+                np_ += 1
+            self._save_keyframes()
+            self._pcache_id = None
+            self._refresh_player_list()
+            self._redraw()
+            self.log(f"[seed] 선수 #{tid - 900000} {np_}샘플로 확장")
 
     def _delete_extra(self, tid):
         for si, rows in list(self.extra_players.items()):

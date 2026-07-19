@@ -448,6 +448,85 @@ def gapfill_analysis(pano_path, analysis, targets, weights=None,
     return n_ball, n_person
 
 
+def propagate_seed(pano_path, analysis, f0, x0, y0, kind="ball",
+                   weights=None, max_extend_s=4.0, conf=0.06,
+                   radius=150.0, tile=640, miss_limit=3,
+                   cancel=None, log=print):
+    """수동 인식(공/선수) 시드를 앞뒤 샘플로 따라가며 확장.
+
+    시드 (f0, x0, y0) 의 최근접 샘플에서 출발해 양방향으로 저문턱 타일
+    검출을 체인으로 잇는다 — 크롭 중심은 직전 매칭 위치, 매칭은 반경
+    radius 내 최고 conf. 연속 miss_limit 회 놓치면 그 방향 중단.
+    순방향은 순차 grab(빠름), 역방향은 프레임 시크(느림 — 조기 중단이
+    비용을 줄임). 반환: [(si, x, y, w, h, conf), ...] (시드 샘플 포함).
+    """
+    from ultralytics import YOLO
+    model = YOLO(str(weights or _DEFAULT_WEIGHTS))
+    cls = _CLS_BALL if kind == "ball" else _CLS_PERSON
+    cap = cv2.VideoCapture(str(pano_path))
+    W = analysis["pano_w"]
+    H = analysis["pano_h"]
+    frames = np.asarray(analysis["frames"])
+    fps = analysis["fps"]
+    de = analysis["detect_every"]
+    si0 = int(np.argmin(np.abs(frames - f0)))
+    n_ext = max(1, int(round(max_extend_s * fps / de)))
+
+    def detect_at(frame, cx, cy):
+        x0_ = int(np.clip(cx - tile / 2, 0, max(W - tile, 0)))
+        y0_ = int(np.clip(cy - tile / 2, 0, max(H - tile, 0)))
+        crop = frame[y0_:y0_ + tile, x0_:x0_ + tile]
+        r = model.predict(crop, imgsz=tile, conf=conf, classes=[cls],
+                          verbose=False)[0]
+        best = None
+        for b in r.boxes:
+            bx1, by1, bx2, by2 = b.xyxy[0].tolist()
+            bx, by = x0_ + (bx1 + bx2) / 2, y0_ + (by1 + by2) / 2
+            c = float(b.conf[0])
+            if (bx - cx) ** 2 + (by - cy) ** 2 <= radius ** 2 \
+                    and (best is None or c > best[4]):
+                best = (bx, by, bx2 - bx1, by2 - by1, c)
+        return best
+
+    out = []
+    pos_f = -10 ** 9
+    for direction in (1, -1):
+        cx, cy = float(x0), float(y0)
+        misses = 0
+        rng = range(si0, min(si0 + n_ext + 1, len(frames))) \
+            if direction == 1 else range(si0 - 1, max(si0 - n_ext - 1, -1), -1)
+        for si in rng:
+            if cancel is not None and cancel():
+                break
+            F = int(frames[si])
+            if direction == 1 and 0 <= F - pos_f <= 90:
+                for _ in range(F - pos_f - 1):
+                    cap.grab()
+            else:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, F)
+            ok, frame = cap.read()
+            pos_f = F
+            if not ok:
+                break
+            hit = detect_at(frame, cx, cy)
+            if hit is None:
+                misses += 1
+                if misses >= miss_limit:
+                    break
+                continue
+            misses = 0
+            cx, cy = hit[0], hit[1]
+            if direction == -1 or si != si0 or not out:
+                out.append((int(si), round(hit[0], 1), round(hit[1], 1),
+                            round(hit[2], 1), round(hit[3], 1),
+                            round(hit[4], 3)))
+    cap.release()
+    out.sort()
+    log(f"[seed] {kind} 시드 {f0/fps:.1f}s → {len(out)}샘플 연결 "
+        f"(±{max_extend_s:.0f}s 창)")
+    return out
+
+
 def classify_teams(analysis, k=3, roles=None):
     """트랙릿(선수 ID)별 유니폼 색으로 팀/역할 분류.
 
