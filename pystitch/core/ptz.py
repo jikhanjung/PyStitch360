@@ -958,11 +958,13 @@ def draw_radar_panel(radar, si, panel_w):
 
 def render_plan(pano_path, out_path, plan, out_w=1920, out_h=1080,
                 codec="libx264", crf=20, log=print, progress=None,
-                cancel=None, radar=None, radar_alpha=0.55):
+                cancel=None, radar=None, radar_alpha=0.55,
+                start=0, end=None):
     """2패스: 계획대로 크롭(필요 시 줌아웃 다운스케일)해 인코딩. fps 반환.
 
     radar(build_radar_data 결과)가 있으면 우하단에 반투명 탑다운
-    레이더를 합성한다."""
+    레이더를 합성한다. start/end(프레임)로 구간 내보내기 — 오디오도
+    같은 오프셋으로 잘라 맞춘다."""
     import subprocess
     import time
 
@@ -971,10 +973,15 @@ def render_plan(pano_path, out_path, plan, out_w=1920, out_h=1080,
     pano_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     pano_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
+    n = len(plan["cx"])
+    end = n if end is None else max(0, min(int(end), n))
+    start = max(0, min(int(start), end))
+    audio_in = (["-ss", f"{start / fps:.3f}"] if start else []) \
+        + ["-i", str(pano_path)]
     cmd = ([ffmpeg_bin(), "-y", "-v", "error",
             "-f", "rawvideo", "-pix_fmt", "bgr24",
-            "-s", f"{out_w}x{out_h}", "-r", f"{fps}", "-i", "-",
-            "-i", str(pano_path), "-map", "0:v", "-map", "1:a?"]
+            "-s", f"{out_w}x{out_h}", "-r", f"{fps}", "-i", "-"]
+           + audio_in + ["-map", "0:v", "-map", "1:a?"]
            + encoder_args(codec, crf)
            + ["-pix_fmt", "yuv420p", "-c:a", "copy", "-shortest", str(out_path)])
     enc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
@@ -986,7 +993,9 @@ def render_plan(pano_path, out_path, plan, out_w=1920, out_h=1080,
     t0 = time.perf_counter()
     done = 0
     try:
-        for i in range(len(cx)):
+        if start:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+        for i in range(start, end):
             if cancel is not None and cancel():
                 log("[render] 사용자 취소")
                 break
@@ -1023,7 +1032,7 @@ def render_plan(pano_path, out_path, plan, out_w=1920, out_h=1080,
             enc.stdin.write(np.ascontiguousarray(crop).tobytes())
             done += 1
             if done % 90 == 0 and progress is not None:
-                progress(done, len(cx), done / (time.perf_counter() - t0))
+                progress(done, end - start, done / (time.perf_counter() - t0))
             if done % 900 == 0:
                 el = time.perf_counter() - t0
                 log(f"[render] {done}/{len(cx)} @ {done/el:.2f}fps")

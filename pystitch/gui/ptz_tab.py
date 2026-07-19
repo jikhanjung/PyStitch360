@@ -15,10 +15,10 @@ from PyQt6.QtCore import QSettings, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QCheckBox
 from PyQt6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
-    QColorDialog, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout,
-    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMenu, QMessageBox,
-    QProgressBar, QPushButton, QSlider, QSpinBox, QTabWidget, QVBoxLayout,
-    QWidget,
+    QColorDialog, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
+    QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar,
+    QPushButton, QSlider, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from ..core.encoders import available_encoders
@@ -81,6 +81,7 @@ class RadarView(QWidget):
     def __init__(self):
         super().__init__()
         self.setFixedHeight(180)
+        self.setFixedWidth(int(180 * 110 / 75))   # 기본(카메라 기준) 범위 비율
         self.points: list = []      # (X, Y, team)
         self.ball = None            # (X, Y) or None
         self.field = None           # {length, width, cam} — 캘리브레이션 후
@@ -91,9 +92,22 @@ class RadarView(QWidget):
         self.update()
 
     def set_field(self, field):
-        """경기장 절대 좌표 모드 on/off — 켜지면 실측 경기장을 그린다."""
+        """경기장 절대 좌표 모드 on/off — 켜지면 실측 경기장을 그린다.
+
+        위젯 폭을 표시 범위의 실제 가로세로 비율에 맞춰 고정 —
+        경기장 사각형이 입력 크기(예: 100×62m) 비율 그대로 보인다.
+        """
         if field != self.field:
             self.field = field
+            h = self.height()
+            if field:
+                hl, hw = field["length"] / 2, field["width"] / 2
+                camy = field["cam"][1]
+                span_x = (hl + 6) * 2
+                span_y = (hw + 6) - (min(camy, -hw) - 4)
+            else:
+                span_x, span_y = 110.0, 75.0
+            self.setFixedWidth(int(round(h * span_x / span_y)))
             self.update()
 
     def paintEvent(self, ev):
@@ -165,6 +179,7 @@ class TimelineView(QWidget):
 
     seek = pyqtSignal(int)
     pick = pyqtSignal(str, int)      # ("kf"|"ball"|"ignore"|"player", 키)
+    range_menu = pyqtSignal(int, object)   # 우클릭: (프레임, 전역 좌표)
 
     RULER = 16
     LANE_H = 20
@@ -186,7 +201,21 @@ class TimelineView(QWidget):
         self.t0 = 0.0                # 보이는 시작 프레임
         self.ppf = 0.0               # 픽셀/프레임 (0 = 전체 맞춤)
         self.selected = None         # (종류, 키)
+        self.mark_in = None          # 내보내기 시작 프레임 (None=미지정)
+        self.mark_out = None         # 내보내기 끝 프레임
         self._press = None
+
+    def set_range(self, f0, f1):
+        if (f0, f1) != (self.mark_in, self.mark_out):
+            self.mark_in, self.mark_out = f0, f1
+            self.update()
+
+    def contextMenuEvent(self, ev):
+        if self.total <= 1:
+            return
+        x = int(ev.pos().x())
+        f = int(min(max(self._f(max(x, self.GUTTER)), 0), self.total - 1))
+        self.range_menu.emit(f, ev.globalPos())
 
     # --------------------------------------------------------------- 데이터
     def set_data(self, total, spans, ignores, kfs, promotes=None):
@@ -332,6 +361,23 @@ class TimelineView(QWidget):
             if self.selected == ("player", tid):
                 p.setPen(QColor(255, 255, 255))
                 p.drawRect(r[0] - 1, r[1] - 1, r[2] + 1, r[3] + 1)
+        # 내보내기 구간: 바깥은 어둡게, IN/OUT 브래킷 표시
+        if self.mark_in is not None or self.mark_out is not None:
+            fi = 0 if self.mark_in is None else self.mark_in
+            fo = self.total - 1 if self.mark_out is None else self.mark_out
+            xa, xb = self._x(fi), self._x(fo)
+            dim = QColor(0, 0, 0, 110)
+            if xa > self.GUTTER:
+                p.fillRect(self.GUTTER, self.RULER,
+                           xa - self.GUTTER, self.height(), dim)
+            if xb < W:
+                p.fillRect(xb, self.RULER, W - xb, self.height(), dim)
+            p.setPen(QColor(80, 230, 120))
+            p.drawLine(xa, 0, xa, self.height())
+            p.drawText(xa + 3, self.height() - 4, "IN")
+            p.setPen(QColor(240, 120, 80))
+            p.drawLine(xb, 0, xb, self.height())
+            p.drawText(xb - 26, self.height() - 4, "OUT")
         # 거터 마스크 + 플레이헤드
         p.fillRect(0, self.RULER, self.GUTTER, self.height(), QColor(34, 34, 38))
         for i, name in enumerate(self.LANES):     # 라벨 다시 (마스크 위)
@@ -591,10 +637,10 @@ class PtzRenderWorker(QThread):
 
     def __init__(self, pano_path, out_path, analysis, keyframes, codec, crf,
                  wide=False, ignores=None, far_zoom=1.0, promotes=None,
-                 radar=None):
+                 radar=None, start=0, end=None):
         super().__init__()
         self.args = (pano_path, out_path, analysis, keyframes, codec, crf, wide,
-                     ignores or [], far_zoom, promotes or [], radar)
+                     ignores or [], far_zoom, promotes or [], radar, start, end)
         self._cancel = False
 
     def cancel(self):
@@ -602,7 +648,7 @@ class PtzRenderWorker(QThread):
 
     def run(self):
         (pano, out, analysis, kfs, codec, crf, wide, ignores, far_zoom,
-         promotes, radar) = self.args
+         promotes, radar, start, end) = self.args
         try:
             out_w, out_h = (2560, 1080) if wide else (1920, 1080)
             plan = build_plan(analysis, analysis["pano_w"], analysis["pano_h"],
@@ -617,13 +663,122 @@ class PtzRenderWorker(QThread):
                         codec=codec, crf=crf,
                         log=lambda s: self.log.emit(s),
                         progress=lambda d, t, f: self.progress.emit(d, t, f),
-                        cancel=lambda: self._cancel, radar=radar)
+                        cancel=lambda: self._cancel, radar=radar,
+                        start=start, end=end)
             if self._cancel:
                 self.failed.emit("취소됨")
             else:
                 self.finished_ok.emit(str(out))
         except Exception as e:  # noqa: BLE001
             self.failed.emit(str(e))
+
+
+class ExportDialog(QDialog):
+    """PTZ 내보내기 설정 대화창 — 구간(IN/OUT 마커 기준)·모드·코덱·미니맵."""
+
+    def __init__(self, parent, total, fps, export_range, mode_idx,
+                 encoders, crf, radar_on, default_dir, default_stem):
+        super().__init__(parent)
+        self.setWindowTitle("PTZ 내보내기")
+        self.fps = fps
+        self.total = total
+        self.export_range = export_range      # (f0, f1) 정규화됨 or None
+        self.default_dir = default_dir
+        self.default_stem = default_stem
+        form = QFormLayout(self)
+
+        self.combo_range = QComboBox()
+        f0, f1 = export_range if export_range else (0, total)
+        dur = (f1 - f0) / fps
+        if export_range:
+            self.combo_range.addItem(
+                f"마커 구간  {self._hms(f0/fps)} ~ {self._hms(f1/fps)} "
+                f"(길이 {self._hms(dur)}, {f1-f0}프레임)")
+        self.combo_range.addItem(
+            f"전체  0:00:00 ~ {self._hms(total/fps)} ({total}프레임)")
+        form.addRow("구간", self.combo_range)
+
+        self.combo_mode = QComboBox()
+        self.combo_mode.addItems(["공 추적 PTZ (1920×1080)",
+                                  "와이드 감상 (2560×1080, 완만한 팬)"])
+        self.combo_mode.setCurrentIndex(mode_idx)
+        self.combo_mode.currentIndexChanged.connect(self._mode_changed)
+        form.addRow("모드", self.combo_mode)
+
+        self.combo_codec = QComboBox()
+        self.combo_codec.addItems(list(encoders))
+        saved = QSettings("PyStitch360", "PyStitch360").value(
+            "ptz_export_codec", "")
+        labels = list(encoders)
+        if saved in labels:                       # 직전 선택 기억
+            self.combo_codec.setCurrentIndex(labels.index(saved))
+        else:                                     # GPU 있으면 hevc_nvenc 기본
+            for idx, lbl in enumerate(labels):
+                if encoders[lbl] == "hevc_nvenc":
+                    self.combo_codec.setCurrentIndex(idx)
+                    break
+        form.addRow("코덱", self.combo_codec)
+
+        self.spin_crf = QSpinBox(minimum=10, maximum=35, value=crf)
+        form.addRow("CRF/CQ", self.spin_crf)
+
+        self.check_radar = QCheckBox("우하단 반투명 탑다운 미니맵 (선수·공)")
+        self.check_radar.setChecked(radar_on)
+        form.addRow("미니맵", self.check_radar)
+
+        path_row = QHBoxLayout()
+        self.edit_path = QLineEdit(self._default_path())
+        path_row.addWidget(self.edit_path, 1)
+        b = QPushButton("찾아보기...")
+        b.clicked.connect(self._browse)
+        path_row.addWidget(b)
+        form.addRow("출력 파일", path_row)
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                              | QDialogButtonBox.StandardButton.Cancel)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("내보내기")
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+        self.resize(560, self.sizeHint().height())
+
+    @staticmethod
+    def _hms(sec):
+        h, rem = divmod(max(0.0, sec), 3600)
+        m, s = divmod(rem, 60)
+        return f"{int(h)}:{int(m):02d}:{s:04.1f}"
+
+    def _default_path(self):
+        wide = self.combo_mode.currentIndex() == 1
+        part = ""
+        if self.export_range and self.combo_range.currentIndex() == 0:
+            part = f"_{int(self.export_range[0]/self.fps)}s"
+        return str(Path(self.default_dir)
+                   / f"{self.default_stem}{part}"
+                     f"{'_wide' if wide else '_ptz'}.mp4")
+
+    def _mode_changed(self, _):
+        self.edit_path.setText(self._default_path())
+
+    def _browse(self):
+        p, _ = QFileDialog.getSaveFileName(self, "PTZ 출력 파일",
+                                           self.edit_path.text(),
+                                           "MP4 (*.mp4)")
+        if p:
+            self.edit_path.setText(p)
+
+    def config(self):
+        """선택 결과: {start, end, wide, codec_name, crf, radar, path}."""
+        use_marks = self.export_range and self.combo_range.currentIndex() == 0
+        f0, f1 = (self.export_range if use_marks else (0, self.total))
+        QSettings("PyStitch360", "PyStitch360").setValue(
+            "ptz_export_codec", self.combo_codec.currentText())
+        return {"start": int(f0), "end": int(f1),
+                "wide": self.combo_mode.currentIndex() == 1,
+                "codec_name": self.combo_codec.currentText(),
+                "crf": self.spin_crf.value(),
+                "radar": self.check_radar.isChecked(),
+                "path": self.edit_path.text().strip()}
 
 
 class PtzTab(QWidget):
@@ -643,6 +798,7 @@ class PtzTab(QWidget):
         self.keyframes: list[list] = []   # [frame, x, y]
         self.ignores: list[list] = []     # [f0, f1] 사용자 지정 오인식 구간
         self.promotes: list[list] = []    # [f, x, y] 회색 공 → 트랙 강제 수락
+        self.export_range: list = [None, None]   # 내보내기 IN/OUT 프레임
         self.roles: dict[int, int] = {}   # {track_id: 역할} 사용자 지정 (GK 등)
         self.field_points: dict[str, list] = {}   # {랜드마크키: [x, y]}
         self.line_points: list[list] = []  # 흰 선 검출 샘플 [x, y] (사이드라인)
@@ -768,6 +924,14 @@ class PtzTab(QWidget):
         self.trackbar = TimelineView()
         self.trackbar.seek.connect(lambda f: self.slider.setValue(f))
         self.trackbar.pick.connect(self._timeline_pick)
+        self.trackbar.range_menu.connect(self._timeline_menu)
+        # I/O = 내보내기 구간 시작/끝 (NLE 관례)
+        QShortcut(QKeySequence(Qt.Key.Key_I), self,
+                  activated=lambda: self._set_export_mark("in",
+                                                          self.slider.value()))
+        QShortcut(QKeySequence(Qt.Key.Key_O), self,
+                  activated=lambda: self._set_export_mark("out",
+                                                          self.slider.value()))
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setEnabled(False)
         self.slider.sliderPressed.connect(self._stop_play)
@@ -956,25 +1120,7 @@ class PtzTab(QWidget):
                                           .value("ptz_far_zoom", 1.0)))
         self.spin_far_zoom.valueChanged.connect(self._far_zoom_changed)
         bottom.addWidget(self.spin_far_zoom)
-        bottom.addWidget(QLabel("코덱"))
-        self.combo_codec = QComboBox()
         self.encoders = available_encoders()
-        self.combo_codec.addItems(list(self.encoders))
-        bottom.addWidget(self.combo_codec)
-        bottom.addWidget(QLabel("CRF/CQ"))
-        self.spin_crf = QSpinBox(minimum=10, maximum=35, value=20)
-        bottom.addWidget(self.spin_crf)
-        self.check_export_radar = QCheckBox("레이더")
-        self.check_export_radar.setToolTip(
-            "출력 우하단에 반투명 탑다운 레이더(선수·공) 합성 — "
-            "경기장 사각형은 입력한 크기 비율 그대로")
-        self.check_export_radar.setChecked(
-            QSettings("PyStitch360", "PyStitch360")
-            .value("ptz_export_radar", "true") == "true")
-        self.check_export_radar.toggled.connect(
-            lambda v: QSettings("PyStitch360", "PyStitch360")
-            .setValue("ptz_export_radar", "true" if v else "false"))
-        bottom.addWidget(self.check_export_radar)
         self.btn_export = QPushButton("PTZ 내보내기...")
         self.btn_export.setEnabled(False)
         self.btn_export.clicked.connect(self._start_render)
@@ -1134,6 +1280,11 @@ class PtzTab(QWidget):
                                   (doc.get("extra_players") or {}).items()}
             self.kit_colors = {int(r): [int(v) for v in c] for r, c in
                                (doc.get("kit_colors") or {}).items()}
+            er = doc.get("export_range")
+            self.export_range = ([None if v is None else int(v) for v in er]
+                                 if er else [None, None])
+            r = self._norm_export_range()
+            self.trackbar.set_range(*(r if r else (None, None)))
             ids = [int(p[4]) for rows in self.extra_players.values()
                    for p in rows]
             self._next_extra_id = max(ids, default=900000) + 1
@@ -1201,7 +1352,8 @@ class PtzTab(QWidget):
                                    "field_size": self.field_size,
                                    "line_points": self.line_points,
                                    "extra_players": self.extra_players,
-                                   "kit_colors": self.kit_colors}))
+                                   "kit_colors": self.kit_colors,
+                                   "export_range": self.export_range}))
         tmp.replace(sp)
 
     def _write_analysis(self):
@@ -2411,6 +2563,43 @@ class PtzTab(QWidget):
         self._redraw()
         self.log(f"[ptz] {names[scope]} 초기화 — 분석 원본 상태로 되돌림")
 
+    # ------------------------------------------------------ 내보내기 구간 마커
+    def _norm_export_range(self):
+        """정규화된 (f0, f1) — 마커가 하나도 없으면 None."""
+        fi, fo = self.export_range
+        if fi is None and fo is None:
+            return None
+        f0 = 0 if fi is None else int(fi)
+        f1 = self.total if fo is None else int(fo)
+        return (min(f0, f1), max(f0, f1))
+
+    def _set_export_mark(self, kind, f, clear=False):
+        if clear:
+            self.export_range = [None, None]
+            self.log("[ptz] 내보내기 구간 해제")
+        else:
+            i = 0 if kind == "in" else 1
+            self.export_range[i] = int(f)
+            self.log(f"[ptz] 내보내기 {'시작' if kind == 'in' else '끝'} "
+                     f"마커 = {self._hms(f/self.fps, tenth=True)}")
+        r = self._norm_export_range()
+        self.trackbar.set_range(*(r if r else (None, None)))
+        self._save_keyframes()
+
+    def _timeline_menu(self, f, gpos):
+        menu = QMenu(self)
+        menu.addAction(f"내보내기 시작 지점 (I) — {self._hms(f/self.fps)}",
+                       lambda: self._set_export_mark("in", f))
+        menu.addAction(f"내보내기 끝 지점 (O) — {self._hms(f/self.fps)}",
+                       lambda: self._set_export_mark("out", f))
+        if self._norm_export_range():
+            menu.addSeparator()
+            menu.addAction("내보내기 구간 해제",
+                           lambda: self._set_export_mark("", 0, clear=True))
+        menu.addSeparator()
+        menu.addAction("여기로 이동", lambda: self.slider.setValue(int(f)))
+        menu.exec(gpos)
+
     def _timeline_pick(self, kind, key):
         """타임라인 바 클릭 → 해당 목록 선택(→ 프레임 이동)."""
         if kind in ("kf", "ball"):
@@ -2965,17 +3154,26 @@ class PtzTab(QWidget):
         if self.analysis is None or self.pano_path is None:
             return
         self._stop_play()
-        wide = self.combo_mode.currentIndex() == 1
-        suffix = "_wide.mp4" if wide else "_ptz.mp4"
-        default = str(self.pano_path.with_name(self.pano_path.stem + suffix))
-        out, _ = QFileDialog.getSaveFileName(self, "PTZ 출력 파일", default,
-                                             "MP4 (*.mp4)")
-        if not out:
+        st = QSettings("PyStitch360", "PyStitch360")
+        dlg = ExportDialog(
+            self, self.total, self.fps, self._norm_export_range(),
+            self.combo_mode.currentIndex(), self.encoders,
+            int(st.value("ptz_export_crf", 20)),
+            st.value("ptz_export_radar", "true") == "true",
+            str(self.pano_path.parent), self.pano_path.stem)
+        if not dlg.exec():
             return
-        codec = self.encoders[self.combo_codec.currentText()]
+        cfg = dlg.config()
+        if not cfg["path"]:
+            return
+        st.setValue("ptz_export_crf", cfg["crf"])
+        st.setValue("ptz_export_radar", "true" if cfg["radar"] else "false")
+        wide = cfg["wide"]
+        self.combo_mode.setCurrentIndex(1 if wide else 0)  # 미리보기 일치
+        codec = self.encoders[cfg["codec_name"]]
         kfs = [tuple(k) for k in self.keyframes]
         radar = None
-        if self.check_export_radar.isChecked():
+        if cfg["radar"]:
             spans, _ = self._player_cache()
             teams = {tid: self._role_of(tid) for tid in spans}
             radar = build_radar_data(
@@ -2983,17 +3181,20 @@ class PtzTab(QWidget):
                 field_size=tuple(self.field_size),
                 extra_players=self.extra_players,
                 palette={r: self._role_color(r) for r in range(6)})
-            self.log("[ptz] 레이더 오버레이 포함 "
+            self.log("[ptz] 미니맵 오버레이 포함 "
                      + ("(경기장 절대 좌표)" if self._field_calib is not None
                         else "(캘리브레이션 없음 — 근사 좌표)"))
+        dur = (cfg["end"] - cfg["start"]) / self.fps
         self.log(f"[ptz] 내보내기 시작: {'와이드' if wide else 'PTZ'} 모드, "
+                 f"구간 {self._hms(cfg['start']/self.fps)}~"
+                 f"{self._hms(cfg['end']/self.fps)} ({dur/60:.1f}분), "
                  f"키프레임 {len(kfs)}개 반영")
-        w = PtzRenderWorker(str(self.pano_path), out, self.analysis, kfs,
-                            codec, self.spin_crf.value(), wide=wide,
+        w = PtzRenderWorker(str(self.pano_path), cfg["path"], self.analysis,
+                            kfs, codec, cfg["crf"], wide=wide,
                             ignores=[tuple(r) for r in self.ignores],
                             far_zoom=self.spin_far_zoom.value(),
                             promotes=[tuple(p) for p in self.promotes],
-                            radar=radar)
+                            radar=radar, start=cfg["start"], end=cfg["end"])
         w.log.connect(self.log)
         w.progress.connect(self._render_progress)
         w.finished_ok.connect(self._render_done)
