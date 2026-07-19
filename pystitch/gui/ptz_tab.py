@@ -1307,6 +1307,8 @@ class PtzTab(QWidget):
         self._radar_palette: dict = {}    # {역할: BGR} 레이더 오버레이 색
         self.roles: dict[int, int] = {}   # {track_id: 역할} 사용자 지정 (GK 등)
         self.merges: dict[int, int] = {}  # {tid: 대표 tid} 트랙릿 병합 (비파괴)
+        self.player_nums: dict[int, str] = {}  # {대표 tid: 등번호}
+        self.rosters: dict[int, list] = {}     # {팀: ["7 이름", ...]} 명단
         self.field_points: dict[str, list] = {}   # {랜드마크키: [x, y]}
         self.line_points: list[list] = []  # 흰 선 검출 샘플 [x, y] (사이드라인)
         self.field_size = [105.0, 68.0]   # 경기장 길이×폭 (m)
@@ -1955,6 +1957,8 @@ class PtzTab(QWidget):
         self.user_events = []
         self.match_info = None
         self.merges = {}
+        self.player_nums = {}
+        self.rosters = {}
         sp = self._sidecar_path()
         doc = None
         if sp.exists():
@@ -1991,6 +1995,10 @@ class PtzTab(QWidget):
             self.match_info = doc.get("match_info")
             self.merges = {int(t): int(r) for t, r in
                            (doc.get("merges") or {}).items()}
+            self.player_nums = {int(t): str(n) for t, n in
+                                (doc.get("player_nums") or {}).items()}
+            self.rosters = {int(k): [str(e) for e in v] for k, v in
+                            (doc.get("rosters") or {}).items()}
             ids = [int(p[4]) for rows in self.extra_players.values()
                    for p in rows]
             self._next_extra_id = max(ids, default=900000) + 1
@@ -2065,7 +2073,11 @@ class PtzTab(QWidget):
                                    "user_events": self.user_events,
                                    "match_info": self.match_info,
                                    "merges": {str(t): r for t, r in
-                                              self.merges.items()}}))
+                                              self.merges.items()},
+                                   "player_nums": {str(t): n for t, n in
+                                                   self.player_nums.items()},
+                                   "rosters": {str(k): v for k, v in
+                                               self.rosters.items()}}))
         tmp.replace(sp)
 
     def _write_analysis(self):
@@ -2834,8 +2846,12 @@ class PtzTab(QWidget):
                                       (x2 + g, y2 + g), (255, 255, 255),
                                       max(1, int(2 * sc)))
                     tag = ROLE_TAGS.get(team)
-                    if team == 5 and len(pp) >= 5:
-                        tag = self._ref_tag(int(pp[4]))   # 선심 ARN/ARF
+                    if team == 5 and pid is not None:
+                        tag = self._ref_tag(pid)          # 선심 ARN/ARF
+                    if pid is not None and pid >= 0:
+                        num = self._num_of(pid)           # 등번호
+                        if num and num.isascii():
+                            tag = f"{tag} {num}" if tag else num
                     if tag:
                         cv2.putText(frame, tag, (x1, y1 - max(4, int(8 * sc))),
                                     cv2.FONT_HERSHEY_SIMPLEX,
@@ -3009,10 +3025,16 @@ class PtzTab(QWidget):
         if tid is not None:
             menu.addSeparator()
             sub = menu.addMenu(
-                f"선수 #{tid} ({self._role_name(self._role_of(tid))}) 역할 지정")
-            for r in (0, 1, 5):
+                f"선수 #{tid} ({self._disp_role(tid, self._role_of(tid))}) "
+                "역할 지정")
+            for r in (0, 1):
                 sub.addAction(self._role_name(r),
                               lambda _=False, rr=r, t=tid: self._set_role(t, rr))
+                self._fill_num_menu(
+                    sub.addMenu(f"  ↳ {self._role_name(r)} 번호 지정"),
+                    tid, r)
+            sub.addAction(self._role_name(5),
+                          lambda _=False, t=tid: self._set_role(t, 5))
             sub.addSeparator()                    # GK 는 드묾 — 아래쪽
             for r in (3, 4):
                 sub.addAction(self._role_name(r),
@@ -3340,11 +3362,85 @@ class PtzTab(QWidget):
         return "REF"
 
     def _disp_role(self, tid, r):
-        """목록용 역할명 — 선심은 ARN(근측)/ARF(원측) 표기."""
+        """목록용 역할명 — 선심은 ARN(근측)/ARF(원측) 표기 (+등번호)."""
         if r == 5:
             return {"ARN": "선심 ARN", "ARF": "선심 ARF"}.get(
                 self._ref_tag(tid), "심판")
-        return self._role_name(r)
+        name = self._role_name(r)
+        num = self._num_of(tid)
+        return f"{name} {num}번" if num else name
+
+    # ------------------------------------------------------ 등번호
+    def _num_of(self, tid):
+        """유효 등번호 — 병합 대표 기준 (없으면 None)."""
+        rep = self._rep(tid)
+        return self.player_nums.get(rep, self.player_nums.get(int(tid)))
+
+    def _set_player_num(self, tid, team, num):
+        """등번호 지정 — 번호는 팀 소속을 함의하므로 역할도 맞춘다."""
+        rep = self._rep(tid)
+        self.player_nums[rep] = str(num)
+        if self._role_of(rep) not in (team, team + 3):   # GK 는 유지
+            self.roles[rep] = team
+        self._roles_changed()
+        self.log(f"[ptz] #{rep} → {self.team_names[team]} {num}번")
+
+    def _clear_player_num(self, tid):
+        rep = self._rep(tid)
+        n = (self.player_nums.pop(rep, None)
+             or self.player_nums.pop(int(tid), None))
+        if n:
+            self._roles_changed()
+            self.log(f"[ptz] #{rep} 등번호 {n} 해제")
+
+    def _input_player_num(self, tid, team):
+        from PyQt6.QtWidgets import QInputDialog
+        num, ok = QInputDialog.getText(
+            self, "등번호",
+            f"#{self._rep(tid)} ({self.team_names[team]}) 등번호:",
+            text=self._num_of(tid) or "")
+        if ok and num.strip():
+            self._set_player_num(tid, team, num.strip().split()[0])
+
+    def _edit_roster(self, team):
+        """팀 명단 입력 — 한 줄에 하나, "번호" 또는 "번호 이름"."""
+        from PyQt6.QtWidgets import QInputDialog
+        txt, ok = QInputDialog.getMultiLineText(
+            self, f"{self.team_names[team]} 명단",
+            "한 줄에 한 명 — \"7\" 또는 \"7 홍길동\":",
+            "\n".join(self.rosters.get(team, [])))
+        if not ok:
+            return
+        self.rosters[team] = [ln.strip() for ln in txt.splitlines()
+                              if ln.strip()]
+        self._save_keyframes()
+        self.log(f"[ptz] {self.team_names[team]} 명단 "
+                 f"{len(self.rosters[team])}명 저장")
+
+    def _fill_num_menu(self, nsub, tid, team):
+        """번호 지정 서브메뉴: 명단 항목 + 직접 입력 + 명단 편집."""
+        cur = self._num_of(tid)
+        used = {}                        # 번호 → 이미 쓴 대표 tid
+        for t, n in self.player_nums.items():
+            if self._role_of(t) in (team, team + 3):
+                used.setdefault(n, self._rep(t))
+        for entry in self.rosters.get(team, []):
+            num = entry.split()[0]
+            mark = " ✓" if cur == num else (
+                f"  (#{used[num]})" if num in used
+                and used[num] != self._rep(tid) else "")
+            nsub.addAction(entry + mark,
+                           lambda _=False, n=num:
+                           self._set_player_num(tid, team, n))
+        if self.rosters.get(team):
+            nsub.addSeparator()
+        nsub.addAction("직접 입력...",
+                       lambda: self._input_player_num(tid, team))
+        nsub.addAction(f"{self.team_names[team]} 명단 입력/수정...",
+                       lambda: self._edit_roster(team))
+        if cur:
+            nsub.addAction(f"등번호 해제 ({cur}번)",
+                           lambda: self._clear_player_num(tid))
 
     def _edit_team_names(self):
         dlg = QDialog(self)
@@ -3936,6 +4032,7 @@ class PtzTab(QWidget):
         if scope in ("roles", "all"):
             self.roles = {}
             self.merges = {}
+            self.player_nums = {}
             self.extra_players = {}
             self.kit_colors = {}
             self._pcache_id = None
