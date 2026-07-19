@@ -688,35 +688,46 @@ def same_spot_spans(linked, f0, f1, radius=60.0, static_r80=40.0):
 
 
 def export_training_labels(analysis, keyframes=None, ignore_ranges=None,
-                           linked=None):
-    """사용자 마킹을 커스텀 공 검출 모델 학습 라벨로 변환.
+                           force_ranges=None, linked=None):
+    """사용자 마킹을 커스텀 공 검출 모델 학습 라벨로 변환 (P03-5).
 
-    - 무시 구간 안의 공 검출 → "not_ball" (하드 네거티브 — 낙엽 등)
-    - 수락 트랙의 공 검출   → "ball" (자동 양성, 약한 라벨)
+    - 수락 트랙 위 검출     → "ball" (자동 양성)
+    - 갭필/시드 주입 검출   → "ball_lowconf" (양성, 저신뢰 태그 —
+      후보 행 길이 6 이 주입 마커, 6번째 원소가 원래 conf)
+    - 무시 구간 안의 후보   → "not_ball" (하드 네거티브 — 낙엽 등,
+      수락 판정보다 후순위라 승격 트랙은 양성 유지)
     - 사용자 키프레임       → "ball_manual" (사람이 확인한 양성, 박스 없음)
+    승격(force_ranges) 트랙은 수락 경로를 거쳐 양성에 포함된다.
 
     반환: [{"frame", "x", "y", "w", "h", "conf", "label"}, ...]
     원본 분석은 수정하지 않는다 (마킹은 비파괴).
     """
-    idx, _, spans = accept_ball_tracks(analysis, ignore_ranges=ignore_ranges,
-                                       linked=linked, log=None)
+    idx, acc, _spans = accept_ball_tracks(
+        analysis, ignore_ranges=ignore_ranges, force_ranges=force_ranges,
+        linked=linked, log=None)
     ig = [(r[0], r[1]) for r in (ignore_ranges or [])]
+    cands = analysis.get("ball_cands")
     out = []
-    for i, b in enumerate(analysis["balls"]):
-        if b is None:
-            continue
-        f = int(idx[i])
-        w = float(b[3]) if len(b) >= 5 else 0.0
-        h = float(b[4]) if len(b) >= 5 else 0.0
-        rec = {"frame": f, "x": float(b[0]), "y": float(b[1]),
-               "w": w, "h": h, "conf": float(b[2])}
-        if any(lo <= f <= hi for lo, hi in ig):
-            rec["label"] = "not_ball"
-        elif any(f0 <= f <= f1 for f0, f1 in spans):
-            rec["label"] = "ball"
-        else:
-            continue                      # 자동 기각(불확실) — 라벨로 안 씀
-        out.append(rec)
+    for si in range(len(idx)):
+        f = int(idx[si])
+        row = (cands[si] if cands is not None else
+               ([list(analysis["balls"][si])]
+                if analysis["balls"][si] is not None else []))
+        in_ig = any(lo <= f <= hi for lo, hi in ig)
+        ax = acc[si] if acc is not None and si < len(acc) else (np.nan, np.nan)
+        for p in row:
+            rec = {"frame": f, "x": float(p[0]), "y": float(p[1]),
+                   "w": float(p[3]) if len(p) >= 5 else 0.0,
+                   "h": float(p[4]) if len(p) >= 5 else 0.0,
+                   "conf": float(p[5] if len(p) >= 6 else p[2])}
+            if np.isfinite(ax[0]) \
+                    and np.hypot(ax[0] - p[0], ax[1] - p[1]) <= 25.0:
+                rec["label"] = ("ball_lowconf" if len(p) >= 6 else "ball")
+            elif in_ig:
+                rec["label"] = "not_ball"
+            else:
+                continue                  # 자동 기각(불확실) — 라벨로 안 씀
+            out.append(rec)
     for kf, kx, ky in (keyframes or []):
         out.append({"frame": int(kf), "x": float(kx), "y": float(ky),
                     "w": 0.0, "h": 0.0, "conf": 1.0, "label": "ball_manual"})
