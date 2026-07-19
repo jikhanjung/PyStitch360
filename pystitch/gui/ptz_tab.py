@@ -1296,6 +1296,7 @@ class PtzTab(QWidget):
         self.highlights: list[dict] = []   # .events.json "highlights" 문서
         self.match_info: dict | None = None  # 경기 정보 (하프·앵커·중단)
         self._referees: dict = {}         # .events.json "referees" (근/원측 선심)
+        self._ocr_nums: dict = {}         # .events.json "ocr_numbers" 제안
         self._radar_palette: dict = {}    # {역할: BGR} 레이더 오버레이 색
         self._radar_smooth: dict = {}     # {tid: [x, y]} 미니맵 EMA 상태
         self._radar_smooth_f = None       # EMA 마지막 프레임 (점프 리셋용)
@@ -1320,6 +1321,8 @@ class PtzTab(QWidget):
         self._tfeat_id = None
         self._pbgr = {}                   # {tid: BGR} 대표색 변환 캐시
         self._pbgr_id = None
+        self._footmed = {}                # {tid: 발 위치 중앙값} (_ar_side 용)
+        self._footmed_id = None
         self._pspans: dict = {}           # {tid: [f0, f1, 검출수]}
         self._pcolors: dict = {}          # {tid: (h, s, v)} 유니폼 대표색
         self._accepted_ball = None        # accept_ball_tracks 의 샘플별 수락 공
@@ -1910,6 +1913,8 @@ class PtzTab(QWidget):
         items.sort()
         self.trackbar.set_events(items)
         self._referees = doc.get("referees") or {}
+        self._ocr_nums = {int(k): v for k, v in
+                          (doc.get("ocr_numbers") or {}).items()}
         self.highlights = doc.get("highlights", [])
         self._refresh_highlight_lane()
         self.trackbar.set_pauses(
@@ -3476,33 +3481,48 @@ class PtzTab(QWidget):
             return self._ar_side(rep, grp) or "AR"
         return "REF"
 
+    def _foot_med(self):
+        """트랙릿별 발 위치 중앙값 캐시 — 분석당 1회 (프로파일: 재스캔이
+        _ar_side 를 통해 역할 지정마다 수백 ms~수 초를 먹던 주범)."""
+        if self._footmed_id != id(self.analysis):
+            pts: dict[int, list] = {}
+            for prow in self.analysis["players"]:
+                for p in prow:
+                    if len(p) >= 5 and p[4] >= 0:
+                        pts.setdefault(int(p[4]), []).append(
+                            (p[0], p[1] + p[3] / 2.0))
+            self._footmed = {t: (float(np.median([q[0] for q in v])),
+                                 float(np.median([q[1] for q in v])))
+                             for t, v in pts.items()}
+            self._footmed_id = id(self.analysis)
+        return self._footmed
+
     def _ar_side(self, rep, grp):
-        """선심 근/원측 자동 판정 — 그룹 검출 위치의 필드 Y 중앙값 부호.
+        """선심 근/원측 자동 판정 — 그룹 발 위치 중앙값의 필드 Y 부호.
 
         역할 6 지정만으로 ARN/ARF 가 붙도록 (referee.py 분류 없이도).
-        결과는 캐시 — 역할/병합 변경 시 무효화.
+        트랙릿별 중앙값 캐시(_foot_med) 위에서 변환 몇 번뿐이라 싸다.
         """
         if rep in self._ar_side_cache:
             return self._ar_side_cache[rep]
         if self.analysis is None:
             return None
+        fm = self._foot_med()
+        feet = [fm[t] for t in grp if t in fm]
+        if not feet:
+            return None
         ys = []
-        for prow in self.analysis["players"]:
-            feet = [(p[0], p[1] + p[3] / 2.0) for p in prow
-                    if len(p) >= 5 and int(p[4]) in grp]
-            if not feet:
-                continue
-            if self._field_calib is not None:
-                for gx, gy in pano_to_field(self._field_calib, feet):
-                    if np.isfinite(gy):
-                        ys.append(float(gy))
-            else:
-                for X, Y, _t, _j in ground_positions(
-                        [[fx, fy, 0.0, 0.0] for fx, fy in feet],
-                        self.pano_w, self.pano_h):
-                    # 캘리브레이션 전: 카메라 거리로 근사 (near = 가까움)
-                    ys.append(float(Y) - (self.field_size[1] / 2.0 + 5.0))
-        if len(ys) < 10:
+        if self._field_calib is not None:
+            for gx, gy in pano_to_field(self._field_calib, feet):
+                if np.isfinite(gy):
+                    ys.append(float(gy))
+        else:
+            for X, Y, _t, _j in ground_positions(
+                    [[fx, fy, 0.0, 0.0] for fx, fy in feet],
+                    self.pano_w, self.pano_h):
+                # 캘리브레이션 전: 카메라 거리로 근사 (near = 가까움)
+                ys.append(float(Y) - (self.field_size[1] / 2.0 + 5.0))
+        if not ys:
             return None
         side = "ARN" if float(np.median(ys)) < 0.0 else "ARF"
         self._ar_side_cache[rep] = side
@@ -3609,6 +3629,13 @@ class PtzTab(QWidget):
             sub.addAction("      " + label + mark,
                           lambda _=False, n=num:
                           self._set_player_num(tid, team, n))
+        ocr = self._ocr_nums.get(self._rep(int(tid)))
+        if ocr and ocr.get("num") and ocr["num"] != cur:
+            sub.addAction(
+                f"      OCR 제안: {ocr['num']}번  "
+                f"(지분 {float(ocr.get('share', 0)):.0%})",
+                lambda _=False, n=str(ocr["num"]):
+                self._set_player_num(tid, team, n))
         more = sub.addMenu("      번호 입력/명단...")
         more.addAction("직접 입력...",
                        lambda: self._input_player_num(tid, team))
@@ -4488,13 +4515,21 @@ class PtzTab(QWidget):
             self.log(f"[ptz] #{rep} 팀 변경 — 등번호 {num} 제거")
 
     def _set_role(self, tid, role):
-        eff = (int(role) if role is not None
-               else self._teams.get(self._rep(int(tid)), 2))
+        """역할 지정 — 병합 대표에 저장 (그룹 = 한 사람).
+
+        멤버 tid 에 저장하면 대표의 기존 역할이 우선돼(_role_of 순서)
+        지정이 가려지는 버그가 있었다 — "팀을 바꿨는데 안 바뀜".
+        """
+        rep = self._rep(int(tid))
+        eff = int(role) if role is not None else self._teams.get(rep, 2)
         self._maybe_clear_num(tid, eff)
         if role is None:
+            self.roles.pop(rep, None)
             self.roles.pop(int(tid), None)
         else:
-            self.roles[int(tid)] = int(role)
+            self.roles[rep] = int(role)
+            if int(tid) != rep:              # 멤버의 낡은 개별 역할 제거
+                self.roles.pop(int(tid), None)
         self._roles_changed()
 
     def _roles_changed(self):
