@@ -1308,6 +1308,7 @@ class PtzTab(QWidget):
         self._radar_palette: dict = {}    # {역할: BGR} 레이더 오버레이 색
         self._radar_smooth: dict = {}     # {tid: [x, y]} 미니맵 EMA 상태
         self._radar_smooth_f = None       # EMA 마지막 프레임 (점프 리셋용)
+        self._ar_side_cache: dict = {}    # {대표 tid: "ARN"|"ARF"} 자동 판정
         self.roles: dict[int, int] = {}   # {track_id: 역할} 사용자 지정 (GK 등)
         self.merges: dict[int, int] = {}  # {tid: 대표 tid} 트랙릿 병합 (비파괴)
         self.player_nums: dict[int, str] = {}  # {대표 tid: 등번호}
@@ -2012,6 +2013,7 @@ class PtzTab(QWidget):
         self.player_nums = {}
         self.rosters = {}
         self.hidden_players = set()
+        self._ar_side_cache = {}
         sp = self._sidecar_path()
         doc = None
         if sp.exists():
@@ -3428,7 +3430,41 @@ class PtzTab(QWidget):
             return "ARN"
         if grp & {int(t) for t in self._referees.get("ar_far") or []}:
             return "ARF"
-        return "AR" if role == 6 else "REF"
+        if role == 6:
+            return self._ar_side(rep, grp) or "AR"
+        return "REF"
+
+    def _ar_side(self, rep, grp):
+        """선심 근/원측 자동 판정 — 그룹 검출 위치의 필드 Y 중앙값 부호.
+
+        역할 6 지정만으로 ARN/ARF 가 붙도록 (referee.py 분류 없이도).
+        결과는 캐시 — 역할/병합 변경 시 무효화.
+        """
+        if rep in self._ar_side_cache:
+            return self._ar_side_cache[rep]
+        if self.analysis is None:
+            return None
+        ys = []
+        for prow in self.analysis["players"]:
+            feet = [(p[0], p[1] + p[3] / 2.0) for p in prow
+                    if len(p) >= 5 and int(p[4]) in grp]
+            if not feet:
+                continue
+            if self._field_calib is not None:
+                for gx, gy in pano_to_field(self._field_calib, feet):
+                    if np.isfinite(gy):
+                        ys.append(float(gy))
+            else:
+                for X, Y, _t, _j in ground_positions(
+                        [[fx, fy, 0.0, 0.0] for fx, fy in feet],
+                        self.pano_w, self.pano_h):
+                    # 캘리브레이션 전: 카메라 거리로 근사 (near = 가까움)
+                    ys.append(float(Y) - (self.field_size[1] / 2.0 + 5.0))
+        if len(ys) < 10:
+            return None
+        side = "ARN" if float(np.median(ys)) < 0.0 else "ARF"
+        self._ar_side_cache[rep] = side
+        return side
 
     def _disp_role(self, tid, r):
         """목록용 역할명 — 선심은 ARN(근측)/ARF(원측) 표기 (+등번호)."""
@@ -4394,6 +4430,7 @@ class PtzTab(QWidget):
         self._roles_changed()
 
     def _roles_changed(self):
+        self._ar_side_cache = {}
         if self.analysis is not None:
             self._teams = classify_teams(self.analysis, roles=self.roles)
         self._refresh_team_label()
@@ -4436,6 +4473,7 @@ class PtzTab(QWidget):
                  f"(선수 목록 우클릭으로 해제/분리/추가)")
 
     def _merges_changed(self):
+        self._ar_side_cache = {}
         self._save_keyframes()
         self._refresh_team_label()
         self._refresh_player_list()
