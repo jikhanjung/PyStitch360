@@ -1353,6 +1353,11 @@ class PtzTab(QWidget):
                 lambda on, k=key: (QSettings("PyStitch360", "PyStitch360")
                                    .setValue(k, "true" if on else "false"),
                                    self._redraw()))
+        self.sld_radar_alpha.setValue(int(st.value("ptz_radar_alpha", 55)))
+        self.sld_radar_alpha.valueChanged.connect(
+            lambda v: (QSettings("PyStitch360", "PyStitch360")
+                       .setValue("ptz_radar_alpha", int(v)),
+                       self._redraw()))
         # 스페이스 = 재생/정지 — 포커스가 아니라 커서 위치 기준이라
         # (타임라인/영상 위에서만) 앱 필터로 처리, 그 외엔 통과
         QApplication.instance().installEventFilter(self)
@@ -1377,7 +1382,8 @@ class PtzTab(QWidget):
         if ph + mgn >= H or pw_ + mgn >= W:
             return
         roi = frame[H - mgn - ph:H - mgn, W - mgn - pw_:W - mgn]
-        cv2.addWeighted(panel, 0.55, roi, 0.45, 0.0, dst=roi)
+        a = self.sld_radar_alpha.value() / 100.0
+        cv2.addWeighted(panel, a, roi, 1.0 - a, 0.0, dst=roi)
 
     def log(self, msg):
         """메인 윈도우 로그 + 탭 내 로그 미러."""
@@ -1462,6 +1468,14 @@ class PtzTab(QWidget):
                 "QCheckBox { color: white; background: rgba(20,20,20,150);"
                 " padding: 2px 8px; border-radius: 4px; }")
             ov_row.addWidget(cb)
+        self.sld_radar_alpha = QSlider(Qt.Orientation.Horizontal)
+        self.sld_radar_alpha.setRange(10, 95)
+        self.sld_radar_alpha.setFixedWidth(80)
+        self.sld_radar_alpha.setToolTip("미니맵 불투명도")
+        self.sld_radar_alpha.setStyleSheet(
+            "QSlider { background: rgba(20,20,20,150); border-radius: 4px;"
+            " padding: 2px 6px; }")
+        ov_row.addWidget(self.sld_radar_alpha)
         ov.addLayout(ov_row)
         ov.addStretch(1)
         # pane/타임라인/정보 3행은 세로 스플리터로 — 아래에서 합침
@@ -2717,7 +2731,7 @@ class PtzTab(QWidget):
             self._plan_box = (x0, y0, w, h)
             thick = max(2, int(6 * sc))
             if self._box_edit is None and self._box_hover == ("border", None):
-                thick += max(2, int(4 * sc))    # 이동 가능 표시: 테두리 두껍게
+                thick += max(1, int(2 * sc))    # 이동 가능 표시: 테두리 두껍게
             cv2.rectangle(frame, (int(x0 * sc), int(y0 * sc)),
                           (int((x0 + w) * sc), int((y0 + h) * sc)),
                           box_color, thick)
@@ -2759,7 +2773,7 @@ class PtzTab(QWidget):
             else:
                 cv2.circle(frame, p, rad, (150, 150, 150), 4)
             if _is_hover("ball", bx, by):
-                cv2.circle(frame, p, rad + max(6, int(12 * sc)), (0, 255, 255), 3)
+                cv2.circle(frame, p, rad + max(6, int(12 * sc)), (0, 255, 255), 2)
         for k in ([] if picking else self.keyframes):
             if len(k) > 3 and not self.check_crop.isChecked():
                 continue                      # 크롭 키프레임은 크롭 토글에
@@ -2783,16 +2797,20 @@ class PtzTab(QWidget):
                     cv2.circle(frame, p, max(3, int(7 * sc)),
                                (0, 140, 255), -1)
                 if _is_hover("kf", kx, ky):
-                    cv2.circle(frame, p, max(16, int(40 * sc)), (0, 255, 255), 3)
+                    cv2.circle(frame, p, max(16, int(40 * sc)), (0, 255, 255), 2)
         # 선수 박스(팀 색) + 레이더
         radar_pts = []
         if si is not None:
             prow = self._players_row(si)
+            sel = self.trackbar.selected
+            sel_rep = (self._rep(sel[1]) if sel and sel[0] == "player"
+                       else None)
             if self.check_players.isChecked() and not picking:
                 for pp in prow:
                     if len(pp) < 4:
                         continue
-                    team = self._role_of(int(pp[4])) if len(pp) >= 5 else 2
+                    pid = int(pp[4]) if len(pp) >= 5 else None
+                    team = self._role_of(pid) if pid is not None else 2
                     color = self._role_color(team)
                     x1 = int((pp[0] - pp[2] / 2) * sc)
                     y1 = int((pp[1] - pp[3] / 2) * sc)
@@ -2800,6 +2818,13 @@ class PtzTab(QWidget):
                     y2 = int((pp[1] + pp[3] / 2) * sc)
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color,
                                   max(1, int(2 * sc)))
+                    if pid is not None and sel_rep is not None \
+                            and pid >= 0 and self._rep(pid) == sel_rep:
+                        # 선택된 트랙릿(병합 그룹 포함): 얇은 흰 이중 테두리
+                        g = max(3, int(6 * sc))
+                        cv2.rectangle(frame, (x1 - g, y1 - g),
+                                      (x2 + g, y2 + g), (255, 255, 255),
+                                      max(1, int(2 * sc)))
                     tag = ROLE_TAGS.get(team)
                     if team == 5 and len(pp) >= 5:
                         tag = self._ref_tag(int(pp[4]))   # 선심 ARN/ARF
@@ -2968,6 +2993,11 @@ class PtzTab(QWidget):
             menu.addAction("여기 수동 공 추가",
                            lambda: self._add_keyframe(f, x, y))
         tid = self._player_at(x, y)
+        if tid is None and self._injected_person_at(x, y):
+            menu.addSeparator()
+            a = menu.addAction("ID 없는 주입 검출 (갭필) — 역할을 붙이려면 "
+                               "\"이 주변 사람 재검출\"로 ID 부여")
+            a.setEnabled(False)
         if tid is not None:
             menu.addSeparator()
             sub = menu.addMenu(
@@ -3487,6 +3517,7 @@ class PtzTab(QWidget):
             spans, _ = self._player_cache()
             self.slider.setValue(int(spans[rows[row]][0]))
             self.trackbar.set_selection("player", rows[row])
+            self._redraw()                    # 선택 bbox 강조 즉시 반영
 
     def start_gapfill(self):
         """분석 메뉴: 갭필 2차 패스 — 트랙 갭을 저문턱 검출로 메꿈."""
@@ -4669,6 +4700,16 @@ class PtzTab(QWidget):
         self._pcache_id = None
         self._refresh_player_list()
         self._redraw()
+
+    def _injected_person_at(self, x, y):
+        """(x, y)가 ID 없는 주입 검출(갭필 id<0) 박스 안인지."""
+        si = self._current_sample()
+        if self.analysis is None or si is None:
+            return False
+        return any(len(p) >= 5 and p[4] < 0
+                   and abs(x - p[0]) <= p[2] / 2 + 10
+                   and abs(y - p[1]) <= p[3] / 2 + 10
+                   for p in self._players_row(si))
 
     def _player_at(self, x, y):
         """(x, y)를 포함하는 현재 샘플의 선수 박스 track id (없으면 None)."""
