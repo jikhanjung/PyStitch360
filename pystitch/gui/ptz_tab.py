@@ -67,6 +67,7 @@ class RadarView(QWidget):
         self.points: list = []      # (X, Y, team)
         self.ball = None            # (X, Y) or None
         self.field = None           # {length, width, cam} — 캘리브레이션 후
+        self.palette: dict = {}     # {역할: BGR} 유니폼 대표색 (없으면 기본)
 
     def set_data(self, points, ball=None):
         self.points, self.ball = list(points), ball
@@ -121,7 +122,8 @@ class RadarView(QWidget):
             p.setPen(QColor(255, 255, 255, 140))
             p.drawLine(*px(0, 0), *px(0, 75))        # 하프라인 방향
         for X, Y, team in self.points:
-            b, g, r = TEAM_COLORS[min(max(team, 0), len(TEAM_COLORS) - 1)]
+            b, g, r = self.palette.get(
+                team, TEAM_COLORS[min(max(team, 0), len(TEAM_COLORS) - 1)])
             p.setBrush(QColor(r, g, b))
             p.setPen(Qt.PenStyle.NoPen)
             x, y = px(X, Y)
@@ -649,6 +651,7 @@ class PtzTab(QWidget):
         self._link_worker = None
         self._linked = None
         self._teams = {}
+        self._role_colors: dict[int, tuple] = {}   # 역할별 유니폼 대표색(BGR)
         self._play_worker = None
         self._playing = False
         self._proxy_worker = None
@@ -1728,7 +1731,7 @@ class PtzTab(QWidget):
                     if len(pp) < 4:
                         continue
                     team = self._role_of(int(pp[4])) if len(pp) >= 5 else 2
-                    color = TEAM_COLORS[min(max(team, 0), len(TEAM_COLORS) - 1)]
+                    color = self._role_color(team)
                     x1 = int((pp[0] - pp[2] / 2) * sc)
                     y1 = int((pp[1] - pp[3] / 2) * sc)
                     x2 = int((pp[0] + pp[2] / 2) * sc)
@@ -2073,6 +2076,11 @@ class PtzTab(QWidget):
     def _role_of(self, tid):
         return self.roles.get(tid, self._teams.get(tid, 2))
 
+    def _role_color(self, role):
+        """역할의 표시색(BGR) — 실제 유니폼 대표색, 없으면 기본 팔레트."""
+        return self._role_colors.get(
+            role, TEAM_COLORS[min(max(role, 0), len(TEAM_COLORS) - 1)])
+
     def _refresh_team_label(self, log_colors=False):
         """팀/GK/심판별 대표 유니폼 색 범례 (분석 후 '이 팀이 이 색')."""
         spans, cols = self._player_cache()
@@ -2080,6 +2088,7 @@ class PtzTab(QWidget):
             self.lbl_team_colors.setText("팀 색: 분석 후 표시")
             return
         parts, logs = [], []
+        self._role_colors = {}
         for r in (0, 1, 3, 4, 5):
             member = [t for t in cols
                       if self._role_of(t) == r and spans.get(t, [0, 0, 0])[2] >= 5]
@@ -2091,6 +2100,7 @@ class PtzTab(QWidget):
                                           int(min(cols[t][1], 255)),
                                           int(min(cols[t][2], 255))]]]),
                               cv2.COLOR_HSV2BGR)[0, 0] for t in member]), axis=0)
+            self._role_colors[r] = (int(bgr[0]), int(bgr[1]), int(bgr[2]))
             hexc = f"#{int(bgr[2]):02x}{int(bgr[1]):02x}{int(bgr[0]):02x}"
             parts.append(f"{ROLE_NAMES[r]} <span style='background:{hexc};"
                          f"color:{hexc}'>&nbsp;██&nbsp;</span>"
@@ -2098,12 +2108,21 @@ class PtzTab(QWidget):
             logs.append(f"{ROLE_NAMES[r]} {hexc} ({len(member)}트랙릿)")
         self.lbl_team_colors.setText("유니폼 색:  " + " &nbsp; ".join(parts)
                                      if parts else "팀 색: 분석 후 표시")
+        self.radar.palette = dict(self._role_colors)
         if log_colors and logs:
             self.log("[ptz] 팀 색 분류: " + ", ".join(logs))
 
     def _refresh_player_list(self):
         """선수 트랙릿 목록: 유니폼 색 스와치 + 역할 + 구간 (검출 수 순)."""
         spans, cols = self._player_cache()
+        # 재구성 전 선택을 tid 로 기억해 복원 — 역할 지정 등으로 목록이
+        # 다시 만들어질 때 선택이 리셋되면, 이후 포커스 이동이 첫 행을
+        # 선택하며 엉뚱한 프레임으로 점프하는 문제가 있었다.
+        old_rows = getattr(self, "_player_rows", [])
+        cur = self.player_list.currentRow()
+        prev_cur = old_rows[cur] if 0 <= cur < len(old_rows) else None
+        prev_sel = {old_rows[i.row()] for i in self.player_list.selectedIndexes()
+                    if i.row() < len(old_rows)}
         self._player_rows = sorted(spans, key=lambda t: -spans[t][2])
         self.player_list.blockSignals(True)
         self.player_list.clear()
@@ -2121,6 +2140,11 @@ class PtzTab(QWidget):
                 px.fill(QColor(_hsv_hex(cols[tid])))
                 it.setIcon(QIcon(px))
             self.player_list.addItem(it)
+        for row, tid in enumerate(self._player_rows):     # 선택 복원
+            if tid in prev_sel:
+                self.player_list.item(row).setSelected(True)
+            if tid == prev_cur:
+                self.player_list.setCurrentRow(row)
         self.player_list.blockSignals(False)
         self.trackbar.set_players(
             {t: (spans[t][0], spans[t][1], self._role_of(t)) for t in spans})
@@ -2480,37 +2504,47 @@ class PtzTab(QWidget):
                                     classes=[0], verbose=False)[0]
         finally:
             QApplication.restoreOverrideCursor()
-        rows = self.extra_players.setdefault(int(si), [])
-        new = []
+        # 주변에 여럿 잡혀도 커서를 포함하는 박스 하나만 채택
+        # (포함 박스가 여럿이면 가장 작은 것 = 가장 특정한 것).
+        best, best_key = None, None
         for b in r.boxes:
             x1, y1, x2, y2 = (float(v) for v in b.xyxy[0])
             cx, cy = x0 + (x1 + x2) / 2, y0 + (y1 + y2) / 2
-            # 기존(분석+수동) 박스와 겹치면 중복 추가하지 않음
-            if any((p[0] - cx) ** 2 + (p[1] - cy) ** 2 < (p[3] / 2) ** 2
-                   for p in self._players_row(si) if len(p) >= 4):
-                continue
-            row = [round(cx, 1), round(cy, 1), round(x2 - x1, 1),
-                   round(y2 - y1, 1), self._next_extra_id]
-            self._next_extra_id += 1
-            rows.append(row)
-            new.append((row[4], float(b.conf[0])))
-        if not new:
-            self.log(f"[ptz] 주변 재검출: 새 사람 없음 (크롭 {2*half}px, "
-                     f"기존과 중복 {len(r.boxes)}건)")
+            bw, bh = x2 - x1, y2 - y1
+            inside = abs(x - cx) <= bw / 2 + 8 and abs(y - cy) <= bh / 2 + 8
+            d2 = (cx - x) ** 2 + (cy - y) ** 2
+            if not inside and d2 > max(150.0, ph) ** 2:
+                continue                 # 커서에서 먼 박스는 무시
+            key = (0, bw * bh) if inside else (1, d2)
+            if best_key is None or key < best_key:
+                best, best_key = (cx, cy, bw, bh, float(b.conf[0])), key
+        if best is None:
+            self.log(f"[ptz] 주변 재검출: 커서 위치에 사람 없음 "
+                     f"(크롭 {2*half}px, 검출 {len(r.boxes)}건)")
             return
-        self.log(f"[ptz] 주변 재검출: 사람 {len(new)}명 추가 "
-                 f"(크롭 {2*half}px, 예상 키 {ph:.0f}px)")
+        cx, cy, bw, bh, conf = best
+        # 기존(분석+수동) 박스와 겹치면 중복 추가하지 않음
+        if any((p[0] - cx) ** 2 + (p[1] - cy) ** 2 < (p[3] / 2) ** 2
+               for p in self._players_row(si) if len(p) >= 4):
+            self.log("[ptz] 주변 재검출: 이미 있는 박스와 중복 — 추가 안 함")
+            return
+        tid = self._next_extra_id
+        self._next_extra_id += 1
+        self.extra_players.setdefault(int(si), []).append(
+            [round(cx, 1), round(cy, 1), round(bw, 1), round(bh, 1), tid])
+        skipped = len(r.boxes) - 1
+        self.log(f"[ptz] 주변 재검출: 사람 1명 추가 (conf {conf:.2f}"
+                 + (f", 주변 {skipped}건은 제외" if skipped > 0 else "")
+                 + f", 크롭 {2*half}px)")
         self._save_keyframes()
         self._pcache_id = None           # 선수 목록 캐시 무효화
         self._refresh_player_list()
         self._redraw()
         menu = QMenu(self)               # 바로 역할 지정
-        for tid, conf in new:
-            sub = menu.addMenu(f"사람 #{tid - 900000} (conf {conf:.2f}) 역할")
-            for rr in (3, 4, 5, 0, 1):
-                sub.addAction(ROLE_NAMES[rr],
-                              lambda _=False, r_=rr, t=tid:
-                              self._set_role(t, r_))
+        for rr in (3, 4, 5, 0, 1):
+            menu.addAction(f"{ROLE_NAMES[rr]} 지정",
+                           lambda _=False, r_=rr, t=tid:
+                           self._set_role(t, r_))
         menu.addAction("역할 없이 두기", lambda: None)
         menu.exec(gpos)
 

@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -105,10 +106,27 @@ class MainWindow(QMainWindow):
         v = QSettings("PyStitch360", "PyStitch360").value("recent_projects", [])
         if isinstance(v, str):          # QSettings 는 원소 1개 리스트를 str 로 돌려줄 수 있음
             v = [v]
-        return [p for p in (v or []) if Path(p).exists()]
+        out, seen = [], set()
+        for p in v or []:               # 기존에 쌓인 중복 표기도 정리
+            c = self._canon(p)
+            if c not in seen and Path(p).exists():
+                seen.add(c)
+                out.append(p)
+        return out
+
+    @staticmethod
+    def _canon(path) -> str:
+        """중복 판정용 정규화 — 슬래시/역슬래시·대소문자 표기 차이 흡수.
+
+        Windows 에서 파일 대화상자는 D:/a/b, 내부 Path 는 D:\\a\\b 를
+        돌려줘 같은 파일이 두 표기로 최근 목록에 쌓이는 문제가 있었다.
+        """
+        return os.path.normcase(os.path.normpath(str(path)))
 
     def _remember_recent(self, path):
-        paths = [str(path)] + [p for p in self._recent_projects() if p != str(path)]
+        canon = self._canon(path)
+        paths = [str(Path(path))] + [p for p in self._recent_projects()
+                                     if self._canon(p) != canon]
         QSettings("PyStitch360", "PyStitch360").setValue(
             "recent_projects", paths[: self._MAX_RECENT])
         self._rebuild_recent_menu()
