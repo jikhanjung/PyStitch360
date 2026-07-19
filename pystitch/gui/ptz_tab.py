@@ -1813,11 +1813,28 @@ class PtzTab(QWidget):
                 self.log(f"[작업] {msg} 완료 ({el:.1f}s)")
 
     def _on_slider(self, _):
+        # 재생 중 사용자 시크(워커 갱신이 아님) → 그 지점부터 재생 계속
+        if self._playing and not getattr(self, "_play_sync", False):
+            self._restart_play_at(self.slider.value())
+            return
         self.trackbar.set_pos(self.slider.value())
         t = self.slider.value() / self.fps
         self.lbl_time.setText(f"{self._hms(t, tenth=True)} / "
                               f"{self._hms(self.total / self.fps)}")
         self._slider_timer.start()
+
+    def _restart_play_at(self, f):
+        """재생 중 시크: 이전 워커를 버리고 f 부터 재생 재시작."""
+        w_old = self._play_worker
+        if w_old is not None:
+            try:
+                w_old.frame_ready.disconnect()
+                w_old.finished.disconnect()
+            except TypeError:
+                pass
+            w_old.stop()                  # 남은 프레임 방출은 무시됨
+        self._playing = False
+        self._toggle_play()               # slider 값(=f)부터 새로 시작
 
     def _toggle_play(self):
         if self._playing:
@@ -1841,7 +1858,11 @@ class PtzTab(QWidget):
 
     def _play_frame(self, frame, f):
         self._cur_frame, self._cur_frame_idx = frame, f
-        self.slider.setValue(f)     # _show_frame 은 재생 중 가드로 무시됨
+        self._play_sync = True      # 워커 발 갱신 표시 — 사용자 시크와 구분
+        try:
+            self.slider.setValue(f)  # _show_frame 은 재생 중 가드로 무시됨
+        finally:
+            self._play_sync = False
         self._redraw()
 
     def _play_finished(self):
