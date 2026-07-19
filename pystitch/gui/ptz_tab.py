@@ -165,7 +165,7 @@ class RadarView(QWidget):
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.setPen(QColor(0, 0, 0, 180))            # 외곽선 — 배경 대비
             p.drawEllipse(x - 6, y - 6, 12, 12)
-            p.setBrush(QColor(255, 255, 255))
+            p.setBrush(QColor(255, 140, 0))          # 공 = 주황
             p.setPen(Qt.PenStyle.NoPen)
             p.drawEllipse(x - 5, y - 5, 10, 10)
         p.setPen(QColor(255, 255, 255, 160))

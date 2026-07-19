@@ -1174,7 +1174,7 @@ def draw_radar_panel(radar, si, panel_w):
     if radar["balls"][si] is not None:
         q = px(*radar["balls"][si])
         cv2.circle(img, q, r_dot + 2, (30, 30, 30), 2)   # 외곽선 — 대비
-        cv2.circle(img, q, r_dot + 1, (255, 255, 255), -1)
+        cv2.circle(img, q, r_dot + 1, (0, 140, 255), -1)   # 공 = 주황 (BGR)
     return img
 
 
