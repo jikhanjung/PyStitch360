@@ -81,7 +81,10 @@ def _default_out_dir(left_dir: Path, right_dir: Path) -> Path:
     name = "_".join(pre + suf)
     if len(name) < 3:
         name = "PyStitch360_headless"
-    return left_dir.resolve().parent / name
+    out = left_dir.resolve().parent / name
+    if out in (left_dir.resolve(), right_dir.resolve()):
+        out = out.with_name(name + "_pano")   # 입력과 동명 — 원본 보호
+    return out
 
 
 def _estimate_sync(left0, right0, first_dur: float, prefer_start=60.0):

@@ -67,6 +67,10 @@ def test_default_out_dir():
     assert _default_out_dir(base / "Left_cam", base / "Right_cam").name == "cam"
     assert _default_out_dir(base / "abc", base / "xyz"
                             ).name == "PyStitch360_headless"
+    # 공통부분이 입력 디렉터리 이름 그대로면 원본 안에 쓰지 않도록 회피
+    assert _default_out_dir(base / "20251026_GoPro5",
+                            base / "20251026_GoPro5 2"
+                            ).name == "20251026_GoPro5_pano"
 
 
 def _analysis(rows_per_frame):
