@@ -540,6 +540,11 @@ def classify_teams(analysis, k=3, roles=None):
     군집 중심보다 그 센터가 더 가까운 트랙릿에 역할을 부여한다 (GK·심판은
     필드 플레이어와 다른 색 옷이므로 시드 한 명이면 ID가 갈라져도 같은
     사람/역할의 다른 트랙릿까지 잡힌다). 시드 자신은 무조건 그 역할.
+
+    색 전파는 GK·심판(역할 ≥3)만 — 팀 역할(0/1) 시드는 자신에게만
+    적용된다. 팀 수정 시드는 대개 오분류된 애매한 색(그늘 등)이라 그
+    색을 팀 센터로 삼으면 멀쩡한 다른 트랙릿(어두운 옷 심판 포함)까지
+    끌려오는 오동작이 있었다.
     반환: {track_id: 역할번호}.
     """
     feats: dict[int, list] = {}
@@ -579,7 +584,7 @@ def classify_teams(analysis, k=3, roles=None):
     pos = {t: i for i, t in enumerate(ids)}
     seed_feats: dict[int, list] = {}
     for t, r in roles.items():
-        if int(t) in pos:
+        if int(t) in pos and int(r) >= 3:     # GK·심판만 색 전파
             seed_feats.setdefault(int(r), []).append(X[pos[int(t)]])
     role_C = {r: np.median(np.array(v), axis=0)
               for r, v in seed_feats.items()}
