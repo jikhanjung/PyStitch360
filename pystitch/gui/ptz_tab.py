@@ -1112,6 +1112,8 @@ class PtzTab(QWidget):
         self.kit_colors: dict[int, list] = {}      # 사용자 지정 표시 색(BGR)
         self._play_worker = None
         self._playing = False
+        self._audio = None                # QMediaPlayer (지연 초기화, False=불가)
+        self._audio_out = None
         self._proxy_worker = None
         self.disp_path = None
         self.disp_scale = 1.0
@@ -1192,6 +1194,14 @@ class PtzTab(QWidget):
         for b in (self.btn_mode_ball, self.btn_mode_kf):
             b.setCheckable(True)
         self.btn_mode_ball.setChecked(True)
+        self.btn_mute = _tbtn("🔊", "재생 소리 켬/끔",
+                              self._toggle_mute, 0, 5)
+        self.btn_mute.setCheckable(True)
+        self.btn_mute.setChecked(
+            QSettings("PyStitch360", "PyStitch360")
+            .value("ptz_muted", "false") == "true")
+        if self.btn_mute.isChecked():
+            self.btn_mute.setText("🔇")
         for col, (text, tip, d) in enumerate(
                 [("≪", "-10초", -300), ("<", "-1초", -30), ("‹", "-1프레임", -1),
                  ("›", "+1프레임", 1), (">", "+1초", 30), ("≫", "+10초", 300)]):
@@ -1833,6 +1843,30 @@ class PtzTab(QWidget):
         self._playing = False
         self._toggle_play()               # slider 값(=f)부터 새로 시작
 
+    def _toggle_mute(self):
+        muted = self.btn_mute.isChecked()
+        self.btn_mute.setText("🔇" if muted else "🔊")
+        QSettings("PyStitch360", "PyStitch360").setValue(
+            "ptz_muted", "true" if muted else "false")
+        if self._audio:
+            self._audio_out.setMuted(muted)
+
+    def _ensure_audio(self):
+        """오디오 플레이어 지연 초기화 — 백엔드 없으면 조용히 무음."""
+        if self._audio is not None:
+            return self._audio or None
+        try:
+            from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
+            self._audio_out = QAudioOutput()
+            self._audio_out.setMuted(self.btn_mute.isChecked())
+            p = QMediaPlayer()
+            p.setAudioOutput(self._audio_out)
+            self._audio = p
+        except Exception as e:  # noqa: BLE001
+            self.log(f"[ptz] 오디오 재생 불가 (QtMultimedia): {e}")
+            self._audio = False
+        return self._audio or None
+
     def _toggle_play(self):
         if self._playing:
             self._stop_play()
@@ -1847,11 +1881,21 @@ class PtzTab(QWidget):
         self._play_worker = w
         self._playing = True
         self.btn_play.setText("⏸")
+        a = self._ensure_audio()
+        if a is not None:
+            from PyQt6.QtCore import QUrl
+            url = QUrl.fromLocalFile(str(self.pano_path))
+            if a.source() != url:
+                a.setSource(url)      # 오디오는 항상 원본에서 (프록시 무관)
+            a.setPosition(int(self.slider.value() / self.fps * 1000))
+            a.play()
         w.start()
 
     def _stop_play(self):
         if self._play_worker is not None and self._play_worker.isRunning():
             self._play_worker.stop()
+        if self._audio:
+            self._audio.pause()
 
     def _play_frame(self, frame, f):
         self._cur_frame, self._cur_frame_idx = frame, f
@@ -1860,11 +1904,18 @@ class PtzTab(QWidget):
             self.slider.setValue(f)  # _show_frame 은 재생 중 가드로 무시됨
         finally:
             self._play_sync = False
+        # 오디오 드리프트 보정 (±0.3s 넘으면 재동기)
+        if self._audio and f % 150 < 5:
+            want = int(f / self.fps * 1000)
+            if abs(self._audio.position() - want) > 300:
+                self._audio.setPosition(want)
         self._redraw()
 
     def _play_finished(self):
         self._playing = False
         self.btn_play.setText("▶")
+        if self._audio:
+            self._audio.pause()
 
     def _current_sample(self):
         """현재 시각 근처(±0.5s)의 분석 샘플 인덱스."""
