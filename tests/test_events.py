@@ -113,9 +113,9 @@ def test_classify_referees_positional():
          "players": players, "pano_w": PANO_W, "pano_h": PANO_H}
     teams = {100 + i: (0 if i < 3 else 1) for i in range(6)}
     sug, info = classify_referees(a, teams, _calib())
-    assert sug.get(500) == 5 and 500 in info["main"]
-    assert sug.get(501) == 5 and 501 in info["ar_near"]
-    assert sug.get(502) == 5 and 502 in info["ar_far"]
+    assert sug.get(500) == 5 and 500 in info["main"]      # 주심
+    assert sug.get(501) == 6 and 501 in info["ar_near"]   # 선심
+    assert sug.get(502) == 6 and 502 in info["ar_far"]
     assert 100 not in sug                        # 팀 선수는 제외
 
 

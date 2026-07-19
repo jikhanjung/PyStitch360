@@ -141,7 +141,7 @@ def detect_kickoffs(track, whistles, min_db=15.0,
 
 
 def classify_referees(analysis, teams, calib, min_det=40):
-    """비팀 트랙릿의 위치 통계로 심판 역할(5) 제안.
+    """비팀 트랙릿의 위치 통계로 심판 역할 제안 (주심=5, 선심=6).
 
     주심: 필드 내부 상주 + 넓은 활동 범위 (경기를 따라다님).
     선심(부심): 사이드라인 부근 상주(경계 ±3.5m, Y 요동 작음) +
@@ -178,10 +178,10 @@ def classify_referees(analysis, teams, calib, min_det=40):
         d_side = min(abs(my - hw), abs(my + hw))
         inside = float(np.mean((np.abs(x) < hl + 2) & (np.abs(y) < hw - 2)))
         if d_side <= 3.5 and y_iqr <= 3.0 and x_span >= 8.0:
-            suggest[tid] = 5
+            suggest[tid] = 6                      # 선심 (AR)
             info["ar_near" if my < 0 else "ar_far"].append(tid)
         elif inside >= 0.75 and x_span >= 15.0 and y_iqr >= 6.0:
-            suggest[tid] = 5
+            suggest[tid] = 5                      # 주심
             info["main"].append(tid)
     return suggest, info
 

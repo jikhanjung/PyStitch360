@@ -44,9 +44,10 @@ from .widgets import FramePane
 
 # BGR — 인덱스 = 역할 번호 (core.ptz ROLE_*): 팀1, 팀2, 기타, 팀1 GK, 팀2 GK, 심판
 TEAM_COLORS = [(60, 60, 230), (230, 140, 40), (160, 160, 160),
-               (180, 105, 255), (230, 230, 0), (60, 200, 230)]
-ROLE_NAMES = ["팀1", "팀2", "기타", "팀1 GK", "팀2 GK", "심판"]
-ROLE_TAGS = {3: "GK1", 4: "GK2", 5: "REF"}
+               (180, 105, 255), (230, 230, 0), (60, 200, 230),
+               (250, 150, 60)]
+ROLE_NAMES = ["팀1", "팀2", "기타", "팀1 GK", "팀2 GK", "주심", "선심"]
+ROLE_TAGS = {3: "GK1", 4: "GK2", 5: "REF", 6: "AR"}
 # 미리보기 오버레이용 랜드마크 약칭 (cv2 폰트는 한글 불가)
 LANDMARK_TAGS = {"corner_far_l": "FL", "corner_far_r": "FR",
                  "corner_near_l": "NL", "corner_near_r": "NR",
@@ -1675,7 +1676,7 @@ class PtzTab(QWidget):
         self.lbl_team_colors = QLabel("팀 색: 분석 후 표시")
         legend.addWidget(self.lbl_team_colors)
         self._kit_btns, self._kit_lbls = {}, {}
-        for r in (0, 1, 3, 4, 5):
+        for r in (0, 1, 3, 4, 5, 6):
             b = QPushButton()
             b.setFixedSize(26, 18)
             b.setToolTip(f"{self._role_name(r)} 표시 색 — 클릭: 색 선택, "
@@ -1703,7 +1704,7 @@ class PtzTab(QWidget):
         rl = QHBoxLayout()
         rl.addWidget(QLabel("선택한 트랙릿 →"))
         self._role_btns = {}
-        for r in (0, 1, 5, 3, 4):        # 자주 쓰는 팀/심판 먼저, GK 뒤로
+        for r in (0, 1, 5, 6, 3, 4):     # 자주 쓰는 팀/심판 먼저, GK 뒤로
             b = QPushButton(self._role_name(r))
             b.setMaximumWidth(90)
             b.clicked.connect(lambda _, rr=r: self._assign_selected_role(rr))
@@ -2902,8 +2903,8 @@ class PtzTab(QWidget):
                                       (x2 + g, y2 + g), (255, 255, 255),
                                       max(1, int(2 * sc)))
                     tag = ROLE_TAGS.get(team)
-                    if team == 5 and pid is not None:
-                        tag = self._ref_tag(pid)          # 선심 ARN/ARF
+                    if team in (5, 6) and pid is not None:
+                        tag = self._ref_tag(pid, team)    # 주심/선심 태그
                     if pid is not None and pid >= 0:
                         num = self._num_of(pid)           # 등번호
                         if num and num.isascii():
@@ -3092,8 +3093,10 @@ class PtzTab(QWidget):
                 self._fill_num_menu(
                     sub.addMenu(f"  ↳ {self._role_name(r)} 번호 지정"),
                     tid, r)
-            sub.addAction(self._role_name(5),
-                          lambda _=False, t=tid: self._set_role(t, 5))
+            for r in (5, 6):
+                sub.addAction(self._role_name(r),
+                              lambda _=False, rr=r, t=tid:
+                              self._set_role(t, rr))
             sub.addSeparator()                    # GK 는 드묾 — 아래쪽
             for r in (3, 4):
                 sub.addAction(self._role_name(r),
@@ -3409,12 +3412,14 @@ class PtzTab(QWidget):
         """역할 표시명 — 팀1/팀2 자리에 사용자 입력 팀 이름."""
         t1, t2 = self.team_names
         return {0: t1, 1: t2, 2: "기타",
-                3: f"{t1} GK", 4: f"{t2} GK", 5: "심판"}.get(r, "기타")
+                3: f"{t1} GK", 4: f"{t2} GK",
+                5: "주심", 6: "선심"}.get(r, "기타")
 
-    def _ref_tag(self, tid):
+    def _ref_tag(self, tid, role=5):
         """심판 트랙릿 태그 — 선심은 근/원측 (ARN/ARF, referee.py 분류).
 
         병합 그룹의 어느 멤버든 분류에 있으면 그룹 전체에 적용.
+        분류 정보가 없으면 역할 기본값 (주심=REF, 선심=AR).
         """
         rep = self._rep(tid)
         grp = {int(tid), rep} | {t for t, r in self.merges.items()
@@ -3423,13 +3428,13 @@ class PtzTab(QWidget):
             return "ARN"
         if grp & {int(t) for t in self._referees.get("ar_far") or []}:
             return "ARF"
-        return "REF"
+        return "AR" if role == 6 else "REF"
 
     def _disp_role(self, tid, r):
         """목록용 역할명 — 선심은 ARN(근측)/ARF(원측) 표기 (+등번호)."""
-        if r == 5:
-            return {"ARN": "선심 ARN", "ARF": "선심 ARF"}.get(
-                self._ref_tag(tid), "심판")
+        if r in (5, 6):
+            return {"ARN": "선심 ARN", "ARF": "선심 ARF",
+                    "AR": "선심"}.get(self._ref_tag(tid, r), "주심")
         name = self._role_name(r)
         num = self._num_of(tid)
         return f"{name} {num}번" if num else name
@@ -3594,7 +3599,7 @@ class PtzTab(QWidget):
         logs = []
         self._role_colors = {}
         shown = 0
-        for r in (0, 1, 3, 4, 5):
+        for r in (0, 1, 3, 4, 5, 6):
             member = [t for t in cols
                       if self._role_of(t) == r and spans.get(t, [0, 0, 0])[2] >= 5]
             if not member:
@@ -3618,7 +3623,7 @@ class PtzTab(QWidget):
             logs.append(f"{self._role_name(r)} {hexc} ({len(member)}트랙릿)")
         self.lbl_team_colors.setText("유니폼 색:" if shown
                                      else "팀 색: 분석 후 표시")
-        self._radar_palette = {r: self._role_color(r) for r in range(6)}
+        self._radar_palette = {r: self._role_color(r) for r in range(7)}
         self.trackbar.set_role_palette(self._radar_palette)
         if log_colors and logs:
             self.log("[ptz] 팀 색 분류: " + ", ".join(logs))
@@ -3951,7 +3956,7 @@ class PtzTab(QWidget):
                 self.analysis, teams, calib=self._field_calib,
                 field_size=tuple(self.field_size),
                 extra_players=self.extra_players,
-                palette={r: self._role_color(r) for r in range(6)})
+                palette={r: self._role_color(r) for r in range(7)})
         dur = sum(e - s for s, e, _ in segs) / self.fps
         self.log(f"[hl] 일괄 내보내기 시작: {len(segs)}개 구간, "
                  f"총 {dur/60:.1f}분 → {cfg['dir']}")
@@ -5103,7 +5108,7 @@ class PtzTab(QWidget):
                 self.analysis, teams, calib=self._field_calib,
                 field_size=tuple(self.field_size),
                 extra_players=self.extra_players,
-                palette={r: self._role_color(r) for r in range(6)})
+                palette={r: self._role_color(r) for r in range(7)})
             self.log("[ptz] 미니맵 오버레이 포함 "
                      + ("(경기장 절대 좌표)" if self._field_calib is not None
                         else "(캘리브레이션 없음 — 근사 좌표)"))
