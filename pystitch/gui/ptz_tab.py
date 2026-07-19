@@ -144,10 +144,7 @@ class RadarView(QWidget):
             cx0, cy0 = px(0, 0)
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawEllipse(cx0 - rx, cy0 - ry, 2 * rx, 2 * ry)
-            p.setBrush(QColor(255, 220, 0))
             p.setPen(Qt.PenStyle.NoPen)
-            camp = px(camx, camy)
-            p.drawEllipse(camp[0] - 3, camp[1] - 3, 6, 6)   # 카메라 위치
         else:
             p.setPen(QColor(255, 255, 255, 45))
             for gx in range(-50, 51, 10):
