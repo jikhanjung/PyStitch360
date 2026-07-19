@@ -11,7 +11,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import QSettings, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QRect, QSettings, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QCheckBox
 from PyQt6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
@@ -187,18 +187,19 @@ class TimelineView(QWidget):
     RULER = 16
     LANE_H = 20                  # 기본 레인 높이 (개별 조절 가능)
     GUTTER = 64
-    LANES = ["크롭/KF", "공", "팀1", "팀2", "기타", "호각"]
+    LANES = ["크롭/KF", "공", "팀1", "팀2", "기타", "호각", "이벤트"]
     WHISTLE_MIN_DB = 20.0        # 이 피크 이상만 '확실한 호각'으로 표시
 
     def __init__(self):
         super().__init__()
+        self.lanes = list(self.LANES)     # 인스턴스 사본 (팀 이름 반영)
         saved = QSettings("PyStitch360", "PyStitch360").value(
             "ptz_timeline_lanes", None)
         try:
             self.lane_h = [max(10, min(120, int(v))) for v in saved]
-            assert len(self.lane_h) == len(self.LANES)
+            assert len(self.lane_h) == len(self.lanes)
         except Exception:  # noqa: BLE001
-            self.lane_h = [self.LANE_H] * len(self.LANES)
+            self.lane_h = [self.LANE_H] * len(self.lanes)
         self._apply_height()
         self.setMouseTracking(True)
         self.setToolTip("레이블 쪽에서 레인 경계 드래그 = 높이 조절 "
@@ -217,8 +218,17 @@ class TimelineView(QWidget):
         self.mark_in = None          # 내보내기 시작 프레임 (None=미지정)
         self.mark_out = None         # 내보내기 끝 프레임
         self._whistle = None         # (hop_s, 프로미넌스 배열, 이벤트)
+        self.events = []             # [(frame, label, kind)] kind: auto|user
         self._press = None
         self._resize = None          # 레인 경계 드래그 상태
+
+    def set_lane_names(self, team1, team2):
+        self.lanes[2], self.lanes[3] = team1, team2
+        self.update()
+
+    def set_events(self, events):
+        self.events = list(events)
+        self.update()
 
     def _emit_view(self):
         vis = (self.width() - self.GUTTER) / max(self._eff_ppf(), 1e-9)
@@ -366,13 +376,14 @@ class TimelineView(QWidget):
         p.fillRect(self.rect(), QColor(34, 34, 38))
         W = self.width()
         # 레인 배경/라벨
-        for i, name in enumerate(self.LANES):
+        for i, name in enumerate(self.lanes):
             y, lh = self._lane_rect(i)
             if i % 2 == 0:
                 p.fillRect(self.GUTTER, y, W - self.GUTTER, lh,
                            QColor(255, 255, 255, 8))
             p.setPen(QColor(200, 200, 200))
-            p.drawText(4, y + lh - 6, name)
+            p.drawText(QRect(4, y, self.GUTTER - 8, lh),
+                       Qt.AlignmentFlag.AlignVCenter, name)
             p.setPen(QColor(255, 255, 255, 25))
             p.drawLine(0, y + lh, W, y + lh)
         # 눈금자: 60px 이상 간격이 되는 단위 선택
@@ -449,6 +460,21 @@ class TimelineView(QWidget):
                 # 긴 호각(킥오프·종료 후보)은 위 눈금까지 강조
                 if t1_ - t0_ >= 0.8:
                     p.drawLine(x_, y + 1, x_ + w_, y + 1)
+        # 이벤트 레인: 자동(킥오프)=초록, 사용자=시안 마커 + 라벨
+        if self.events and self.total > 1:
+            y, lh = self._lane_rect(6)
+            for i, (f_, label, kind) in enumerate(self.events):
+                x_ = self._x(f_)
+                if not (self.GUTTER - 4 <= x_ <= W + 4):
+                    continue
+                c = (QColor(90, 220, 120) if kind == "auto"
+                     else QColor(80, 200, 230))
+                p.fillRect(x_ - 1, y + 2, 3, lh - 4, c)
+                p.setPen(c)
+                if self.selected == ("event", i):
+                    p.drawRect(x_ - 4, y + 1, 8, lh - 2)
+                p.drawText(QRect(x_ + 5, y, 140, lh),
+                           Qt.AlignmentFlag.AlignVCenter, label)
         # 내보내기 구간: 바깥은 어둡게, IN/OUT 브래킷 표시
         if self.mark_in is not None or self.mark_out is not None:
             fi = 0 if self.mark_in is None else self.mark_in
@@ -468,10 +494,11 @@ class TimelineView(QWidget):
             p.drawText(xb - 26, self.height() - 4, "OUT")
         # 거터 마스크 + 플레이헤드
         p.fillRect(0, self.RULER, self.GUTTER, self.height(), QColor(34, 34, 38))
-        for i, name in enumerate(self.LANES):     # 라벨 다시 (마스크 위)
+        for i, name in enumerate(self.lanes):     # 라벨 다시 (마스크 위)
             y, lh = self._lane_rect(i)
             p.setPen(QColor(200, 200, 200))
-            p.drawText(4, y + lh - 6, name)
+            p.drawText(QRect(4, y, self.GUTTER - 8, lh),
+                       Qt.AlignmentFlag.AlignVCenter, name)
         x = self._x(self.pos)
         if x >= self.GUTTER:
             p.setPen(QColor(255, 60, 60))
@@ -506,12 +533,23 @@ class TimelineView(QWidget):
                 ry = ly + 2 + si * bh
                 if f0 <= f <= f1 and ry - 1 <= y <= ry + bh:
                     return ("player", tid)
+        if lane == 6:
+            best, bd = None, 10.0
+            for i, (f_, label, kind) in enumerate(self.events):
+                d = abs(self._x(f_) - x)
+                if d < bd:
+                    best, bd = ("event", i), d
+            return best
         return None
 
     def mousePressEvent(self, ev):
         if ev.button() != Qt.MouseButton.LeftButton:
             return
         x, y = int(ev.position().x()), int(ev.position().y())
+        if y >= self.height() - 4:          # 하단 가장자리 = 전체 비례 리사이즈
+            self._resize = {"lane": len(self.lane_h) - 1, "y": y,
+                            "orig": list(self.lane_h), "all": True}
+            return
         if x < self.GUTTER:                 # 레이블 영역: 경계 드래그 = 높이
             b = self._boundary_at(y)
             if b is not None:
@@ -530,10 +568,11 @@ class TimelineView(QWidget):
             self._apply_lane_resize(y - self._resize["y"])
             return
         if self._press is None:
-            # 호버 커서: 레이블 영역 경계 위에서 상하 리사이즈 커서
-            self.setCursor(Qt.CursorShape.SizeVerCursor
-                           if x < self.GUTTER
-                           and self._boundary_at(y) is not None
+            # 호버 커서: 하단 가장자리(전체) / 레이블 영역 경계(개별)
+            on_edge = (y >= self.height() - 4
+                       or (x < self.GUTTER
+                           and self._boundary_at(y) is not None))
+            self.setCursor(Qt.CursorShape.SizeVerCursor if on_edge
                            else Qt.CursorShape.ArrowCursor)
             return
         dx = x - self._press["x"]
@@ -941,6 +980,8 @@ class PtzTab(QWidget):
         self.ignores: list[list] = []     # [f0, f1] 사용자 지정 오인식 구간
         self.promotes: list[list] = []    # [f, x, y] 회색 공 → 트랙 강제 수락
         self.export_range: list = [None, None]   # 내보내기 IN/OUT 프레임
+        self.team_names = ["팀1", "팀2"]  # 사용자 입력 팀 이름
+        self.user_events: list[list] = []  # [[frame, label]] 사용자 이벤트
         self.roles: dict[int, int] = {}   # {track_id: 역할} 사용자 지정 (GK 등)
         self.field_points: dict[str, list] = {}   # {랜드마크키: [x, y]}
         self.line_points: list[list] = []  # 흰 선 검출 샘플 [x, y] (사이드라인)
@@ -1155,7 +1196,7 @@ class PtzTab(QWidget):
         for r in (0, 1, 3, 4, 5):
             b = QPushButton()
             b.setFixedSize(26, 18)
-            b.setToolTip(f"{ROLE_NAMES[r]} 표시 색 — 클릭: 색 선택, "
+            b.setToolTip(f"{self._role_name(r)} 표시 색 — 클릭: 색 선택, "
                          "우클릭: 측정색으로 되돌리기")
             b.clicked.connect(lambda _=False, rr=r: self._pick_kit_color(rr))
             b.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -1176,11 +1217,17 @@ class PtzTab(QWidget):
         pl.addWidget(self.player_list, 1)
         rl = QHBoxLayout()
         rl.addWidget(QLabel("선택한 트랙릿 →"))
+        self._role_btns = {}
         for r in (3, 4, 5, 0, 1):
-            b = QPushButton(ROLE_NAMES[r])
-            b.setMaximumWidth(72)
+            b = QPushButton(self._role_name(r))
+            b.setMaximumWidth(90)
             b.clicked.connect(lambda _, rr=r: self._assign_selected_role(rr))
+            self._role_btns[r] = b
             rl.addWidget(b)
+        b = QPushButton("팀 이름...")
+        b.setMaximumWidth(72)
+        b.clicked.connect(self._edit_team_names)
+        rl.addWidget(b)
         b = QPushButton("자동")
         b.setMaximumWidth(56)
         b.setToolTip("사용자 지정을 지우고 색 기반 자동 분류로")
@@ -1341,8 +1388,26 @@ class PtzTab(QWidget):
             self.btn_analyze.setToolTip("ultralytics 미설치 (pip install ultralytics)")
         self.analysis = None
         self._load_sidecar()
+        self._apply_team_names()
+        self._refresh_events()
         self._show_frame()
         self._update_export_enabled()
+
+    def _refresh_events(self):
+        """자동(킥오프, .events.json) + 사용자 이벤트 → 타임라인 레인."""
+        items = []
+        try:
+            from ..core.events import load_events
+            for k in load_events(self.pano_path):
+                items.append((int(k["t"] * self.fps),
+                              "킥오프" + (" ●" if k.get("long_whistle")
+                                         else ""), "auto"))
+        except Exception as e:  # noqa: BLE001
+            self.log(f"[ptz] 이벤트 파일 무시: {e}")
+        for f, label in self.user_events:
+            items.append((int(f), label, "user"))
+        items.sort()
+        self.trackbar.set_events(items)
 
     def _proxy_path(self) -> Path:
         return self.pano_path.with_suffix(".scrub.mp4")
@@ -1446,6 +1511,11 @@ class PtzTab(QWidget):
                                  if er else [None, None])
             r = self._norm_export_range()
             self.trackbar.set_range(*(r if r else (None, None)))
+            tn = doc.get("team_names")
+            if tn and len(tn) == 2:
+                self.team_names = [str(tn[0]), str(tn[1])]
+            self.user_events = [[int(e[0]), str(e[1])]
+                                for e in doc.get("user_events", [])]
             ids = [int(p[4]) for rows in self.extra_players.values()
                    for p in rows]
             self._next_extra_id = max(ids, default=900000) + 1
@@ -1514,7 +1584,9 @@ class PtzTab(QWidget):
                                    "line_points": self.line_points,
                                    "extra_players": self.extra_players,
                                    "kit_colors": self.kit_colors,
-                                   "export_range": self.export_range}))
+                                   "export_range": self.export_range,
+                                   "team_names": self.team_names,
+                                   "user_events": self.user_events}))
         tmp.replace(sp)
 
     def _write_analysis(self):
@@ -2328,9 +2400,9 @@ class PtzTab(QWidget):
         if tid is not None:
             menu.addSeparator()
             sub = menu.addMenu(
-                f"선수 #{tid} ({ROLE_NAMES[self._role_of(tid)]}) 역할 지정")
+                f"선수 #{tid} ({self._role_name(self._role_of(tid))}) 역할 지정")
             for r in (3, 4, 5, 0, 1):
-                sub.addAction(ROLE_NAMES[r],
+                sub.addAction(self._role_name(r),
                               lambda _=False, rr=r, t=tid: self._set_role(t, rr))
             if tid in self.roles:
                 sub.addAction("자동 분류로 되돌리기",
@@ -2558,6 +2630,39 @@ class PtzTab(QWidget):
             self._pcache_id = id(self.analysis)
         return self._pspans, self._pcolors
 
+    def _role_name(self, r):
+        """역할 표시명 — 팀1/팀2 자리에 사용자 입력 팀 이름."""
+        t1, t2 = self.team_names
+        return {0: t1, 1: t2, 2: "기타",
+                3: f"{t1} GK", 4: f"{t2} GK", 5: "심판"}.get(r, "기타")
+
+    def _edit_team_names(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("팀 이름")
+        form = QFormLayout(dlg)
+        e1, e2 = QLineEdit(self.team_names[0]), QLineEdit(self.team_names[1])
+        form.addRow("팀 1 (홈)", e1)
+        form.addRow("팀 2 (원정)", e2)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                              | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if not dlg.exec():
+            return
+        self.team_names = [e1.text().strip() or "팀1",
+                           e2.text().strip() or "팀2"]
+        self._save_keyframes()
+        self._apply_team_names()
+
+    def _apply_team_names(self):
+        """팀 이름 변경을 역할 버튼·범례·목록·타임라인에 반영."""
+        for r, b in getattr(self, "_role_btns", {}).items():
+            b.setText(self._role_name(r))
+        self.trackbar.set_lane_names(*self.team_names)
+        self._refresh_team_label()
+        self._refresh_player_list()
+
     def _role_of(self, tid):
         return self.roles.get(tid, self._teams.get(tid, 2))
 
@@ -2602,9 +2707,9 @@ class PtzTab(QWidget):
                 f"background-color: {hexc}; border: 1px solid #666;")
             self._kit_btns[r].show()
             mark = "✎" if r in self.kit_colors else ""
-            self._kit_lbls[r].setText(f"{ROLE_NAMES[r]}{mark} {len(member)}명")
+            self._kit_lbls[r].setText(f"{self._role_name(r)}{mark} {len(member)}명")
             shown += 1
-            logs.append(f"{ROLE_NAMES[r]} {hexc} ({len(member)}트랙릿)")
+            logs.append(f"{self._role_name(r)} {hexc} ({len(member)}트랙릿)")
         self.lbl_team_colors.setText("유니폼 색:" if shown
                                      else "팀 색: 분석 후 표시")
         self.radar.palette = {r: self._role_color(r) for r in range(6)}
@@ -2615,17 +2720,17 @@ class PtzTab(QWidget):
         """범례 스와치 클릭 → 컬러피커로 역할 표시 색 지정."""
         b, g, r = self._role_color(role)
         c = QColorDialog.getColor(QColor(r, g, b), self,
-                                  f"{ROLE_NAMES[role]} 표시 색")
+                                  f"{self._role_name(role)} 표시 색")
         if not c.isValid():
             return
         self.kit_colors[role] = [c.blue(), c.green(), c.red()]
         self._kit_colors_changed()
-        self.log(f"[ptz] {ROLE_NAMES[role]} 표시 색 지정: {c.name()}")
+        self.log(f"[ptz] {self._role_name(role)} 표시 색 지정: {c.name()}")
 
     def _reset_kit_color(self, role):
         if self.kit_colors.pop(role, None) is not None:
             self._kit_colors_changed()
-            self.log(f"[ptz] {ROLE_NAMES[role]} 표시 색 → 측정색으로 복귀")
+            self.log(f"[ptz] {self._role_name(role)} 표시 색 → 측정색으로 복귀")
 
     def _kit_colors_changed(self):
         self._save_keyframes()
@@ -2643,7 +2748,9 @@ class PtzTab(QWidget):
         prev_cur = old_rows[cur] if 0 <= cur < len(old_rows) else None
         prev_sel = {old_rows[i.row()] for i in self.player_list.selectedIndexes()
                     if i.row() < len(old_rows)}
-        self._player_rows = sorted(spans, key=lambda t: -spans[t][2])
+        # GK 는 목록 하단 그룹으로 (그 안에선 검출 수 순)
+        self._player_rows = sorted(
+            spans, key=lambda t: (self._role_of(t) in (3, 4), -spans[t][2]))
         self.player_list.blockSignals(True)
         self.player_list.clear()
         for tid in self._player_rows:
@@ -2652,7 +2759,7 @@ class PtzTab(QWidget):
             t0, t1 = f0 / self.fps, f1 / self.fps
             mark = "● " if tid in self.roles else ""
             it = QListWidgetItem(
-                f"#{tid}  {mark}{ROLE_NAMES[r]}  "
+                f"#{tid}  {mark}{self._role_name(r)}  "
                 f"{int(t0//60):02d}:{t0%60:04.1f}~"
                 f"{int(t1//60):02d}:{t1%60:04.1f}  ({n}회)")
             if tid in cols:
@@ -2723,6 +2830,39 @@ class PtzTab(QWidget):
         self.progress.setFormat("갭필 완료")
         self.log(f"[gapfill] 완료: 공 {nb}개, 선수 {np_}명 주입 — 트랙 재연결")
         self._start_link()                # 링크·수락 재계산 → 목록/타임라인 갱신
+
+    def detect_events(self):
+        """분석 메뉴: 호각 × 대형 → 킥오프 검출 → .events.json + 타임라인."""
+        if self.analysis is None or self.pano_path is None:
+            QMessageBox.information(self, "이벤트", "먼저 분석이 필요합니다.")
+            return
+        if self._field_calib is None:
+            QMessageBox.information(self, "이벤트",
+                                    "경기장 캘리브레이션이 필요합니다 "
+                                    "(대형 판정에 필드 좌표 사용).")
+            return
+        from ..core.audio import load_whistle_track
+        from ..core.events import detect_kickoffs, formation_track, \
+            save_events
+        _, whistles = load_whistle_track(self.pano_path)
+        if not whistles:
+            QMessageBox.information(
+                self, "이벤트",
+                "호각 트랙이 없습니다 — scripts/whistle.py 를 먼저 "
+                "실행하세요 (오디오 추출, ~20초).")
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            spans, _ = self._player_cache()
+            teams = {tid: self._role_of(tid) for tid in spans}
+            tr = formation_track(self.analysis, teams, self._field_calib)
+            ks = detect_kickoffs(tr, whistles)
+            save_events(self.pano_path, ks)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._refresh_events()
+        times = ", ".join(self._hms(t) for t, _, _ in ks) or "없음"
+        self.log(f"[events] 킥오프 {len(ks)}개: {times}")
 
     def reset_edits(self, scope="all"):
         """사용자 편집 무효화 → 순수 분석 원본 상태 (분석 메뉴에서 호출).
@@ -2805,8 +2945,36 @@ class PtzTab(QWidget):
             menu.addAction("내보내기 구간 해제",
                            lambda: self._set_export_mark("", 0, clear=True))
         menu.addSeparator()
+        menu.addAction("여기에 이벤트 추가...",
+                       lambda: self._add_user_event(f))
+        near = [i for i, (uf, _l) in enumerate(self.user_events)
+                if abs(uf - f) <= 3 * self.fps]
+        for i in near:
+            menu.addAction(f"이벤트 '{self.user_events[i][1]}' 삭제",
+                           lambda _=False, ii=i: self._del_user_event(ii))
+        menu.addSeparator()
         menu.addAction("여기로 이동", lambda: self.slider.setValue(int(f)))
         menu.exec(gpos)
+
+    def _add_user_event(self, f):
+        from PyQt6.QtWidgets import QInputDialog
+        label, ok = QInputDialog.getText(
+            self, "이벤트 추가",
+            f"{self._hms(f/self.fps)} 이벤트 이름 (예: 골, 코너킥):")
+        if not ok or not label.strip():
+            return
+        self.user_events.append([int(f), label.strip()])
+        self.user_events.sort()
+        self._save_keyframes()
+        self._refresh_events()
+        self.log(f"[ptz] 이벤트 '{label.strip()}' @ {self._hms(f/self.fps)}")
+
+    def _del_user_event(self, i):
+        if 0 <= i < len(self.user_events):
+            f, label = self.user_events.pop(i)
+            self._save_keyframes()
+            self._refresh_events()
+            self.log(f"[ptz] 이벤트 '{label}' 삭제")
 
     def _tl_view_changed(self, t0, vis, total):
         """타임라인 줌/팬 → 스크롤바 동기화 (전체 보기면 숨김)."""
@@ -2843,6 +3011,10 @@ class PtzTab(QWidget):
                 spans, _ = self._player_cache()
                 if key in spans:
                     self.slider.setValue(int(spans[key][0]))
+        elif kind == "event":
+            evs = self.trackbar.events
+            if 0 <= key < len(evs):
+                self.slider.setValue(int(evs[key][0]))
 
     def _assign_selected_role(self, role):
         rows = getattr(self, "_player_rows", [])
@@ -3214,7 +3386,7 @@ class PtzTab(QWidget):
         self._redraw()
         menu = QMenu(self)               # 바로 역할 지정
         for rr in (3, 4, 5, 0, 1):
-            menu.addAction(f"{ROLE_NAMES[rr]} 지정",
+            menu.addAction(f"{self._role_name(rr)} 지정",
                            lambda _=False, r_=rr, t=tid:
                            self._set_role(t, r_))
         menu.addAction("역할 없이 두기", lambda: None)

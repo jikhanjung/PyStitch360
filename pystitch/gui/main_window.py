@@ -90,6 +90,8 @@ class MainWindow(QMainWindow):
         a = self.menuBar().addMenu("분석(&A)")
         a.addAction("갭필 2차 패스 (트랙 갭 재검출)...",
                     lambda: self.ptz_tab.start_gapfill())
+        a.addAction("킥오프 검출 (호각 × 대형)",
+                    lambda: self.ptz_tab.detect_events())
         a.addSeparator()
         a.addAction("공/키프레임 편집 초기화",
                     lambda: self.ptz_tab.reset_edits("ball"))
