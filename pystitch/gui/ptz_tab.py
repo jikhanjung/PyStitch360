@@ -1406,6 +1406,7 @@ class PtzTab(QWidget):
         self.kit_colors: dict[int, list] = {}      # 사용자 지정 표시 색(BGR)
         self._play_worker = None
         self._playing = False
+        self._play_until = None          # 구간 재생 끝 프레임 (자동 정지)
         self._audio = None                # QMediaPlayer (지연 초기화, False=불가)
         self._audio_out = None
         self._proxy_worker = None
@@ -2194,6 +2195,7 @@ class PtzTab(QWidget):
         return self._audio or None
 
     def _toggle_play(self):
+        self._play_until = None           # 수동 조작은 구간 재생 해제
         if self._playing:
             self._stop_play()
             return
@@ -2236,6 +2238,22 @@ class PtzTab(QWidget):
             if abs(self._audio.position() - want) > 300:
                 self._audio.setPosition(want)
         self._redraw()
+        if self._play_until is not None and f >= self._play_until:
+            self._play_until = None       # 구간 끝 — 자동 정지
+            self._stop_play()
+
+    def _play_segment(self, f0, f1):
+        """구간 재생: f0 부터 f1 에서 자동 정지 (하이라이트/마커 검수용)."""
+        if self.cap is None or f1 <= f0:
+            return
+        if not self._playing:
+            self.slider.setValue(int(f0))
+            self._toggle_play()
+        else:
+            self.slider.setValue(int(f0))   # 재생 중 시크 → 자동 재시작
+        self._play_until = int(f1)
+        self.log(f"[ptz] 구간 재생 {self._hms(f0 / self.fps)}~"
+                 f"{self._hms(f1 / self.fps)}")
 
     def _play_finished(self):
         self._playing = False
@@ -3874,6 +3892,9 @@ class PtzTab(QWidget):
                        lambda: self._set_export_mark("out", f))
         if self._norm_export_range():
             menu.addSeparator()
+            r = self._norm_export_range()
+            menu.addAction("마커 구간 재생 (OUT 에서 정지)",
+                           lambda: self._play_segment(*r))
             menu.addAction("내보내기 구간 해제",
                            lambda: self._set_export_mark("", 0, clear=True))
         menu.addSeparator()
@@ -3882,6 +3903,8 @@ class PtzTab(QWidget):
         near = [i for i, (uf, _l) in enumerate(self.user_events)
                 if abs(uf - f) <= 3 * self.fps]
         for i in near:
+            menu.addAction(f"이벤트 '{self.user_events[i][1]}' 이름 바꾸기...",
+                           lambda _=False, ii=i: self._rename_user_event(ii))
             menu.addAction(f"이벤트 '{self.user_events[i][1]}' 삭제",
                            lambda _=False, ii=i: self._del_user_event(ii))
         menu.addSeparator()
@@ -3906,6 +3929,10 @@ class PtzTab(QWidget):
             tag = (f"'{h.get('label', '')}' "
                    f"{self._hms(h['t0'])}~{self._hms(h['t1'])}")
             menu.addSeparator()
+            menu.addAction(f"하이라이트 구간 재생 — {tag}",
+                           lambda _=False, ii=i: self._play_segment(
+                               self.highlights[ii]["t0"] * self.fps,
+                               self.highlights[ii]["t1"] * self.fps))
             st = h.get("state", "cand")
             if st != "accept":
                 menu.addAction(f"하이라이트 수락 — {tag}",
@@ -3949,6 +3976,74 @@ class PtzTab(QWidget):
             self._save_keyframes()
             self._refresh_events()
             self.log(f"[ptz] 이벤트 '{label}' 삭제")
+
+    def _rename_user_event(self, i):
+        """이벤트 이름 변경 — '골?' 검수 후 골1/골2 확정 (스코어 반영)."""
+        if not 0 <= i < len(self.user_events):
+            return
+        from PyQt6.QtWidgets import QInputDialog
+        f, old = self.user_events[i]
+        label, ok = QInputDialog.getText(
+            self, "이벤트 이름",
+            f"{self._hms(f / self.fps)} 이벤트 이름\n"
+            "(골1/골2 = 팀1/팀2 득점 — 시계 스코어에 집계):", text=old)
+        if not ok or not label.strip() or label.strip() == old:
+            return
+        self.user_events[i][1] = label.strip()
+        self._save_keyframes()
+        self._refresh_events()
+        self.log(f"[ptz] 이벤트 '{old}' → '{label.strip()}'")
+
+    def suggest_goals(self):
+        """분석 메뉴: 득점 역추론 — 경기 중 킥오프 = 직전 골 (P03-6 보조).
+
+        첫 킥오프(하프 시작) 이후의 각 킥오프 앞에 '골?' 이벤트(−45s)와
+        '골 추정' 하이라이트 후보([−70s, −5s])를 제안한다. 구간 재생으로
+        확인 후 이벤트 이름을 골1/골2 로 바꾸면 스코어에 반영, 오탐이면
+        삭제. 이미 근처에 골 이벤트가 있으면 건너뛴다 (재실행 안전).
+        """
+        if self.pano_path is None:
+            QMessageBox.information(self, "득점 역추론",
+                                    "열린 파노라마가 없습니다.")
+            return
+        from ..core.events import load_events
+        ks = load_events(self.pano_path)
+        if len(ks) < 2:
+            QMessageBox.information(
+                self, "득점 역추론",
+                f"경기 중 킥오프가 없습니다 (검출 {len(ks)}개 — 첫 킥오프는 "
+                "하프 시작). 먼저 \"킥오프 검출\"을 실행하세요.")
+            return
+        n_ev = n_hl = 0
+        for k in ks[1:]:
+            t = float(k["t"])
+            near = [(uf, lb) for uf, lb in self.user_events
+                    if (t - 120.0) * self.fps <= uf <= t * self.fps
+                    and "골" in lb]
+            if not near:
+                self.user_events.append(
+                    [int(max(0.0, t - 45.0) * self.fps), "골?"])
+                n_ev += 1
+            t0, t1 = max(0.0, t - 70.0), t - 5.0
+            if not any("goal" in (h.get("kinds") or [])
+                       and min(h["t1"], t1) - max(h["t0"], t0) > 0
+                       for h in self.highlights):
+                self.highlights.append(
+                    {"t0": round(t0, 2), "t1": round(t1, 2),
+                     "kinds": ["goal"], "label": "골 추정", "score": 4.0,
+                     "state": "cand"})
+                n_hl += 1
+        if n_ev or n_hl:
+            self.user_events.sort()
+            self.highlights.sort(key=lambda h: h["t0"])
+            self._save_keyframes()
+            self._save_highlights()
+            self._refresh_events()
+        times = ", ".join(self._hms(float(k["t"])) for k in ks[1:])
+        self.log(f"[goal] 경기 중 킥오프 {len(ks) - 1}개 ({times}) → "
+                 f"'골?' 이벤트 {n_ev}개, '골 추정' 구간 {n_hl}개 제안")
+        self.log("[goal] 검수: 구간 재생으로 확인 → 이벤트 이름을 "
+                 "골1/골2 로 변경 (스코어 반영) 또는 삭제")
 
     def _tl_view_changed(self, t0, vis, total):
         """타임라인 줌/팬 → 스크롤바 동기화 (전체 보기면 숨김)."""

@@ -99,6 +99,8 @@ class MainWindow(QMainWindow):
                     lambda: self.ptz_tab.detect_highlights())
         a.addAction("하이라이트 일괄 내보내기...",
                     lambda: self.ptz_tab.export_highlights())
+        a.addAction("득점 역추론 (경기 중 킥오프 → 골 제안)",
+                    lambda: self.ptz_tab.suggest_goals())
         a.addAction("경기 정보 (시계 앵커·중단 구간)...",
                     lambda: self.ptz_tab.edit_match_info())
         a.addAction("선수 히트맵/활동량 리포트",
