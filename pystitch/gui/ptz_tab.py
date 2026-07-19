@@ -694,6 +694,43 @@ class GapfillWorker(QThread):
             self.failed.emit(str(e))
 
 
+class AirborneWorker(QThread):
+    """공중볼 스캔 (correct_ball_track) — UI 프리즈 방지용 백그라운드."""
+
+    done = pyqtSignal(int, dict, str)     # gen, {si: (X,Y,z)}, 로그 문구
+
+    def __init__(self, gen, frames, fps, acc, calib):
+        super().__init__()
+        self.args = (gen, frames, fps, acc, calib)
+
+    def run(self):
+        gen, frames, fps, acc, calib = self.args
+        try:
+            from ..core.airborne import correct_ball_track
+            from ..core.field import pano_to_field
+            fin = np.isfinite(acc[:, 0])
+            if fin.sum() < 10:
+                self.done.emit(gen, {}, "")
+                return
+            g = np.full((len(acc), 2), np.nan)
+            g[fin] = pano_to_field(calib, acc[fin])
+            t = frames / fps
+            corr, z, segs = correct_ball_track(
+                t, g, (calib["ex"], calib["ey"]), calib["h"])
+            cache = {}
+            for i0, i1, fit in segs:
+                for si in range(i0, i1 + 1):
+                    cache[si] = (float(corr[si, 0]), float(corr[si, 1]),
+                                 float(z[si]))
+            msg = ""
+            if segs:
+                msg = (f"[air] 공중 구간 {len(segs)}개 (정점 최대 "
+                       f"{max(f['apex_z'] for _, _, f in segs):.1f}m)")
+            self.done.emit(gen, cache, msg)
+        except Exception as e:  # noqa: BLE001
+            self.done.emit(gen, {}, f"[air] 공중볼 보정 실패: {e}")
+
+
 class SeedWorker(QThread):
     """시드 전파: 수동 공/선수 인식을 앞뒤 샘플로 확장 (propagate_seed)."""
 
@@ -1035,6 +1072,8 @@ class PtzTab(QWidget):
         self._analyze_worker = None
         self._gapfill_worker = None
         self._seed_worker = None
+        self._air_worker = None
+        self._air_gen = 0
         self._render_worker = None
         self._plan_worker = None
         self._link_worker = None
@@ -2639,35 +2678,29 @@ class PtzTab(QWidget):
         w.start()
 
     def _recompute_airborne(self):
-        """공중볼 보정 캐시 {si: (X, Y, z)} — 링크/캘리브레이션 후 갱신."""
+        """공중볼 보정 캐시 재계산 시작 — 백그라운드 (UI 프리즈 방지)."""
         self._air = {}
         if self.analysis is None or self._field_calib is None \
                 or self._accepted_ball is None:
             return
-        try:
-            from ..core.airborne import correct_ball_track
-            from ..core.field import pano_to_field
-            acc = self._accepted_ball
-            fin = np.isfinite(acc[:, 0])
-            if fin.sum() < 10:
-                return
-            g = np.full((len(acc), 2), np.nan)
-            g[fin] = pano_to_field(self._field_calib, acc[fin])
-            t = np.asarray(self.analysis["frames"]) / self.fps
-            c = self._field_calib
-            corr, z, segs = correct_ball_track(
-                t, g, (c["ex"], c["ey"]), c["h"])
-            for i0, i1, fit in segs:
-                for si in range(i0, i1 + 1):
-                    self._air[si] = (float(corr[si, 0]), float(corr[si, 1]),
-                                     float(z[si]))
-            if segs:
-                times = ", ".join(
-                    f"{self._hms(t[i0])}~{self._hms(t[i1])} "
-                    f"(정점 {fit['apex_z']:.1f}m)" for i0, i1, fit in segs)
-                self.log(f"[air] 공중 구간 {len(segs)}개: {times}")
-        except Exception as e:  # noqa: BLE001
-            self.log(f"[air] 공중볼 보정 실패: {e}")
+        self._air_gen = getattr(self, "_air_gen", 0) + 1
+        w = AirborneWorker(self._air_gen,
+                           np.asarray(self.analysis["frames"], dtype=float),
+                           float(self.fps),
+                           np.array(self._accepted_ball, copy=True),
+                           dict(self._field_calib))
+        w.done.connect(self._airborne_done)
+        self._air_worker = w
+        w.start()
+
+    def _airborne_done(self, gen, cache, msg):
+        if gen != getattr(self, "_air_gen", 0):
+            return                        # 그 사이 재계산됨 — 낡은 결과 폐기
+        self._air = cache
+        if msg:
+            self.log(msg)
+        if cache:
+            self._redraw()
 
     def _link_done(self, linked):
         self._linked = linked

@@ -137,13 +137,20 @@ def detect_airborne_segments(t, gxy, cam, h, min_dur=0.5, max_dur=3.5,
             i1 = i0
             while i1 < r1 and t[i1 + 1] - t[i0] <= max_dur:
                 i1 += 1
-            for j1 in range(i1, i0, -1):
+            # 창 길이 후보 몇 개만 (전수 축소는 비용 폭발 — UI 프리즈 원인)
+            n_w = i1 - i0
+            ends = sorted({i1, i0 + n_w * 3 // 4, i0 + n_w // 2,
+                           i0 + n_w // 3}, reverse=True)
+            for j1 in ends:
                 if t[j1] - t[i0] < min_dur or j1 - i0 + 1 < 6:
-                    break
+                    continue
+                # 싼 사전 게이트: 직선 잔차가 작으면(굴림) 피팅 불필요
+                lin = _linear_rms(t[i0:j1 + 1], gxy[i0:j1 + 1])
+                if lin < 1.0:
+                    continue
                 fit = fit_ballistic(t[i0:j1 + 1], gxy[i0:j1 + 1], cam, h)
                 if fit is None:
                     continue
-                lin = _linear_rms(t[i0:j1 + 1], gxy[i0:j1 + 1])
                 spd = float(np.hypot(*fit["v"]))
                 if (fit["rms"] < max_rms
                         and lin / max(fit["rms"], 1e-6) >= min_improve
