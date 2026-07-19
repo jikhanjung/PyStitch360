@@ -20,6 +20,8 @@ def collect_ocr_candidates(analysis, calib, role_of, rep_of,
     """근측 + 큰 박스 크롭 후보 [(si, box, rep), ...] (프레임 순).
 
     role_of/rep_of: tid → 유효 역할 / 병합 대표. 팀 역할(0/1/3/4)만.
+    calib=None 이면 필드 게이트 없이 높이 게이트만 적용 (헤드리스 등
+    캘리브레이션 이전 단계 — 원경 선수는 min_h 로 대부분 걸러진다).
     """
     frames = analysis["frames"]
     fps = analysis["fps"]
@@ -29,9 +31,14 @@ def collect_ocr_candidates(analysis, calib, role_of, rep_of,
                 and p[3] >= min_h and role_of(int(p[4])) in (0, 1, 3, 4)]
         if not rows:
             continue
-        fxy = pano_to_field(calib, [(p[0], p[1] + p[3] / 2.0) for p in rows])
-        for (gx, gy), p in zip(fxy, rows):
-            if np.isfinite(gy) and gy < 0.0:          # 근측 절반만
+        if calib is None:
+            near = [True] * len(rows)
+        else:
+            fxy = pano_to_field(calib,
+                                [(p[0], p[1] + p[3] / 2.0) for p in rows])
+            near = [bool(np.isfinite(gy) and gy < 0.0) for _gx, gy in fxy]
+        for ok, p in zip(near, rows):
+            if ok:                                    # 근측 절반만
                 cands.setdefault(rep_of(int(p[4])), []).append(
                     (float(p[3]), si, [float(v) for v in p[:4]]))
     picked = []
