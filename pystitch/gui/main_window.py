@@ -119,7 +119,8 @@ class MainWindow(QMainWindow):
         self._recent_menu.setEnabled(bool(recent))
         for p in recent:
             self._recent_menu.addAction(
-                Path(p).name, lambda checked=False, pp=p: self._open_recent(pp))
+                f"{Path(p).name}  —  {Path(p).parent}",
+                lambda checked=False, pp=p: self._open_recent(pp))
         if recent:
             self._recent_menu.addSeparator()
             self._recent_menu.addAction("목록 비우기", self._clear_recent)

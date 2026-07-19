@@ -2385,9 +2385,13 @@ class PtzTab(QWidget):
                 length=self.field_size[0], width=self.field_size[1])
         c = self._field_calib
         if c is not None:
-            msg = (f"캘리브레이션 OK — {c['n_points']}점, 잔차 "
-                   f"{c['rms']:.1f}px, 카메라 높이 {c['h']:.1f}m, "
-                   f"터치라인까지 {-(c['ey'] + c['width']/2):.1f}m")
+            tilt = (f", 기울기 {np.degrees(c['pitch']):+.1f}°/"
+                    f"{np.degrees(c['roll']):+.1f}°"
+                    if c.get("pitch") or c.get("roll") else "")
+            msg = (f"캘리브레이션 OK — {c['n_points']}점, 모델 잔차 "
+                   f"{c['rms']:.1f}px (랜드마크는 워프로 고정), 높이 "
+                   f"{c['h']:.1f}m, 터치라인 {-(c['ey'] + c['width']/2):.1f}m"
+                   + tilt)
         elif len(self.field_points) >= 4:
             msg = ("캘리브레이션 실패 — 점 위치 확인 "
                    "(위치 랜드마크 3개 이상 필요, 사이드라인 점은 보조)")

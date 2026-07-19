@@ -74,19 +74,36 @@ def landmark_positions(length=105.0, width=68.0):
     }
 
 
-def _project(p, fxy, pano_w, pano_h):
-    """필드 좌표 (N,2) → 파노라마 픽셀 (N,2). 카메라 뒤/수평선 위는 NaN."""
-    h, t_top, t_bot, phi0, theta, ex, ey = p
-    d = fxy - np.array([ex, ey])
+# 파라미터 벡터: [h, t_top, t_bot, theta, ex, ey, pitch, roll]
+# theta = 헤딩(수직축 회전), pitch/roll = 리그 기울기 — 삼각대가 완전
+# 수평이 아니면 지평선이 파노라마에서 휘는데, 이를 잡는 자유도.
+# (구 모델의 phi0 은 theta 와 완전 축퇴라 제거.)
+
+
+def _rot(theta, pitch, roll):
+    """리그 → 월드 회전. 월드: X=필드X, Y=위, Z=필드Y."""
     ct, st = np.cos(theta), np.sin(theta)
-    Xc = ct * d[:, 0] - st * d[:, 1]
-    Yc = st * d[:, 0] + ct * d[:, 1]
-    dist = np.hypot(Xc, Yc)
-    phi = np.arctan2(Xc, Yc)
-    t = np.where(dist > 1e-6, -h / np.maximum(dist, 1e-6), np.nan)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cr, sr = np.cos(roll), np.sin(roll)
+    ry = np.array([[ct, 0, st], [0, 1, 0], [-st, 0, ct]])
+    rx = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]])
+    rz = np.array([[cr, -sr, 0], [sr, cr, 0], [0, 0, 1]])
+    return ry @ rx @ rz
+
+
+def _project(p, fxy, pano_w, pano_h):
+    """필드 좌표 (N,2) → 파노라마 픽셀 (N,2) (워프 없는 파라메트릭)."""
+    h, t_top, t_bot, theta, ex, ey, pitch, roll = p
+    fxy = np.asarray(fxy, float)
+    w = np.stack([fxy[:, 0] - ex, np.full(len(fxy), -h),
+                  fxy[:, 1] - ey], axis=1)
+    r = w @ _rot(theta, pitch, roll)      # = R^T · w (리그 프레임)
+    d = np.hypot(r[:, 0], r[:, 2])
+    yaw = np.arctan2(r[:, 0], r[:, 2])
+    t = np.where(d > 1e-6, r[:, 1] / np.maximum(d, 1e-6), np.nan)
     f = pano_h / (t_top - t_bot)
     span = pano_w / f
-    x = ((phi - phi0) / span + 0.5) * (pano_w - 1)
+    x = (yaw / span + 0.5) * (pano_w - 1)
     y = (t_top - t) / (t_top - t_bot) * (pano_h - 1)
     return np.stack([x, y], axis=1)
 
@@ -94,45 +111,89 @@ def _project(p, fxy, pano_w, pano_h):
 def _sideline_rows(p, cols, pano_w, pano_h, width):
     """근처 사이드라인(Y=-폭/2)이 각 열(cols)에서 지나는 예측 행 (N,).
 
-    열 → yaw 광선을 필드 프레임으로 돌려 Y=-폭/2 와 만나는 거리 d 를
-    구하고 elevation 으로 행을 계산. 광선이 선과 평행에 가까우면 NaN.
+    열의 yaw 광선을 t(행 방향)로 매개화하면 월드 방향이 A + t·B 로
+    선형 — 지면 교차와 필드 Y=-폭/2 조건에서 t 가 닫힌형으로 풀린다.
     """
-    h, t_top, t_bot, phi0, theta, ex, ey = p
+    h, t_top, t_bot, theta, ex, ey, pitch, roll = p
     f = pano_h / (t_top - t_bot)
     span = pano_w / f
-    phi = (np.asarray(cols, float) / (pano_w - 1) - 0.5) * span + phi0
-    ux, uy = np.sin(phi), np.cos(phi)
-    ct, st = np.cos(theta), np.sin(theta)
-    ufy = -st * ux + ct * uy              # 광선의 필드 Y 성분
-    d = np.where(np.abs(ufy) > 0.02, (-width / 2.0 - ey) / ufy, np.nan)
-    d = np.where(d > 0.5, d, np.nan)      # 카메라 뒤/과근접 무효
-    t = -h / d
+    yaw = (np.asarray(cols, float) / (pano_w - 1) - 0.5) * span
+    R = _rot(theta, pitch, roll)
+    A = np.stack([np.sin(yaw), np.zeros_like(yaw), np.cos(yaw)], axis=1) @ R.T
+    B = R[:, 1]
+    denom = -width / 2.0 - ey
+    k = np.where(np.abs(denom) > 1e-6, -h / denom, np.nan)
+    t = (k * A[:, 2] - A[:, 1]) / (B[1] - k * B[2])
     return (t_top - t) / (t_top - t_bot) * (pano_h - 1)
 
 
+# ------------------------------------------------------------------ TPS 워프
+# 파라메트릭 모델이 못 잡는 잔류 왜곡(어안 외곽의 렌즈 잔차, 스티칭 심)
+# 을 얇은판 스플라인으로 보정 — 찍은 랜드마크는 정확히 통과한다.
+
+def _tps_phi(r):
+    return np.where(r > 1e-9, r * r * np.log(r + 1e-12), 0.0)
+
+
+def _tps_fit(src, dst_delta, scale):
+    """제어점 src(N,2)에서 dst_delta(N,2)를 보간하는 TPS 계수."""
+    n = len(src)
+    s = src / scale
+    d2 = np.linalg.norm(s[:, None] - s[None], axis=2)
+    K = _tps_phi(d2) + 1e-8 * np.eye(n)
+    P = np.hstack([np.ones((n, 1)), s])
+    A = np.zeros((n + 3, n + 3))
+    A[:n, :n] = K
+    A[:n, n:] = P
+    A[n:, :n] = P.T
+    b = np.zeros((n + 3, 2))
+    b[:n] = dst_delta
+    try:
+        wa = np.linalg.solve(A, b)
+    except np.linalg.LinAlgError:
+        return None
+    return {"src": s, "w": wa[:n], "a": wa[n:], "scale": scale}
+
+
+def _tps_eval(tps, pts):
+    s = np.asarray(pts, float) / tps["scale"]
+    d = np.linalg.norm(s[:, None] - tps["src"][None], axis=2)
+    out = _tps_phi(d) @ tps["w"]
+    out += tps["a"][0] + s @ tps["a"][1:]
+    return out
+
+
 def fit_field_calibration(points, pano_w, pano_h,
-                          length=105.0, width=68.0, iters=200):
-    """찍은 랜드마크 {키: (px, py)} 로 카메라 모델 피팅.
+                          length=105.0, width=68.0, iters=300):
+    """찍은 랜드마크 {키: (px, py)} 로 카메라 모델 + 잔차 워프 피팅.
 
     위치를 아는 점은 방정식 2개, 선 위의 점(LINE_LANDMARKS)은 1개.
-    최소: 위치 점 3개 이상이고 총 방정식 8개 이상 (7 파라미터).
-    반환: calib dict (파라미터 + rms 픽셀 잔차) 또는 None.
+    최소: 위치 점 3개 이상이고 총 방정식 8개 이상. 방정식 10개부터는
+    리그 기울기(pitch/roll)도 푼다. 코너 플래그는 가중 3배.
+
+    파라메트릭 피팅 뒤 랜드마크 잔차를 TPS 로 보간해 calib["warp"] 에
+    저장 — field_to_pano 가 찍은 점을 정확히 통과한다 (렌즈 잔류
+    왜곡·스티칭 심 흡수). 반환: calib dict 또는 None.
     """
     pos = landmark_positions(length, width)
     keys = [k for k in points if k in pos]
     ln_keys = [k for k in points if k in LINE_LANDMARKS]
-    if len(keys) < 3 or 2 * len(keys) + len(ln_keys) < 8:
+    n_eq = 2 * len(keys) + len(ln_keys)
+    if len(keys) < 3 or n_eq < 8:
         return None
     fxy = np.array([pos[k] for k in keys], float)
     pxy = np.array([points[k] for k in keys], float)
     ln = np.array([points[k] for k in ln_keys], float).reshape(-1, 2)
+    wgt = np.array([3.0 if k.startswith("corner") else 1.0 for k in keys])
     p = np.array([4.0, np.tan(np.deg2rad(10.0)), np.tan(np.deg2rad(-38.0)),
-                  0.0, 0.0, 0.0, -(width / 2.0 + 5.0)])
-    step = np.array([0.01, 1e-4, 1e-4, 1e-4, 1e-4, 0.01, 0.01])
+                  0.0, 0.0, -(width / 2.0 + 5.0), 0.0, 0.0])
+    step = np.array([0.01, 1e-4, 1e-4, 1e-4, 0.01, 0.01, 1e-4, 1e-4])
+    free = list(range(6 if n_eq < 10 else 8))    # 기울기는 10방정식부터
     lam = 1e-3
 
     def residual(pp):
-        r = (_project(pp, fxy, pano_w, pano_h) - pxy).ravel()
+        r = ((_project(pp, fxy, pano_w, pano_h) - pxy)
+             * wgt[:, None]).ravel()
         if len(ln):
             rl = _sideline_rows(pp, ln[:, 0], pano_w, pano_h,
                                 width) - ln[:, 1]
@@ -142,20 +203,22 @@ def fit_field_calibration(points, pano_w, pano_h,
     r = residual(p)
     cost = float(r @ r)
     for _ in range(iters):
-        J = np.empty((len(r), len(p)))
-        for j in range(len(p)):
+        J = np.empty((len(r), len(free)))
+        for jj, j in enumerate(free):
             dp = np.zeros_like(p)
             dp[j] = step[j]
-            J[:, j] = (residual(p + dp) - r) / step[j]
+            J[:, jj] = (residual(p + dp) - r) / step[j]
         A = J.T @ J + lam * np.diag(np.diag(J.T @ J) + 1e-9)
         try:
             delta = np.linalg.solve(A, -J.T @ r)
         except np.linalg.LinAlgError:
             return None
-        p_new = p + delta
-        # 물리 제약: 높이 0.5~20m, 수평선 위/아래 부호 유지
+        p_new = p.copy()
+        p_new[free] += delta
+        # 물리 제약: 높이 0.5~20m, 수평선 위/아래 부호 유지, 기울기 ±10도
         p_new[0] = np.clip(p_new[0], 0.5, 20.0)
         p_new[1] = max(p_new[1], p_new[2] + 1e-3)
+        p_new[6:8] = np.clip(p_new[6:8], -0.175, 0.175)
         r_new = residual(p_new)
         c_new = float(r_new @ r_new)
         if c_new < cost:
@@ -170,39 +233,72 @@ def fit_field_calibration(points, pano_w, pano_h,
     rms = float(np.sqrt(cost / len(r)))
     if not np.isfinite(rms) or rms > 200.0:      # 수렴 실패로 간주
         return None
-    h, t_top, t_bot, phi0, theta, ex, ey = (float(v) for v in p)
-    return {"h": h, "t_top": t_top, "t_bot": t_bot, "phi0": phi0,
-            "theta": theta, "ex": ex, "ey": ey,
-            "length": float(length), "width": float(width),
-            "pano_w": int(pano_w), "pano_h": int(pano_h),
-            "n_points": len(keys) + len(ln_keys), "rms": rms}
+    calib = {"h": float(p[0]), "t_top": float(p[1]), "t_bot": float(p[2]),
+             "theta": float(p[3]), "ex": float(p[4]), "ey": float(p[5]),
+             "pitch": float(p[6]), "roll": float(p[7]),
+             "length": float(length), "width": float(width),
+             "pano_w": int(pano_w), "pano_h": int(pano_h),
+             "n_points": len(keys) + len(ln_keys), "rms": rms,
+             "warp": None}
+    # 잔차 워프: 예측 위치 → 클릭 위치 차이를 보간 (제어점 4개 이상일 때)
+    src = _project(p, fxy, pano_w, pano_h)
+    delta = pxy - src
+    if len(ln):
+        rows = _sideline_rows(p, ln[:, 0], pano_w, pano_h, width)
+        m = np.isfinite(rows)
+        src = np.vstack([src, np.stack([ln[m, 0], rows[m]], axis=1)])
+        delta = np.vstack([delta,
+                           np.stack([np.zeros(m.sum()),
+                                     ln[m, 1] - rows[m]], axis=1)])
+    ok = np.isfinite(src).all(axis=1)
+    if ok.sum() >= 4:
+        calib["warp"] = _tps_fit(src[ok], delta[ok], float(max(pano_w, 1)))
+    return calib
 
 
 def _params(calib):
     return np.array([calib["h"], calib["t_top"], calib["t_bot"],
-                     calib["phi0"], calib["theta"], calib["ex"], calib["ey"]])
+                     calib["theta"], calib["ex"], calib["ey"],
+                     calib.get("pitch", 0.0), calib.get("roll", 0.0)])
 
 
 def field_to_pano(calib, fxy):
-    """경기장 좌표 (N,2) m → 파노라마 픽셀 (N,2)."""
-    return _project(_params(calib), np.asarray(fxy, float),
-                    calib["pano_w"], calib["pano_h"])
+    """경기장 좌표 (N,2) m → 파노라마 픽셀 (N,2). 워프 보정 포함."""
+    out = _project(_params(calib), np.asarray(fxy, float),
+                   calib["pano_w"], calib["pano_h"])
+    if calib.get("warp") is not None:
+        ok = np.isfinite(out).all(axis=1)
+        if ok.any():
+            out[ok] += _tps_eval(calib["warp"], out[ok])
+    return out
 
 
-def pano_to_field(calib, pxy):
-    """파노라마 픽셀 (N,2) → 경기장 좌표 (N,2) m. 수평선 위는 NaN."""
-    h, t_top, t_bot, phi0, theta, ex, ey = _params(calib)
+def _pano_to_field_raw(calib, pxy):
+    h, t_top, t_bot, theta, ex, ey, pitch, roll = _params(calib)
     pxy = np.asarray(pxy, float)
     W, H = calib["pano_w"], calib["pano_h"]
     f = H / (t_top - t_bot)
     span = W / f
-    phi = (pxy[:, 0] / (W - 1) - 0.5) * span + phi0
+    yaw = (pxy[:, 0] / (W - 1) - 0.5) * span
     t = t_top - pxy[:, 1] / (H - 1) * (t_top - t_bot)
-    d = np.where(t < -1e-4, h / np.maximum(-t, 1e-9), np.nan)
-    Xc, Yc = d * np.sin(phi), d * np.cos(phi)
-    ct, st = np.cos(theta), np.sin(theta)
-    return np.stack([ex + ct * Xc + st * Yc,
-                     ey - st * Xc + ct * Yc], axis=1)
+    dir_rig = np.stack([np.sin(yaw), t, np.cos(yaw)], axis=1)
+    dw = dir_rig @ _rot(theta, pitch, roll).T
+    s = np.where(dw[:, 1] < -1e-6, h / np.maximum(-dw[:, 1], 1e-9), np.nan)
+    return np.stack([ex + s * dw[:, 0], ey + s * dw[:, 2]], axis=1)
+
+
+def pano_to_field(calib, pxy):
+    """파노라마 픽셀 (N,2) → 경기장 좌표 (N,2) m. 수평선 위는 NaN.
+
+    워프가 있으면 고정점 반복으로 역보정(2~3회면 수렴) 후 역투영.
+    """
+    pxy = np.asarray(pxy, float)
+    if calib.get("warp") is not None:
+        u = pxy.copy()
+        for _ in range(3):
+            u = pxy - _tps_eval(calib["warp"], u)
+        pxy = u
+    return _pano_to_field_raw(calib, pxy)
 
 
 def field_outline(length=105.0, width=68.0, step=2.0):
