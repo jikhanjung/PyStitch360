@@ -3553,21 +3553,27 @@ class PtzTab(QWidget):
                  f"{len(self.rosters[team])}명 저장")
 
     def _fill_num_menu(self, nsub, tid, team):
-        """번호 지정 서브메뉴: 명단 항목 + 직접 입력 + 명단 편집."""
+        """번호 지정 서브메뉴: 명단 + 기입력 번호 + 직접 입력 + 명단 편집."""
         cur = self._num_of(tid)
         used = {}                        # 번호 → 이미 쓴 대표 tid
         for t, n in self.player_nums.items():
             if self._role_of(t) in (team, team + 3):
                 used.setdefault(n, self._rep(t))
-        for entry in self.rosters.get(team, []):
-            num = entry.split()[0]
+        entries = [(e.split()[0], e) for e in self.rosters.get(team, [])]
+        roster_nums = {n for n, _ in entries}
+        # 명단에 없어도 이미 입력된 번호는 바로 선택 가능하게
+        entries += [(n, n) for n in sorted(
+            (n for n in used if n not in roster_nums),
+            key=lambda n: (not n.isdigit(),
+                           int(n) if n.isdigit() else 0, n))]
+        for num, label in entries:
             mark = " ✓" if cur == num else (
                 f"  (#{used[num]})" if num in used
                 and used[num] != self._rep(tid) else "")
-            nsub.addAction(entry + mark,
+            nsub.addAction(label + mark,
                            lambda _=False, n=num:
                            self._set_player_num(tid, team, n))
-        if self.rosters.get(team):
+        if entries:
             nsub.addSeparator()
         nsub.addAction("직접 입력...",
                        lambda: self._input_player_num(tid, team))
