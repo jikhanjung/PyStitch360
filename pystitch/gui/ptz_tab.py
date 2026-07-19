@@ -48,7 +48,8 @@ LANDMARK_TAGS = {"corner_far_l": "FL", "corner_far_r": "FR",
                  "pen_r_far": "PRF", "pen_r_near": "PRN",
                  "pen_l_box_far": "BLF", "pen_l_box_near": "BLN",
                  "pen_r_box_far": "BRF", "pen_r_box_near": "BRN",
-                 "center_near": "CM"}
+                 "center_near": "CM",
+                 "circle_l": "CL", "circle_r": "CR"}
 
 
 def _boost_bgr(bgr, s_gain=1.35, v_gain=1.55, v_floor=190):
