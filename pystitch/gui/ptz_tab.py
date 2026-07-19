@@ -18,7 +18,8 @@ from PyQt6.QtWidgets import (
     QColorDialog, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar,
-    QPushButton, QSlider, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
+    QPushButton, QScrollBar, QSlider, QSpinBox, QTabWidget, QVBoxLayout,
+    QWidget,
 )
 
 from ..core.encoders import available_encoders
@@ -181,16 +182,27 @@ class TimelineView(QWidget):
     seek = pyqtSignal(int)
     pick = pyqtSignal(str, int)      # ("kf"|"ball"|"ignore"|"player", 키)
     range_menu = pyqtSignal(int, object)   # 우클릭: (프레임, 전역 좌표)
+    view_changed = pyqtSignal(float, float, int)   # (t0, 보이는 폭, total)
 
     RULER = 16
-    LANE_H = 20
+    LANE_H = 20                  # 기본 레인 높이 (개별 조절 가능)
     GUTTER = 64
     LANES = ["크롭/KF", "공", "팀1", "팀2", "기타", "호각"]
+    WHISTLE_MIN_DB = 20.0        # 이 피크 이상만 '확실한 호각'으로 표시
 
     def __init__(self):
         super().__init__()
-        self.setFixedHeight(self.RULER + self.LANE_H * len(self.LANES))
+        saved = QSettings("PyStitch360", "PyStitch360").value(
+            "ptz_timeline_lanes", None)
+        try:
+            self.lane_h = [max(10, min(120, int(v))) for v in saved]
+            assert len(self.lane_h) == len(self.LANES)
+        except Exception:  # noqa: BLE001
+            self.lane_h = [self.LANE_H] * len(self.LANES)
+        self._apply_height()
         self.setMouseTracking(True)
+        self.setToolTip("레이블 쪽에서 레인 경계 드래그 = 높이 조절 "
+                        "(Shift+드래그 = 전체 비례)")
         self.total = 0
         self.fps = 30.0
         self.pos = 0
@@ -206,6 +218,18 @@ class TimelineView(QWidget):
         self.mark_out = None         # 내보내기 끝 프레임
         self._whistle = None         # (hop_s, 프로미넌스 배열, 이벤트)
         self._press = None
+        self._resize = None          # 레인 경계 드래그 상태
+
+    def _emit_view(self):
+        vis = (self.width() - self.GUTTER) / max(self._eff_ppf(), 1e-9)
+        self.view_changed.emit(float(self.t0), float(vis), int(self.total))
+
+    def set_view_start(self, f):
+        """외부 스크롤바 → 보이는 시작 프레임 이동."""
+        if abs(float(f) - self.t0) >= 1.0:
+            self.t0 = float(f)
+            self._clamp_view()
+            self.update()
 
     def set_whistle(self, hop_s, prom, events):
         self._whistle = (float(hop_s), np.asarray(prom, dtype=np.float32),
@@ -233,6 +257,12 @@ class TimelineView(QWidget):
             self.promotes = list(promotes)
         self._clamp_view()
         self.update()
+        self._emit_view()
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._clamp_view()
+        self._emit_view()
 
     def set_players(self, players):
         """{tid: (f0, f1, role)} → 레인별 서브행 배치 (겹침 회피 3행)."""
@@ -293,9 +323,42 @@ class TimelineView(QWidget):
     def _f(self, x):
         return (x - self.GUTTER) / self._eff_ppf() + self.t0
 
+    def _apply_height(self):
+        self.setFixedHeight(self.RULER + sum(self.lane_h))
+
     def _lane_rect(self, lane):
-        y = self.RULER + lane * self.LANE_H
-        return y, self.LANE_H
+        return self.RULER + sum(self.lane_h[:lane]), self.lane_h[lane]
+
+    def _lane_at(self, y):
+        acc = self.RULER
+        for i, h in enumerate(self.lane_h):
+            if acc <= y < acc + h:
+                return i
+            acc += h
+        return -1
+
+    def _boundary_at(self, y, tol=4):
+        """y 가 레인 경계(하단선) 근처면 그 레인 인덱스."""
+        acc = self.RULER
+        for i, h in enumerate(self.lane_h):
+            acc += h
+            if abs(y - acc) <= tol:
+                return i
+        return None
+
+    def _apply_lane_resize(self, dy):
+        """진행 중인 경계 드래그 적용 (Shift = 전체 비례)."""
+        i, orig = self._resize["lane"], self._resize["orig"]
+        if self._resize["all"]:
+            total0 = sum(orig)
+            factor = max(0.3, (total0 + dy * len(orig)) / total0)
+            self.lane_h = [max(10, min(120, int(round(h * factor))))
+                           for h in orig]
+        else:
+            self.lane_h = list(orig)
+            self.lane_h[i] = max(10, min(120, orig[i] + dy))
+        self._apply_height()
+        self.update()
 
     # --------------------------------------------------------------- 그리기
     def paintEvent(self, ev):
@@ -368,30 +431,24 @@ class TimelineView(QWidget):
             if self.selected == ("player", tid):
                 p.setPen(QColor(255, 255, 255))
                 p.drawRect(r[0] - 1, r[1] - 1, r[2] + 1, r[3] + 1)
-        # 호각 레인: 프로미넌스 세로 바 (dB → 높이·색), 이벤트는 밝은 틱
+        # 호각 레인: 확실한 이벤트(피크 ≥ WHISTLE_MIN_DB)만 불연속 마커로
+        # — 연속 바는 노이즈처럼 보여 제거 (원본 트랙은 파일에 보관)
         if self._whistle is not None and self.total > 1:
-            hop_s, prom, events = self._whistle
+            _, _, events = self._whistle
             y, lh = self._lane_rect(5)
-            ppf = self._eff_ppf()
-            spf = 1.0 / max(self.fps, 1e-6)          # 초/프레임
-            for px_ in range(self.GUTTER, W):
-                f0 = self._f(px_)
-                i0 = int(f0 * spf / hop_s)
-                i1 = max(i0 + 1, int((f0 + 1.0 / ppf) * spf / hop_s))
-                if i0 >= len(prom):
-                    break
-                v = float(prom[i0:min(i1, len(prom))].max())
-                if v < 6.0:
-                    continue
-                h_ = int(np.clip((v - 6.0) / 24.0, 0.05, 1.0) * (lh - 4))
-                c = (QColor(255, 120, 60) if v >= 15.0
-                     else QColor(180, 180, 90))
-                p.fillRect(px_, y + lh - 2 - h_, 1, h_, c)
-            p.setPen(QColor(255, 200, 80))
             for t0_, t1_, db in events:
+                if db < self.WHISTLE_MIN_DB:
+                    continue
                 x_ = self._x(t0_ * self.fps)
-                if self.GUTTER <= x_ <= W:
-                    p.drawLine(x_, y + 1, x_, y + 3)
+                if not (self.GUTTER - 4 <= x_ <= W):
+                    continue
+                w_ = max(3, self._x(t1_ * self.fps) - x_)
+                c = QColor(255, 150, 40)
+                p.fillRect(x_, y + 3, w_, lh - 6, c)
+                p.setPen(c)
+                # 긴 호각(킥오프·종료 후보)은 위 눈금까지 강조
+                if t1_ - t0_ >= 0.8:
+                    p.drawLine(x_, y + 1, x_ + w_, y + 1)
         # 내보내기 구간: 바깥은 어둡게, IN/OUT 브래킷 표시
         if self.mark_in is not None or self.mark_out is not None:
             fi = 0 if self.mark_in is None else self.mark_in
@@ -424,7 +481,7 @@ class TimelineView(QWidget):
     # --------------------------------------------------------------- 조작
     def _hit(self, x, y):
         f = self._f(x)
-        lane = (y - self.RULER) // self.LANE_H
+        lane = self._lane_at(y)
         if lane == 0:
             best, bd = None, 8.0
             for i, k in enumerate(self.kfs):
@@ -452,24 +509,48 @@ class TimelineView(QWidget):
         return None
 
     def mousePressEvent(self, ev):
-        if self.total <= 1 or ev.button() != Qt.MouseButton.LeftButton:
+        if ev.button() != Qt.MouseButton.LeftButton:
             return
         x, y = int(ev.position().x()), int(ev.position().y())
+        if x < self.GUTTER:                 # 레이블 영역: 경계 드래그 = 높이
+            b = self._boundary_at(y)
+            if b is not None:
+                self._resize = {"lane": b, "y": y, "orig": list(self.lane_h),
+                                "all": bool(ev.modifiers()
+                                            & Qt.KeyboardModifier.ShiftModifier)}
+                return
+        if self.total <= 1:
+            return
         self._press = {"x": x, "t0": self.t0, "moved": False,
                        "hit": self._hit(x, y) if y >= self.RULER else None}
 
     def mouseMoveEvent(self, ev):
-        if self._press is None:
+        x, y = int(ev.position().x()), int(ev.position().y())
+        if self._resize is not None:
+            self._apply_lane_resize(y - self._resize["y"])
             return
-        dx = int(ev.position().x()) - self._press["x"]
+        if self._press is None:
+            # 호버 커서: 레이블 영역 경계 위에서 상하 리사이즈 커서
+            self.setCursor(Qt.CursorShape.SizeVerCursor
+                           if x < self.GUTTER
+                           and self._boundary_at(y) is not None
+                           else Qt.CursorShape.ArrowCursor)
+            return
+        dx = x - self._press["x"]
         if abs(dx) > 3:
             self._press["moved"] = True
         if self._press["moved"] and self._press["hit"] is None:
             self.t0 = self._press["t0"] - dx / self._eff_ppf()   # 팬
             self._clamp_view()
             self.update()
+            self._emit_view()
 
     def mouseReleaseEvent(self, ev):
+        if self._resize is not None:
+            self._resize = None
+            QSettings("PyStitch360", "PyStitch360").setValue(
+                "ptz_timeline_lanes", [int(v) for v in self.lane_h])
+            return
         pr, self._press = self._press, None
         if pr is None or pr["moved"]:
             return
@@ -495,6 +576,7 @@ class TimelineView(QWidget):
             self.t0 -= delta * 80 / self._eff_ppf()
         self._clamp_view()
         self.update()
+        self._emit_view()
         ev.accept()
 
 
@@ -1000,6 +1082,14 @@ class PtzTab(QWidget):
         bar_col = QVBoxLayout()
         bar_col.setSpacing(1)
         bar_col.addWidget(self.trackbar)
+        # 줌인 시 가로 스크롤바 (전체 보기에선 숨김)
+        self.tl_scroll = QScrollBar(Qt.Orientation.Horizontal)
+        self.tl_scroll.setMaximumHeight(12)
+        self.tl_scroll.hide()
+        self.tl_scroll.valueChanged.connect(
+            lambda v: self.trackbar.set_view_start(v))
+        self.trackbar.view_changed.connect(self._tl_view_changed)
+        bar_col.addWidget(self.tl_scroll)
         bar_col.addWidget(self.slider)
         tl.addLayout(bar_col, 1)
         v.addLayout(tl)
@@ -2717,6 +2807,19 @@ class PtzTab(QWidget):
         menu.addSeparator()
         menu.addAction("여기로 이동", lambda: self.slider.setValue(int(f)))
         menu.exec(gpos)
+
+    def _tl_view_changed(self, t0, vis, total):
+        """타임라인 줌/팬 → 스크롤바 동기화 (전체 보기면 숨김)."""
+        if vis >= total - 1 or total <= 1:
+            self.tl_scroll.hide()
+            return
+        self.tl_scroll.blockSignals(True)
+        self.tl_scroll.setRange(0, int(total - vis))
+        self.tl_scroll.setPageStep(max(1, int(vis)))
+        self.tl_scroll.setSingleStep(max(1, int(vis / 20)))
+        self.tl_scroll.setValue(int(t0))
+        self.tl_scroll.blockSignals(False)
+        self.tl_scroll.show()
 
     def _timeline_pick(self, kind, key):
         """타임라인 바 클릭 → 해당 목록 선택(→ 프레임 이동)."""
