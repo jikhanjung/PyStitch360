@@ -13,9 +13,13 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import QRect, QSettings, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import (
+    QEvent, QRect, QSettings, Qt, QThread, QTimer, pyqtSignal,
+)
 from PyQt6.QtWidgets import QApplication, QCheckBox
-from PyQt6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
+from PyQt6.QtGui import (
+    QColor, QCursor, QIcon, QKeySequence, QPainter, QPixmap, QShortcut,
+)
 from PyQt6.QtWidgets import (
     QColorDialog, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
@@ -218,6 +222,7 @@ class TimelineView(QWidget):
         self.kfs: list = []
         self.promotes: list = []
         self._players: list = []     # [(tid, f0, f1, role, 서브행), ...]
+        self._lane_rows: dict = {}   # {레인: 서브행 수} (동시 트랙릿 폭)
         self.t0 = 0.0                # 보이는 시작 프레임
         self.ppf = 0.0               # 픽셀/프레임 (0 = 전체 맞춤)
         self.selected = None         # (종류, 키)
@@ -299,12 +304,18 @@ class TimelineView(QWidget):
         self._emit_view()
 
     def set_players(self, players):
-        """{tid: (f0, f1, role)} → 레인별 서브행 배치 (겹침 회피 3행)."""
+        """{tid: (f0, f1, role)} → 레인별 서브행 배치 (그리디 간트).
+
+        서브행 수는 동시 트랙릿 수만큼 — 상한을 두면 초과분이 기존 행
+        위에 덮여 숨는다 (구버전 3행 상한의 문제). 행 두께는 레인
+        높이/행 수로 정해지므로 레인 경계 드래그로 키우면 두꺼워진다.
+        """
         by_lane: dict[int, list] = {}
         for tid, (f0, f1, role) in players.items():
             by_lane.setdefault(self._lane_of_role(role), []).append(
                 (f0, f1, tid, role))
         out = []
+        self._lane_rows = {}
         for lane, items in by_lane.items():
             ends = []                          # 서브행별 마지막 끝 프레임
             for f0, f1, tid, role in sorted(items):
@@ -313,12 +324,10 @@ class TimelineView(QWidget):
                         ends[si] = f1
                         break
                 else:
-                    si = len(ends) % 3
-                    if len(ends) < 3:
-                        ends.append(f1)
-                    else:
-                        ends[si] = max(ends[si], f1)
+                    si = len(ends)
+                    ends.append(f1)
                 out.append((tid, f0, f1, role, si))
+            self._lane_rows[lane] = max(1, len(ends))
         self._players = out
         self.update()
 
@@ -455,13 +464,15 @@ class TimelineView(QWidget):
         for pr in self.promotes:
             x = self._x(pr[0])
             p.fillRect(x - 1, y + 2, 3, lh - 4, QColor(200, 0, 255))
-        # 선수 레인: 팀/역할 색 바 (서브행 3개)
+        # 선수 레인: 팀/역할 색 바 — 서브행 수는 동시 트랙릿 수 (은폐 없음)
         for tid, f0, f1, role, si in self._players:
-            y, lh = self._lane_rect(self._lane_of_role(role))
-            bh = (lh - 4) // 3
-            ry = y + 2 + si * bh
+            lane = self._lane_of_role(role)
+            y, lh = self._lane_rect(lane)
+            pitch = (lh - 4) / max(self._lane_rows.get(lane, 3), 1)
+            bh = max(1, int(pitch) - (1 if pitch >= 3 else 0))
+            ry = y + 2 + int(si * pitch)
             b, g, rr = TEAM_COLORS[min(role, len(TEAM_COLORS) - 1)]
-            r = (self._x(f0), ry, max(2, self._x(f1) - self._x(f0)), bh - 1)
+            r = (self._x(f0), ry, max(2, self._x(f1) - self._x(f0)), bh)
             p.fillRect(*r, QColor(rr, g, b))
             if self.selected == ("player", tid):
                 p.setPen(QColor(255, 255, 255))
@@ -597,11 +608,12 @@ class TimelineView(QWidget):
             return None
         if lane in (3, 4, 5):
             ly, lh = self._lane_rect(int(lane))
-            bh = (lh - 4) // 3
+            pitch = (lh - 4) / max(self._lane_rows.get(lane, 3), 1)
+            bh = max(1, int(pitch))
             for tid, f0, f1, role, si in self._players:
                 if self._lane_of_role(role) != lane:
                     continue
-                ry = ly + 2 + si * bh
+                ry = ly + 2 + int(si * pitch)
                 if f0 <= f <= f1 and ry - 1 <= y <= ry + bh:
                     return ("player", tid)
         if lane == 7:
@@ -1369,6 +1381,7 @@ class PtzTab(QWidget):
         self.user_events: list[list] = []  # [[frame, label]] 사용자 이벤트
         self.highlights: list[dict] = []   # .events.json "highlights" 문서
         self.match_info: dict | None = None  # 경기 정보 (하프·앵커·중단)
+        self._referees: dict = {}         # .events.json "referees" (근/원측 선심)
         self.roles: dict[int, int] = {}   # {track_id: 역할} 사용자 지정 (GK 등)
         self.merges: dict[int, int] = {}  # {tid: 대표 tid} 트랙릿 병합 (비파괴)
         self.field_points: dict[str, list] = {}   # {랜드마크키: [x, y]}
@@ -1415,10 +1428,32 @@ class PtzTab(QWidget):
         self.plan = None
         self.plan_out = (1920, 1080)
         self._build_ui()
+        # 스페이스 = 재생/정지 — 포커스가 아니라 커서 위치 기준이라
+        # (타임라인/영상 위에서만) 앱 필터로 처리, 그 외엔 통과
+        QApplication.instance().installEventFilter(self)
         self._plan_timer = QTimer(singleShot=True, interval=150)
         self._plan_timer.timeout.connect(self._run_plan)
         self._save_timer = QTimer(singleShot=True, interval=1500)
         self._save_timer.timeout.connect(self._write_sidecar)
+
+    def eventFilter(self, obj, ev):
+        """커서가 타임라인/슬라이더/영상 위일 때 Space = 재생/정지.
+
+        포커스 기반(QShortcut)이 아니라 커서 기반 — 목록·버튼이 포커스를
+        가져도 동작하고, 커서가 딴 데 있으면 이벤트를 그대로 통과시켜
+        다른 위젯의 Space 동작(목록 선택 등)을 깨지 않는다.
+        """
+        if ev.type() == QEvent.Type.KeyPress \
+                and ev.key() == Qt.Key.Key_Space and not ev.isAutoRepeat() \
+                and self.cap is not None:
+            w = QApplication.widgetAt(QCursor.pos())
+            hot = (self.trackbar, self.slider, self.tl_scroll, self.pane)
+            while w is not None:
+                if w in hot:
+                    self._toggle_play()
+                    return True
+                w = w.parentWidget()
+        return super().eventFilter(obj, ev)
 
     # ------------------------------------------------------------ UI
     def _build_ui(self):
@@ -1624,7 +1659,7 @@ class PtzTab(QWidget):
         rl = QHBoxLayout()
         rl.addWidget(QLabel("선택한 트랙릿 →"))
         self._role_btns = {}
-        for r in (3, 4, 5, 0, 1):
+        for r in (0, 1, 5, 3, 4):        # 자주 쓰는 팀/심판 먼저, GK 뒤로
             b = QPushButton(self._role_name(r))
             b.setMaximumWidth(90)
             b.clicked.connect(lambda _, rr=r: self._assign_selected_role(rr))
@@ -1818,6 +1853,7 @@ class PtzTab(QWidget):
             items.append((int(f), label, "user"))
         items.sort()
         self.trackbar.set_events(items)
+        self._referees = doc.get("referees") or {}
         self.highlights = doc.get("highlights", [])
         self._refresh_highlight_lane()
         self.trackbar.set_pauses(
@@ -2776,6 +2812,8 @@ class PtzTab(QWidget):
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color,
                                   max(2, int(4 * sc)))
                     tag = ROLE_TAGS.get(team)
+                    if team == 5 and len(pp) >= 5:
+                        tag = self._ref_tag(int(pp[4]))   # 선심 ARN/ARF
                     if tag:
                         cv2.putText(frame, tag, (x1, y1 - max(4, int(8 * sc))),
                                     cv2.FONT_HERSHEY_SIMPLEX,
@@ -2943,7 +2981,11 @@ class PtzTab(QWidget):
             menu.addSeparator()
             sub = menu.addMenu(
                 f"선수 #{tid} ({self._role_name(self._role_of(tid))}) 역할 지정")
-            for r in (3, 4, 5, 0, 1):
+            for r in (0, 1, 5):
+                sub.addAction(self._role_name(r),
+                              lambda _=False, rr=r, t=tid: self._set_role(t, rr))
+            sub.addSeparator()                    # GK 는 드묾 — 아래쪽
+            for r in (3, 4):
                 sub.addAction(self._role_name(r),
                               lambda _=False, rr=r, t=tid: self._set_role(t, rr))
             if tid in self.roles:
@@ -3254,6 +3296,27 @@ class PtzTab(QWidget):
         return {0: t1, 1: t2, 2: "기타",
                 3: f"{t1} GK", 4: f"{t2} GK", 5: "심판"}.get(r, "기타")
 
+    def _ref_tag(self, tid):
+        """심판 트랙릿 태그 — 선심은 근/원측 (ARN/ARF, referee.py 분류).
+
+        병합 그룹의 어느 멤버든 분류에 있으면 그룹 전체에 적용.
+        """
+        rep = self._rep(tid)
+        grp = {int(tid), rep} | {t for t, r in self.merges.items()
+                                 if r == rep}
+        if grp & {int(t) for t in self._referees.get("ar_near") or []}:
+            return "ARN"
+        if grp & {int(t) for t in self._referees.get("ar_far") or []}:
+            return "ARF"
+        return "REF"
+
+    def _disp_role(self, tid, r):
+        """목록용 역할명 — 선심은 ARN(근측)/ARF(원측) 표기."""
+        if r == 5:
+            return {"ARN": "선심 ARN", "ARF": "선심 ARF"}.get(
+                self._ref_tag(tid), "심판")
+        return self._role_name(r)
+
     def _edit_team_names(self):
         dlg = QDialog(self)
         dlg.setWindowTitle("팀 이름")
@@ -3409,7 +3472,7 @@ class PtzTab(QWidget):
             head = (f"  ↳ #{tid}" if tid != rep
                     else f"#{tid}" + (f" (+{k - 1})" if k > 1 else ""))
             it = QListWidgetItem(
-                f"{head}  {mark}{self._role_name(r)}  "
+                f"{head}  {mark}{self._disp_role(tid, r)}  "
                 f"{int(t0//60):02d}:{t0%60:04.1f}~"
                 f"{int(t1//60):02d}:{t1%60:04.1f}  ({n}회)")
             if tid in cols:

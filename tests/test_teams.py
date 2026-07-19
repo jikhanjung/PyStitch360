@@ -26,3 +26,31 @@ def test_referee_seed_still_propagates():
                       for r in ana["players"]]
     out = classify_teams(ana, roles={21: 5})
     assert out[21] == 5 and out[22] == 5
+
+
+def test_gk_temporal_exclusivity():
+    """GK 단일성: 팀당 GK 한 명 — 같은 GK 역할이 시간상 겹치는 여러
+    트랙릿에 전파되면 안 된다. 비겹침 조각(ID 갈라짐)은 전파 유지."""
+    gk = (30, 220, 200)                              # 노란 GK 유니폼
+    players = []
+    for si in range(100):
+        rows = []
+        for tid in range(1, 7):                       # 빨강 팀
+            rows.append([100 * tid, 500, 40, 120, tid,
+                         2 + tid % 3, 200 - tid, 170 + tid])
+        for tid in range(11, 17):                     # 파랑 팀
+            rows.append([100 * tid, 520, 40, 120, tid,
+                         120 + tid % 3, 190 - tid % 5, 160 + tid % 7])
+        if si < 50:                                   # GK 시드 트랙릿
+            rows.append([300, 700, 40, 120, 31, *gk])
+        if 25 <= si < 80:                             # 같은 색, 시드와 겹침
+            rows.append([3000, 700, 40, 120, 32, *gk])
+        if si >= 60:                                  # 같은 색, 시드와 비겹침
+            rows.append([320, 700, 40, 120, 33, *gk])
+        players.append(rows)
+    ana = {"fps": 30.0, "frames": [si * 3 for si in range(100)],
+           "players": players}
+    out = classify_teams(ana, roles={31: 3})
+    assert out[31] == 3                               # 시드 확정
+    assert out[33] == 3                               # 비겹침 조각 전파 유지
+    assert out[32] != 3                               # 겹침 → 전파 취소

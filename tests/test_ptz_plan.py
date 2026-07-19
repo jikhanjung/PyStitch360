@@ -240,24 +240,32 @@ def test_classify_teams_by_kit_color():
 
 
 def test_classify_teams_role_seeds_propagate():
-    """GK/심판 시드 지정 → 같은 색 옷의 다른 트랙릿에 역할 전파."""
+    """GK/심판 시드 지정 → 같은 색 옷의 다른 트랙릿에 역할 전파.
+
+    GK 는 팀당 한 명 — ID 갈라짐은 시간상 순차라, 전파 대상(21/23)은
+    시드와 시간이 겹치지 않는 후반 조각으로 모델링한다 (동시 존재하는
+    같은 색은 GK 단일성 휴리스틱이 걸러냄 — test_teams.py 참고).
+    """
     from pystitch.core.ptz import classify_teams
     frames = list(range(0, 300, 3))
+    n = len(frames)
     rng = np.random.default_rng(3)
     def det(tid, h, s, v):
         return [1000.0, 900.0, 40.0, 90.0, tid,
                 h + rng.normal(0, 3), s + rng.normal(0, 8), v + rng.normal(0, 8)]
     players = []
-    for _ in frames:
+    for si in range(n):
         row = []
         for tid in range(0, 8):
             row.append(det(tid, 120, 180, 150))    # 팀A: 파랑
         for tid in range(10, 18):
             row.append(det(tid, 3, 190, 160))      # 팀B: 빨강
-        row.append(det(20, 60, 200, 180))          # GK A: 초록 (ID 2개로 갈라짐)
-        row.append(det(21, 60, 200, 180))
-        row.append(det(22, 150, 190, 170))         # GK B: 보라 (ID 2개)
-        row.append(det(23, 150, 190, 170))
+        if si < n // 2:                            # GK: 전반 조각 (시드)
+            row.append(det(20, 60, 200, 180))      # GK A: 초록
+            row.append(det(22, 150, 190, 170))     # GK B: 보라
+        else:                                      # 후반 조각 (전파 대상)
+            row.append(det(21, 60, 200, 180))
+            row.append(det(23, 150, 190, 170))
         row.append(det(30, 25, 210, 210))          # 심판: 노랑
         players.append(row)
     a = _analysis(frames, [None] * len(frames), players)

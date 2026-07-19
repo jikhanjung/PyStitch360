@@ -42,8 +42,8 @@ def make_team_analysis():
                      120 + tid % 3, 190 - tid % 5, 160 + tid % 7])
     rows.append([2500, 700, 40, 120, 21, 60, 150, 60])   # 심판 (어두운 초록)
     rows.append([900, 640, 40, 120, 7, 8, 90, 90])       # 그늘진 빨강
-    return {"fps": 30.0, "frames": [0], "pano_w": PANO_W, "pano_h": PANO_H,
-            "players": [rows] * 30}
+    return {"fps": 30.0, "frames": [si * 3 for si in range(30)],
+            "pano_w": PANO_W, "pano_h": PANO_H, "players": [rows] * 30}
 
 
 def make_ball_analysis(n=300):

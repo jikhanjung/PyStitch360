@@ -548,13 +548,18 @@ def classify_teams(analysis, k=3, roles=None):
     반환: {track_id: 역할번호}.
     """
     feats: dict[int, list] = {}
-    for prow in analysis["players"]:
+    spans: dict[int, list] = {}          # {tid: [첫, 끝 프레임]} — GK 단일성
+    frames = np.asarray(analysis["frames"])
+    for si, prow in enumerate(analysis["players"]):
         for p in prow:
             if len(p) >= 8 and p[4] >= 0:
                 h, s_, v = p[5], p[6], p[7]
                 a = h / 90.0 * np.pi          # OpenCV H 는 0~180
                 feats.setdefault(int(p[4]), []).append(
                     (s_ * np.cos(a), s_ * np.sin(a), v))
+                f = int(frames[si]) if si < len(frames) else si
+                e = spans.setdefault(int(p[4]), [f, f])
+                e[1] = f
     if not feats:
         return {}
     ids = sorted(feats)
@@ -607,6 +612,29 @@ def classify_teams(analysis, k=3, roles=None):
     for t, r in roles.items():              # 시드는 색과 무관하게 확정
         if int(t) in pos:
             out[int(t)] = int(r)
+    # GK 단일성 (휴리스틱): 팀당 GK 는 한 명 — 같은 GK 역할(3/4)이
+    # 시간상 겹치는 여러 트랙릿에 붙을 수 없다. 시드 우선, 다음 역할
+    # 색 근접 순으로 남기고 겹치는 전파분은 기본 군집으로 되돌린다.
+    # (시간 비겹침 조각 전파는 유지 — ID 갈라짐 커버가 전파 목적.)
+    # 심판(5)은 주심+선심 3명이라 제외. docs/heuristics.md 참고.
+    tol = 0.5 * float(analysis.get("fps", 30.0))
+    for gk in (3, 4):
+        if gk not in role_C:
+            continue
+        seeds_r = {int(t) for t, r in roles.items() if int(r) == gk}
+        cands = sorted(
+            (t for t in ids if out.get(t) == gk),
+            key=lambda t: (t not in seeds_r,
+                           float(np.linalg.norm(X[pos[t]] - role_C[gk]))))
+        kept = []
+        for t in cands:
+            s0, s1 = spans.get(t, (0, 0))
+            clash = any(min(s1, spans[k][1]) - max(s0, spans[k][0]) > tol
+                        for k in kept)
+            if clash and t not in seeds_r:
+                out[t] = base[t]
+            else:
+                kept.append(t)
     return out
 
 
