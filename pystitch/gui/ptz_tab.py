@@ -4464,6 +4464,8 @@ class PtzTab(QWidget):
                for i in self.player_list.selectedIndexes()
                if i.row() < len(rows)}
         for tid in sel:
+            self._maybe_clear_num(
+                tid, role if role is not None else self._teams.get(tid, 2))
             if role is None:
                 self.roles.pop(tid, None)
             else:
@@ -4471,7 +4473,23 @@ class PtzTab(QWidget):
         if sel:
             self._roles_changed()
 
+    def _maybe_clear_num(self, tid, new_role):
+        """팀이 바뀌면 등번호 제거 — 번호는 팀 소속 (GK 승격/강등은 유지)."""
+        rep = self._rep(int(tid))
+        num = self.player_nums.get(rep)
+        if num is None:
+            return
+        old = self._role_of(rep)
+        old_team = old % 3 if old in (0, 1, 3, 4) else None
+        new_team = new_role % 3 if new_role in (0, 1, 3, 4) else None
+        if old_team != new_team:
+            self.player_nums.pop(rep, None)
+            self.log(f"[ptz] #{rep} 팀 변경 — 등번호 {num} 제거")
+
     def _set_role(self, tid, role):
+        eff = (int(role) if role is not None
+               else self._teams.get(self._rep(int(tid)), 2))
+        self._maybe_clear_num(tid, eff)
         if role is None:
             self.roles.pop(int(tid), None)
         else:
