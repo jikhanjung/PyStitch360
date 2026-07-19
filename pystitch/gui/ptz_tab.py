@@ -13,23 +13,44 @@ import cv2
 import numpy as np
 from PyQt6.QtCore import QSettings, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QCheckBox
-from PyQt6.QtGui import QColor, QKeySequence, QPainter, QShortcut
+from PyQt6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout, QLabel, QListWidget,
-    QMenu, QMessageBox, QProgressBar, QPushButton, QSlider, QSpinBox,
-    QVBoxLayout, QWidget,
+    QListWidgetItem, QMenu, QMessageBox, QProgressBar, QPushButton, QSlider,
+    QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from ..core.encoders import available_encoders
+from ..core.field import (
+    LANDMARKS, field_outline, field_to_pano, fit_field_calibration,
+    landmark_positions, pano_to_field,
+)
 from ..core.ptz import (
     accept_ball_tracks, analyze_video, build_plan, classify_teams,
     ground_positions, link_ball_tracks, ptz_available, render_plan,
-    same_spot_spans,
+    same_spot_spans, tracklet_colors,
 )
 from .widgets import FramePane
 
 
-TEAM_COLORS = [(60, 60, 230), (230, 140, 40), (60, 200, 230)]   # BGR: 팀0, 팀1, 기타
+# BGR — 인덱스 = 역할 번호 (core.ptz ROLE_*): 팀1, 팀2, 기타, 팀1 GK, 팀2 GK, 심판
+TEAM_COLORS = [(60, 60, 230), (230, 140, 40), (160, 160, 160),
+               (180, 105, 255), (230, 230, 0), (60, 200, 230)]
+ROLE_NAMES = ["팀1", "팀2", "기타", "팀1 GK", "팀2 GK", "심판"]
+ROLE_TAGS = {3: "GK1", 4: "GK2", 5: "REF"}
+# 미리보기 오버레이용 랜드마크 약칭 (cv2 폰트는 한글 불가)
+LANDMARK_TAGS = {"corner_far_l": "FL", "corner_far_r": "FR",
+                 "corner_near_l": "NL", "corner_near_r": "NR",
+                 "half_far": "HF", "half_near": "HN",
+                 "circle_far": "CF", "circle_near": "CN"}
+
+
+def _hsv_hex(hsv):
+    """OpenCV HSV(0~180, 0~255, 0~255) → '#rrggbb'."""
+    px = np.uint8([[[int(hsv[0]) % 180, int(min(hsv[1], 255)),
+                     int(min(hsv[2], 255))]]])
+    b, g, r = cv2.cvtColor(px, cv2.COLOR_HSV2BGR)[0, 0]
+    return f"#{r:02x}{g:02x}{b:02x}"
 
 
 class RadarView(QWidget):
@@ -40,28 +61,62 @@ class RadarView(QWidget):
         self.setFixedHeight(180)
         self.points: list = []      # (X, Y, team)
         self.ball = None            # (X, Y) or None
+        self.field = None           # {length, width, cam} — 캘리브레이션 후
 
     def set_data(self, points, ball=None):
         self.points, self.ball = list(points), ball
         self.update()
 
+    def set_field(self, field):
+        """경기장 절대 좌표 모드 on/off — 켜지면 실측 경기장을 그린다."""
+        if field != self.field:
+            self.field = field
+            self.update()
+
     def paintEvent(self, ev):
         p = QPainter(self)
         p.fillRect(self.rect(), QColor(30, 60, 34))
         W, H = self.width(), self.height()
-        # 표시 범위: X -55..55m, Y 0..75m (카메라 = 하단 중앙)
+        if self.field:
+            hl, hw = self.field["length"] / 2, self.field["width"] / 2
+            camx, camy = self.field["cam"]
+            xmin, xmax = -hl - 6, hl + 6
+            ymin, ymax = min(camy, -hw) - 4, hw + 6
+        else:
+            # 캘리브레이션 전: 카메라 기준 X -55..55m, Y 0..75m
+            xmin, xmax, ymin, ymax = -55, 55, 0, 75
+
         def px(X, Y):
-            return (int((X + 55) / 110 * (W - 1)),
-                    int((1 - Y / 75) * (H - 1)))
-        p.setPen(QColor(255, 255, 255, 45))
-        for gx in range(-50, 51, 10):
-            p.drawLine(*px(gx, 0), *px(gx, 75))
-        for gy in range(0, 76, 10):
-            p.drawLine(*px(-55, gy), *px(55, gy))
-        p.setPen(QColor(255, 255, 255, 140))
-        p.drawLine(*px(0, 0), *px(0, 75))            # 하프라인 방향
+            return (int((X - xmin) / (xmax - xmin) * (W - 1)),
+                    int((1 - (Y - ymin) / (ymax - ymin)) * (H - 1)))
+
+        if self.field:
+            p.setPen(QColor(255, 255, 255, 150))
+            for (a, b), (c, d) in [((-hl, -hw), (hl, -hw)),
+                                   ((hl, -hw), (hl, hw)),
+                                   ((hl, hw), (-hl, hw)),
+                                   ((-hl, hw), (-hl, -hw)),
+                                   ((0, -hw), (0, hw))]:
+                p.drawLine(*px(a, b), *px(c, d))
+            rx = int(9.15 / (xmax - xmin) * (W - 1))
+            ry = int(9.15 / (ymax - ymin) * (H - 1))
+            cx0, cy0 = px(0, 0)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(cx0 - rx, cy0 - ry, 2 * rx, 2 * ry)
+            p.setBrush(QColor(255, 220, 0))
+            p.setPen(Qt.PenStyle.NoPen)
+            camp = px(camx, camy)
+            p.drawEllipse(camp[0] - 3, camp[1] - 3, 6, 6)   # 카메라 위치
+        else:
+            p.setPen(QColor(255, 255, 255, 45))
+            for gx in range(-50, 51, 10):
+                p.drawLine(*px(gx, 0), *px(gx, 75))
+            for gy in range(0, 76, 10):
+                p.drawLine(*px(-55, gy), *px(55, gy))
+            p.setPen(QColor(255, 255, 255, 140))
+            p.drawLine(*px(0, 0), *px(0, 75))        # 하프라인 방향
         for X, Y, team in self.points:
-            b, g, r = TEAM_COLORS[min(max(team, 0), 2)]
+            b, g, r = TEAM_COLORS[min(max(team, 0), len(TEAM_COLORS) - 1)]
             p.setBrush(QColor(r, g, b))
             p.setPen(Qt.PenStyle.NoPen)
             x, y = px(X, Y)
@@ -75,48 +130,271 @@ class RadarView(QWidget):
         p.end()
 
 
-class TrackBar(QWidget):
-    """타임라인 위 공 트랙 표시줄: 초록=수락 트랙, 빨강=무시 구간, 주황=키프레임.
+class TimelineView(QWidget):
+    """NLE 스타일 멀티트랙 타임라인.
 
-    클릭하면 해당 프레임으로 이동한다.
+    레인: 크롭/키프레임, 공(수락=초록·무시=빨강·승격=자홍), 팀1, 팀2, 기타.
+    선수 트랙릿·공 트랙·키프레임이 가로 바/박스로 그려지고 클릭으로
+    선택(pick 시그널)할 수 있다. Ctrl+휠 = 커서 기준 확대축소, 휠 = 팬,
+    빈 곳 드래그 = 팬, 빈 곳 클릭 = 시크. 빨간 세로선 = 현재 위치.
     """
 
     seek = pyqtSignal(int)
+    pick = pyqtSignal(str, int)      # ("kf"|"ball"|"ignore"|"player", 키)
+
+    RULER = 16
+    LANE_H = 20
+    GUTTER = 64
+    LANES = ["크롭/KF", "공", "팀1", "팀2", "기타"]
 
     def __init__(self):
         super().__init__()
-        self.setFixedHeight(16)
+        self.setFixedHeight(self.RULER + self.LANE_H * len(self.LANES))
+        self.setMouseTracking(True)
         self.total = 0
+        self.fps = 30.0
+        self.pos = 0
         self.spans: list = []
         self.ignores: list = []
         self.kfs: list = []
+        self.promotes: list = []
+        self._players: list = []     # [(tid, f0, f1, role, 서브행), ...]
+        self.t0 = 0.0                # 보이는 시작 프레임
+        self.ppf = 0.0               # 픽셀/프레임 (0 = 전체 맞춤)
+        self.selected = None         # (종류, 키)
+        self._press = None
 
-    def set_data(self, total, spans, ignores, kfs):
-        self.total = max(1, total)
-        self.spans, self.ignores, self.kfs = list(spans), list(ignores), list(kfs)
+    # --------------------------------------------------------------- 데이터
+    def set_data(self, total, spans, ignores, kfs, promotes=None):
+        self.total = max(1, int(total))
+        self.spans, self.ignores = list(spans), list(ignores)
+        self.kfs = list(kfs)
+        if promotes is not None:
+            self.promotes = list(promotes)
+        self._clamp_view()
         self.update()
 
-    def _x(self, f):
-        return int(f / self.total * (self.width() - 1))
+    def set_players(self, players):
+        """{tid: (f0, f1, role)} → 레인별 서브행 배치 (겹침 회피 3행)."""
+        by_lane: dict[int, list] = {}
+        for tid, (f0, f1, role) in players.items():
+            by_lane.setdefault(self._lane_of_role(role), []).append(
+                (f0, f1, tid, role))
+        out = []
+        for lane, items in by_lane.items():
+            ends = []                          # 서브행별 마지막 끝 프레임
+            for f0, f1, tid, role in sorted(items):
+                for si, e in enumerate(ends):
+                    if e <= f0:
+                        ends[si] = f1
+                        break
+                else:
+                    si = len(ends) % 3
+                    if len(ends) < 3:
+                        ends.append(f1)
+                    else:
+                        ends[si] = max(ends[si], f1)
+                out.append((tid, f0, f1, role, si))
+        self._players = out
+        self.update()
 
+    def set_pos(self, f):
+        if f != self.pos:
+            self.pos = f
+            self.update()
+
+    def set_selection(self, kind, key):
+        sel = (kind, key) if kind is not None else None
+        if sel != self.selected:
+            self.selected = sel
+            self.update()
+
+    @staticmethod
+    def _lane_of_role(role):
+        if role in (0, 3):
+            return 2
+        if role in (1, 4):
+            return 3
+        return 4
+
+    # --------------------------------------------------------------- 좌표계
+    def _eff_ppf(self):
+        fit = (self.width() - self.GUTTER) / max(self.total, 1)
+        return max(self.ppf, fit) if self.ppf > 0 else fit
+
+    def _clamp_view(self):
+        ppf = self._eff_ppf()
+        vis = (self.width() - self.GUTTER) / max(ppf, 1e-9)
+        self.t0 = min(max(self.t0, 0.0), max(0.0, self.total - vis))
+
+    def _x(self, f):
+        return int(self.GUTTER + (f - self.t0) * self._eff_ppf())
+
+    def _f(self, x):
+        return (x - self.GUTTER) / self._eff_ppf() + self.t0
+
+    def _lane_rect(self, lane):
+        y = self.RULER + lane * self.LANE_H
+        return y, self.LANE_H
+
+    # --------------------------------------------------------------- 그리기
     def paintEvent(self, ev):
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor(40, 40, 40))
-        h = self.height()
-        for f0, f1 in self.spans:
-            p.fillRect(self._x(f0), 2, max(1, self._x(f1) - self._x(f0)), h - 4,
-                       QColor(70, 200, 90))
-        for r in self.ignores:
-            f0, f1 = r[0], r[1]
-            p.fillRect(self._x(f0), 2, max(1, self._x(f1) - self._x(f0)), h - 4,
-                       QColor(220, 70, 60))
-        for kf in self.kfs:
-            p.fillRect(self._x(kf[0]) - 1, 0, 3, h, QColor(255, 190, 0))
+        p.fillRect(self.rect(), QColor(34, 34, 38))
+        W = self.width()
+        # 레인 배경/라벨
+        for i, name in enumerate(self.LANES):
+            y, lh = self._lane_rect(i)
+            if i % 2 == 0:
+                p.fillRect(self.GUTTER, y, W - self.GUTTER, lh,
+                           QColor(255, 255, 255, 8))
+            p.setPen(QColor(200, 200, 200))
+            p.drawText(4, y + lh - 6, name)
+            p.setPen(QColor(255, 255, 255, 25))
+            p.drawLine(0, y + lh, W, y + lh)
+        # 눈금자: 60px 이상 간격이 되는 단위 선택
+        if self.total > 1:
+            ppf = self._eff_ppf()
+            for step_s in (1, 2, 5, 10, 30, 60, 120, 300, 600):
+                if step_s * self.fps * ppf >= 60:
+                    break
+            f = int(self.t0 // (step_s * self.fps)) * step_s * self.fps
+            p.setPen(QColor(180, 180, 180))
+            while f <= self.t0 + (W - self.GUTTER) / ppf:
+                x = self._x(f)
+                if x >= self.GUTTER:
+                    p.drawLine(x, 0, x, self.RULER - 4)
+                    t = f / self.fps
+                    p.drawText(x + 3, self.RULER - 4,
+                               f"{int(t//60):02d}:{int(t%60):02d}")
+                f += step_s * self.fps
+        # 레인 0: 키프레임 (3요소 = 위치, 4요소 = 크롭 박스 폭 포함)
+        y, lh = self._lane_rect(0)
+        for i, k in enumerate(self.kfs):
+            x = self._x(k[0])
+            crop = len(k) > 3
+            c = QColor(255, 130, 0) if crop else QColor(255, 190, 0)
+            r = (x - 4, y + 3, 9, lh - 6)
+            p.fillRect(*r, c)
+            if self.selected == ("kf", i):
+                p.setPen(QColor(255, 255, 255))
+                p.drawRect(r[0] - 1, r[1] - 1, r[2] + 1, r[3] + 1)
+        # 레인 1: 공 — 수락 트랙, 무시, 승격
+        y, lh = self._lane_rect(1)
+        for i, (f0, f1) in enumerate(self.spans):
+            r = (self._x(f0), y + 4, max(2, self._x(f1) - self._x(f0)), lh - 8)
+            p.fillRect(*r, QColor(70, 200, 90))
+            if self.selected == ("ball", i):
+                p.setPen(QColor(255, 255, 255))
+                p.drawRect(r[0] - 1, r[1] - 1, r[2] + 1, r[3] + 1)
+        for i, rg in enumerate(self.ignores):
+            r = (self._x(rg[0]), y + 4,
+                 max(2, self._x(rg[1]) - self._x(rg[0])), lh - 8)
+            p.fillRect(*r, QColor(220, 70, 60))
+            if self.selected == ("ignore", i):
+                p.setPen(QColor(255, 255, 255))
+                p.drawRect(r[0] - 1, r[1] - 1, r[2] + 1, r[3] + 1)
+        for pr in self.promotes:
+            x = self._x(pr[0])
+            p.fillRect(x - 1, y + 2, 3, lh - 4, QColor(200, 0, 255))
+        # 선수 레인: 팀/역할 색 바 (서브행 3개)
+        for tid, f0, f1, role, si in self._players:
+            y, lh = self._lane_rect(self._lane_of_role(role))
+            bh = (lh - 4) // 3
+            ry = y + 2 + si * bh
+            b, g, rr = TEAM_COLORS[min(role, len(TEAM_COLORS) - 1)]
+            r = (self._x(f0), ry, max(2, self._x(f1) - self._x(f0)), bh - 1)
+            p.fillRect(*r, QColor(rr, g, b))
+            if self.selected == ("player", tid):
+                p.setPen(QColor(255, 255, 255))
+                p.drawRect(r[0] - 1, r[1] - 1, r[2] + 1, r[3] + 1)
+        # 거터 마스크 + 플레이헤드
+        p.fillRect(0, self.RULER, self.GUTTER, self.height(), QColor(34, 34, 38))
+        for i, name in enumerate(self.LANES):     # 라벨 다시 (마스크 위)
+            y, lh = self._lane_rect(i)
+            p.setPen(QColor(200, 200, 200))
+            p.drawText(4, y + lh - 6, name)
+        x = self._x(self.pos)
+        if x >= self.GUTTER:
+            p.setPen(QColor(255, 60, 60))
+            p.drawLine(x, 0, x, self.height())
         p.end()
 
+    # --------------------------------------------------------------- 조작
+    def _hit(self, x, y):
+        f = self._f(x)
+        lane = (y - self.RULER) // self.LANE_H
+        if lane == 0:
+            best, bd = None, 8.0
+            for i, k in enumerate(self.kfs):
+                d = abs(self._x(k[0]) - x)
+                if d < bd:
+                    best, bd = ("kf", i), d
+            return best
+        if lane == 1:
+            for i, rg in enumerate(self.ignores):
+                if rg[0] <= f <= rg[1]:
+                    return ("ignore", i)
+            for i, (f0, f1) in enumerate(self.spans):
+                if f0 <= f <= f1:
+                    return ("ball", i)
+            return None
+        if lane in (2, 3, 4):
+            ly, lh = self._lane_rect(int(lane))
+            bh = (lh - 4) // 3
+            for tid, f0, f1, role, si in self._players:
+                if self._lane_of_role(role) != lane:
+                    continue
+                ry = ly + 2 + si * bh
+                if f0 <= f <= f1 and ry - 1 <= y <= ry + bh:
+                    return ("player", tid)
+        return None
+
     def mousePressEvent(self, ev):
-        if self.total > 1:
-            self.seek.emit(int(ev.position().x() / max(1, self.width() - 1) * self.total))
+        if self.total <= 1 or ev.button() != Qt.MouseButton.LeftButton:
+            return
+        x, y = int(ev.position().x()), int(ev.position().y())
+        self._press = {"x": x, "t0": self.t0, "moved": False,
+                       "hit": self._hit(x, y) if y >= self.RULER else None}
+
+    def mouseMoveEvent(self, ev):
+        if self._press is None:
+            return
+        dx = int(ev.position().x()) - self._press["x"]
+        if abs(dx) > 3:
+            self._press["moved"] = True
+        if self._press["moved"] and self._press["hit"] is None:
+            self.t0 = self._press["t0"] - dx / self._eff_ppf()   # 팬
+            self._clamp_view()
+            self.update()
+
+    def mouseReleaseEvent(self, ev):
+        pr, self._press = self._press, None
+        if pr is None or pr["moved"]:
+            return
+        if pr["hit"] is not None:
+            self.selected = pr["hit"]
+            self.update()
+            self.pick.emit(*pr["hit"])
+        elif ev.position().x() >= self.GUTTER:
+            self.seek.emit(int(min(max(self._f(int(ev.position().x())), 0),
+                                   self.total - 1)))
+
+    def wheelEvent(self, ev):
+        if self.total <= 1:
+            return
+        delta = ev.angleDelta().y() / 120.0
+        if ev.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            x = int(ev.position().x())
+            f_at = self._f(max(x, self.GUTTER))
+            fit = (self.width() - self.GUTTER) / self.total
+            self.ppf = min(max(self._eff_ppf() * (1.25 ** delta), fit), 30.0)
+            self.t0 = f_at - (max(x, self.GUTTER) - self.GUTTER) / self.ppf
+        else:
+            self.t0 -= delta * 80 / self._eff_ppf()
+        self._clamp_view()
+        self.update()
+        ev.accept()
 
 
 class AnalyzeWorker(QThread):
@@ -340,13 +618,21 @@ class PtzTab(QWidget):
         self.keyframes: list[list] = []   # [frame, x, y]
         self.ignores: list[list] = []     # [f0, f1] 사용자 지정 오인식 구간
         self.promotes: list[list] = []    # [f, x, y] 회색 공 → 트랙 강제 수락
+        self.roles: dict[int, int] = {}   # {track_id: 역할} 사용자 지정 (GK 등)
+        self.field_points: dict[str, list] = {}   # {랜드마크키: [x, y]}
+        self.field_size = [105.0, 68.0]   # 경기장 길이×폭 (m)
+        self._field_calib = None          # fit_field_calibration 결과
         self.track_spans: list = []
+        self._pcache_id = None            # 선수 요약 캐시 기준 분석 객체 id
+        self._pspans: dict = {}           # {tid: [f0, f1, 검출수]}
+        self._pcolors: dict = {}          # {tid: (h, s, v)} 유니폼 대표색
         self._accepted_ball = None        # accept_ball_tracks 의 샘플별 수락 공
         self._hover = None                # 커서가 가리키는 오브젝트
         self._hover_key = None            # hover 변경 감지 키
         self._plan_box = None             # 현재 프레임에 그려진 크롭 박스 (x0,y0,w,h)
         self._box_hover = None            # 크롭 박스 hover 존: ("corner",i)|("border",None)
         self._box_edit = None             # 진행 중인 박스 드래그 상태
+        self._box_commit = None           # 커밋 직후 낙관적 박스 (f, cx, cy, w)
         self._analyze_worker = None
         self._render_worker = None
         self._plan_worker = None
@@ -428,9 +714,10 @@ class PtzTab(QWidget):
             b.setMaximumWidth(52)
             b.clicked.connect(lambda _, dd=d: self._step(dd))
             tl.addWidget(b)
-        # 트랙바는 슬라이더 바로 위, 같은 폭 — 위치가 1:1 로 대응
-        self.trackbar = TrackBar()
+        # 멀티트랙 타임라인은 슬라이더 바로 위, 같은 폭
+        self.trackbar = TimelineView()
         self.trackbar.seek.connect(lambda f: self.slider.setValue(f))
+        self.trackbar.pick.connect(self._timeline_pick)
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setEnabled(False)
         self.slider.sliderPressed.connect(self._stop_play)
@@ -447,8 +734,11 @@ class PtzTab(QWidget):
         self._slider_timer = QTimer(singleShot=True, interval=120)
         self._slider_timer.timeout.connect(self._show_frame)
 
-        # 하단 스트립: 공 목록 | 오인식 목록 | 레이더 (로그 위 공간 활용)
+        # 하단 스트립: [공 | 선수] 탭 + 레이더 (로그 위 공간 활용)
         strip = QHBoxLayout()
+        w_ball = QWidget()
+        ball_strip = QHBoxLayout(w_ball)
+        ball_strip.setContentsMargins(0, 2, 0, 0)
         col_ball = QVBoxLayout()
         col_ball.addWidget(QLabel("공 — 자동 트랙 + 수동 지정 (↑↓=이동, →/Del=오인식으로)"))
         self.track_list = QListWidget()
@@ -460,7 +750,7 @@ class PtzTab(QWidget):
                       activated=self._ignore_selected_track,
                       context=Qt.ShortcutContext.WidgetShortcut)
         col_ball.addWidget(self.track_list, 1)
-        strip.addLayout(col_ball, 2)
+        ball_strip.addLayout(col_ball, 2)
 
         # 두 목록 사이 이동 버튼: >> = 오인식으로, << = 복원
         col_move = QVBoxLayout()
@@ -476,7 +766,7 @@ class PtzTab(QWidget):
         self.btn_restore.clicked.connect(self._delete_kf)
         col_move.addWidget(self.btn_restore)
         col_move.addStretch(1)
-        strip.addLayout(col_move)
+        ball_strip.addLayout(col_move)
 
         col_ig = QVBoxLayout()
         col_ig.addWidget(QLabel("오인식 — 공 아님 (더블클릭=이동, ←=복원)"))
@@ -487,7 +777,78 @@ class PtzTab(QWidget):
                   activated=self._delete_kf,
                   context=Qt.ShortcutContext.WidgetShortcut)
         col_ig.addWidget(self.kf_list, 1)
-        strip.addLayout(col_ig, 2)
+        ball_strip.addLayout(col_ig, 2)
+
+        # 선수 탭: 트랙릿 목록(유니폼 색 스와치) + 역할 지정 + 팀 색 범례
+        w_players = QWidget()
+        pl = QVBoxLayout(w_players)
+        pl.setContentsMargins(0, 2, 0, 0)
+        self.lbl_team_colors = QLabel("팀 색: 분석 후 표시")
+        self.lbl_team_colors.setTextFormat(Qt.TextFormat.RichText)
+        pl.addWidget(self.lbl_team_colors)
+        self.player_list = QListWidget()
+        self.player_list.setSelectionMode(
+            QListWidget.SelectionMode.ExtendedSelection)
+        self.player_list.currentRowChanged.connect(
+            lambda _: self._goto_player())
+        pl.addWidget(self.player_list, 1)
+        rl = QHBoxLayout()
+        rl.addWidget(QLabel("선택한 트랙릿 →"))
+        for r in (3, 4, 5, 0, 1):
+            b = QPushButton(ROLE_NAMES[r])
+            b.setMaximumWidth(72)
+            b.clicked.connect(lambda _, rr=r: self._assign_selected_role(rr))
+            rl.addWidget(b)
+        b = QPushButton("자동")
+        b.setMaximumWidth(56)
+        b.setToolTip("사용자 지정을 지우고 색 기반 자동 분류로")
+        b.clicked.connect(lambda: self._assign_selected_role(None))
+        rl.addWidget(b)
+        rl.addStretch(1)
+        pl.addLayout(rl)
+
+        # 경기장 탭: 랜드마크 자동 매칭 찍기 + 캘리브레이션 상태
+        w_field = QWidget()
+        fl = QVBoxLayout(w_field)
+        fl.setContentsMargins(0, 2, 0, 0)
+        self.lbl_field_status = QLabel(
+            "랜드마크를 찍으면 자동 매칭됩니다 (★=필수, 최소 4점). "
+            "우클릭으로 수동 지정/수정.")
+        fl.addWidget(self.lbl_field_status)
+        self.field_list = QListWidget()
+        fl.addWidget(self.field_list, 1)
+        fr = QHBoxLayout()
+        self.btn_field_pick = QPushButton("랜드마크 찍기")
+        self.btn_field_pick.setCheckable(True)
+        self.btn_field_pick.setToolTip(
+            "켜면 미리보기 클릭이 랜드마크 지정이 됩니다 (휴리스틱 자동 매칭)")
+        self.btn_field_pick.toggled.connect(lambda _: self._redraw())
+        fr.addWidget(self.btn_field_pick)
+        b = QPushButton("선택 지우기")
+        b.clicked.connect(self._field_clear_selected)
+        fr.addWidget(b)
+        fr.addWidget(QLabel("경기장(m)"))
+        self.spin_field_len = QDoubleSpinBox()
+        self.spin_field_len.setRange(80.0, 130.0)
+        self.spin_field_len.setValue(105.0)
+        self.spin_field_len.setSuffix(" L")
+        self.spin_field_w = QDoubleSpinBox()
+        self.spin_field_w.setRange(40.0, 90.0)
+        self.spin_field_w.setValue(68.0)
+        self.spin_field_w.setSuffix(" W")
+        for sp in (self.spin_field_len, self.spin_field_w):
+            sp.valueChanged.connect(self._field_size_changed)
+            fr.addWidget(sp)
+        fr.addStretch(1)
+        fl.addLayout(fr)
+
+        self.tabs_review = QTabWidget()
+        self.tabs_review.addTab(w_ball, "공")
+        self.tabs_review.addTab(w_players, "선수")
+        self.tabs_review.addTab(w_field, "경기장")
+        self.tabs_review.setMaximumHeight(210)
+        self.tabs_review.currentChanged.connect(self._review_tab_changed)
+        strip.addWidget(self.tabs_review, 5)
 
         col_radar = QVBoxLayout()
         self.radar = RadarView()
@@ -564,6 +925,7 @@ class PtzTab(QWidget):
         self.pano_path = Path(path)
         self._remember_dir(str(self.pano_path.parent))
         self.fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        self.trackbar.fps = self.fps
         self.total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.pano_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.pano_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -651,6 +1013,8 @@ class PtzTab(QWidget):
         """
         self.keyframes, self.ignores, self.promotes, self.analysis = \
             [], [], [], None
+        self.roles = {}
+        self.field_points = {}
         sp = self._sidecar_path()
         doc = None
         if sp.exists():
@@ -662,6 +1026,19 @@ class PtzTab(QWidget):
             self.keyframes = [list(k) for k in doc.get("keyframes", [])]
             self.ignores = [list(r) for r in doc.get("ignores", [])]
             self.promotes = [list(p) for p in doc.get("promotes", [])]
+            self.roles = {int(t): int(r)
+                          for t, r in (doc.get("roles") or {}).items()}
+            self.field_points = {k: [float(v[0]), float(v[1])]
+                                 for k, v in
+                                 (doc.get("field_points") or {}).items()}
+            fs = doc.get("field_size")
+            if fs:
+                self.field_size = [float(fs[0]), float(fs[1])]
+                for sp, v in ((self.spin_field_len, fs[0]),
+                              (self.spin_field_w, fs[1])):
+                    sp.blockSignals(True)
+                    sp.setValue(float(v))
+                    sp.blockSignals(False)
             self.analysis = doc.get("analysis")   # 구 통합본 (이전 대상)
         migrated = self.analysis is not None
         ap = self._analysis_path()
@@ -699,6 +1076,10 @@ class PtzTab(QWidget):
                      f"{len(self.keyframes)}개, 무시 {len(self.ignores)}개")
             self._start_link()
         self._refresh_lists()
+        self._refresh_team_label()
+        self._refresh_player_list()
+        self._refit_field()
+        self._refresh_field_list()
 
     def _write_sidecar(self):
         """사용자 에디트만 저장 — 분석과 분리돼 있어 작고 즉시 쓴다."""
@@ -708,7 +1089,10 @@ class PtzTab(QWidget):
         tmp = sp.with_suffix(".ptz.json.tmp")
         tmp.write_text(json.dumps({"keyframes": self.keyframes,
                                    "ignores": self.ignores,
-                                   "promotes": self.promotes}))
+                                   "promotes": self.promotes,
+                                   "roles": self.roles,
+                                   "field_points": self.field_points,
+                                   "field_size": self.field_size}))
         tmp.replace(sp)
 
     def _write_analysis(self):
@@ -807,6 +1191,7 @@ class PtzTab(QWidget):
             self.slider.setValue(self.slider.value() + d)
 
     def _on_slider(self, _):
+        self.trackbar.set_pos(self.slider.value())
         t = self.slider.value() / self.fps
         cs = round(t * 100)
         m, cs = divmod(cs, 6000)
@@ -1028,7 +1413,8 @@ class PtzTab(QWidget):
         self._save_keyframes()
         self._refresh_kf_list()
         self.trackbar.set_data(self.total, self.track_spans,
-                               self.ignores, self.keyframes)
+                               self.ignores, self.keyframes,
+                               promotes=self.promotes)
         self._plan_dirty()
         self._redraw()
         self.log(f"[ptz] 키프레임 {f/self.fps:.1f}s → ({x:.0f}, {y:.0f})")
@@ -1040,7 +1426,8 @@ class PtzTab(QWidget):
             self._save_keyframes()
             self._refresh_kf_list()
             self.trackbar.set_data(self.total, self.track_spans,
-                                   self.ignores, self.keyframes)
+                                   self.ignores, self.keyframes,
+                                   promotes=self.promotes)
             self._plan_dirty()
             self._redraw()
             self.log(f"[ptz] 키프레임 삭제 {k[0]/self.fps:.1f}s")
@@ -1088,8 +1475,12 @@ class PtzTab(QWidget):
             return
         x0, y0, w, h = self._plan_box
         box = [x0 + w / 2, y0 + h / 2, float(w)]
+        corners = [(x0, y0), (x0 + w, y0), (x0, y0 + h), (x0 + w, y0 + h)]
         self._box_edit = {"mode": hit[0], "corner": hit[1],
                           "box": list(box), "orig": list(box),
+                          # 리사이즈 앵커 = 잡은 코너의 대각 반대편 (고정점)
+                          "anchor": corners[3 - hit[1]] if hit[0] == "corner"
+                          else None,
                           "start": (x, y),
                           "frame": getattr(self, "_cur_frame_idx",
                                            self.slider.value())}
@@ -1101,19 +1492,27 @@ class PtzTab(QWidget):
         x, y = fx * self.pano_w, fy * self.pano_h
         ow, oh = self.plan_out
         cx0, cy0, w0 = e["orig"]
+        top = int(self.plan.get("top_margin", 0)) if self.plan else 0
+        max_w = min(self.pano_w, (self.pano_h - top) * ow / oh)
         if e["mode"] == "border":            # 이동
             cx = cx0 + (x - e["start"][0])
             cy = cy0 + (y - e["start"][1])
-            w = w0
-        else:                                # 모서리 = 중심 기준 리사이즈(줌)
-            w = 2 * max(abs(x - cx0), abs(y - cy0) * ow / oh)
-            cx, cy = cx0, cy0
-        top = int(self.plan.get("top_margin", 0)) if self.plan else 0
-        max_w = min(self.pano_w, (self.pano_h - top) * ow / oh)
-        w = min(max(w, ow / 6.0), max_w)     # 코어 min_crop_w 와 동일 하한
-        h = w * oh / ow
-        cx = min(max(cx, w / 2), self.pano_w - w / 2)
-        cy = min(max(cy, h / 2), self.pano_h - h / 2)
+            w = min(max(w0, ow / 6.0), max_w)
+            h = w * oh / ow
+            cx = min(max(cx, w / 2), self.pano_w - w / 2)
+            cy = min(max(cy, h / 2), self.pano_h - h / 2)
+        else:                                # 모서리 = 반대편 코너 고정 리사이즈
+            ax, ay = e["anchor"]
+            sx = -1 if e["corner"] in (0, 2) else 1   # 왼쪽 코너 = 앵커의 왼쪽으로
+            sy = -1 if e["corner"] in (0, 1) else 1   # 위 코너 = 앵커의 위로
+            w = max(abs(x - ax), abs(y - ay) * ow / oh)
+            # 앵커를 고정한 채 파노라마 안에 들어가는 최대 폭
+            max_w = min(max_w,
+                        (self.pano_w - ax) if sx > 0 else ax,
+                        ((self.pano_h - ay) if sy > 0 else ay) * ow / oh)
+            w = min(max(w, ow / 6.0), max_w)
+            h = w * oh / ow
+            cx, cy = ax + sx * w / 2, ay + sy * h / 2
         e["box"] = [cx, cy, w]
         self._redraw()
 
@@ -1133,10 +1532,13 @@ class PtzTab(QWidget):
                           if abs(k[0] - f) > 0.5 * self.fps]
         self.keyframes.append([f, round(cx, 1), round(cy, 1), round(w, 1)])
         self.keyframes.sort()
+        # 새 계획이 올 때까지 이 위치를 그대로 그린다 — 이전 박스 깜박임 방지
+        self._box_commit = (f, cx, cy, w)
         self._save_keyframes()
         self._refresh_kf_list()
         self.trackbar.set_data(self.total, self.track_spans,
-                               self.ignores, self.keyframes)
+                               self.ignores, self.keyframes,
+                               promotes=self.promotes)
         self._plan_dirty()
         self._redraw()
         self.log(f"[ptz] 크롭 키프레임 {f/self.fps:.1f}s → "
@@ -1167,6 +1569,7 @@ class PtzTab(QWidget):
         if self.plan is not None and f < len(self.plan["cx"]):
             ow, oh = self.plan_out
             top = int(self.plan.get("top_margin", 0))
+            commit = self._box_commit
             if self._box_edit is not None:      # 편집 중: 미확정 박스
                 bcx, bcy, bw = self._box_edit["box"]
                 w = int(round(bw)) & ~1
@@ -1174,6 +1577,13 @@ class PtzTab(QWidget):
                 x0 = int(round(bcx - w / 2))
                 y0 = int(round(bcy - h / 2))
                 box_color = (0, 255, 255)
+            elif commit is not None and abs(f - commit[0]) <= 0.5 * self.fps:
+                # 커밋 직후 (새 계획 계산 중): 놓은 자리 그대로 유지
+                w = int(round(commit[3])) & ~1
+                h = int(round(w * oh / ow)) & ~1
+                x0 = int(round(commit[1] - w / 2))
+                y0 = int(round(commit[2] - h / 2))
+                box_color = (255, 200, 0)
             else:
                 w = int(round(min(self.plan["crop_w"][f], self.pano_w,
                                   self.pano_h * ow / oh))) & ~1
@@ -1231,10 +1641,14 @@ class PtzTab(QWidget):
             if abs(k[0] - f) <= 1.0 * self.fps:
                 kx, ky = float(k[1]), float(k[2])
                 p = (int(kx * sc), int(ky * sc))
-                cv2.drawMarker(frame, p, (0, 0, 255), cv2.MARKER_CROSS,
-                               max(20, int(60 * sc)), max(3, int(8 * sc)))
+                # 이동 가능 표시: 동서남북 4방향 화살표 마커
+                arm = max(12, int(34 * sc))
+                th = max(2, int(6 * sc))
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    cv2.arrowedLine(frame, p, (p[0] + dx * arm, p[1] + dy * arm),
+                                    (0, 0, 255), th, tipLength=0.45)
                 if _is_hover("kf", kx, ky):
-                    cv2.circle(frame, p, max(16, int(34 * sc)), (0, 255, 255), 3)
+                    cv2.circle(frame, p, max(16, int(40 * sc)), (0, 255, 255), 3)
         # 선수 박스(팀 색) + 레이더
         radar_pts = []
         if si is not None:
@@ -1243,25 +1657,78 @@ class PtzTab(QWidget):
                 for pp in prow:
                     if len(pp) < 4:
                         continue
-                    team = self._teams.get(int(pp[4]), 2) if len(pp) >= 5 else 2
-                    color = TEAM_COLORS[min(max(team, 0), 2)]
+                    team = self._role_of(int(pp[4])) if len(pp) >= 5 else 2
+                    color = TEAM_COLORS[min(max(team, 0), len(TEAM_COLORS) - 1)]
                     x1 = int((pp[0] - pp[2] / 2) * sc)
                     y1 = int((pp[1] - pp[3] / 2) * sc)
                     x2 = int((pp[0] + pp[2] / 2) * sc)
                     y2 = int((pp[1] + pp[3] / 2) * sc)
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color,
                                   max(2, int(4 * sc)))
-            for X, Y, tid, j in ground_positions(prow, self.pano_w, self.pano_h):
-                radar_pts.append((X, Y, self._teams.get(tid, 2)))
+                    tag = ROLE_TAGS.get(team)
+                    if tag:
+                        cv2.putText(frame, tag, (x1, y1 - max(4, int(8 * sc))),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    max(0.5, 1.1 * sc), color,
+                                    max(1, int(3 * sc)))
             ball_g = None
             bb = self.analysis["balls"][si]
-            if bb is not None:
-                g = ground_positions([[bb[0], bb[1], 0.0, 0.0]],
-                                     self.pano_w, self.pano_h)
-                ball_g = (g[0][0], g[0][1]) if g else None
+            if self._field_calib is not None:
+                # 캘리브레이션 완료: 경기장 절대 좌표로 표시
+                feet = [(pp[0], pp[1] + pp[3] / 2.0,
+                         int(pp[4]) if len(pp) >= 5 else -1)
+                        for pp in prow if len(pp) >= 4]
+                if feet:
+                    fc = pano_to_field(self._field_calib,
+                                       [(a, b) for a, b, _ in feet])
+                    for (gx, gy), (_, _, tid) in zip(fc, feet):
+                        if np.isfinite(gx):
+                            radar_pts.append((gx, gy, self._role_of(tid)))
+                if bb is not None:
+                    g = pano_to_field(self._field_calib, [[bb[0], bb[1]]])[0]
+                    if np.isfinite(g[0]):
+                        ball_g = (float(g[0]), float(g[1]))
+            else:
+                for X, Y, tid, j in ground_positions(prow, self.pano_w,
+                                                     self.pano_h):
+                    radar_pts.append((X, Y, self._role_of(tid)))
+                if bb is not None:
+                    g = ground_positions([[bb[0], bb[1], 0.0, 0.0]],
+                                         self.pano_w, self.pano_h)
+                    ball_g = (g[0][0], g[0][1]) if g else None
             self.radar.set_data(radar_pts, ball_g)
         else:
             self.radar.set_data([], None)
+        # 경기장 탭: 랜드마크 마커 + (캘리브레이션 후) 예상 경기장 선
+        if self._field_tab_active() or self.btn_field_pick.isChecked():
+            if self._field_calib is not None:
+                for line in field_outline(*self.field_size):
+                    q = field_to_pano(self._field_calib, line)
+                    seg = []
+                    for qx, qy in list(q) + [(np.nan, np.nan)]:
+                        ok = (np.isfinite(qx)
+                              and -0.2 * self.pano_w <= qx <= 1.2 * self.pano_w
+                              and -0.2 * self.pano_h <= qy <= 1.2 * self.pano_h
+                              and not (seg and abs(qx - seg[-1][0])
+                                       > self.pano_w / 4))   # 랩어라운드 컷
+                        if ok:
+                            seg.append((qx, qy))
+                            continue
+                        if len(seg) >= 2:
+                            arr = np.array([[int(a * sc), int(b * sc)]
+                                            for a, b in seg], np.int32)
+                            cv2.polylines(frame, [arr], False, (255, 255, 255),
+                                          max(1, int(3 * sc)))
+                        seg = [(qx, qy)] if np.isfinite(qx) else []
+            for k, pt in self.field_points.items():
+                q = (int(pt[0] * sc), int(pt[1] * sc))
+                cv2.drawMarker(frame, q, (255, 255, 0),
+                               cv2.MARKER_TILTED_CROSS,
+                               max(14, int(36 * sc)), max(2, int(6 * sc)))
+                cv2.putText(frame, LANDMARK_TAGS[k],
+                            (q[0] + 12, q[1] - 12), cv2.FONT_HERSHEY_SIMPLEX,
+                            max(0.5, 1.0 * sc), (255, 255, 0),
+                            max(1, int(3 * sc)))
         self.pane.set_frame(frame)
 
     # ------------------------------------------------------ 화면 오브젝트 조작
@@ -1273,6 +1740,13 @@ class PtzTab(QWidget):
             self._stop_play()
         f = getattr(self, "_cur_frame_idx", self.slider.value())
         x, y = fx * self.pano_w, fy * self.pano_h
+        if self.btn_field_pick.isChecked():   # 랜드마크 찍기 모드가 우선
+            key = self._match_landmark(x, y)
+            if key is None:
+                self.log("[field] 수평선 위 — 지면 지점을 클릭하세요")
+            else:
+                self._field_set_point(key, x, y)
+            return
         o = self._hit(x, y)
         if o is None:
             if self._box_hit(x, y) is not None:
@@ -1323,6 +1797,31 @@ class PtzTab(QWidget):
             menu.addSeparator()
             menu.addAction("여기 키프레임 추가",
                            lambda: self._add_keyframe(f, x, y))
+        tid = self._player_at(x, y)
+        if tid is not None:
+            menu.addSeparator()
+            sub = menu.addMenu(
+                f"선수 #{tid} ({ROLE_NAMES[self._role_of(tid)]}) 역할 지정")
+            for r in (3, 4, 5, 0, 1):
+                sub.addAction(ROLE_NAMES[r],
+                              lambda _=False, rr=r, t=tid: self._set_role(t, rr))
+            if tid in self.roles:
+                sub.addAction("자동 분류로 되돌리기",
+                              lambda _=False, t=tid: self._set_role(t, None))
+        if self._field_tab_active():
+            menu.addSeparator()
+            sub = menu.addMenu("이 위치를 랜드마크로 지정")
+            for key, name, req in LANDMARKS:
+                mark = "★ " if req else ""
+                cur = " ✓" if key in self.field_points else ""
+                sub.addAction(f"{mark}{name}{cur}",
+                              lambda _=False, kk=key:
+                              self._field_set_point(kk, x, y))
+            for k, p in self.field_points.items():
+                if (p[0] - x) ** 2 + (p[1] - y) ** 2 <= 100.0 ** 2:
+                    menu.addAction(f"랜드마크 [{LANDMARK_TAGS[k]}] 지정 해제",
+                                   lambda _=False, kk=k:
+                                   self._field_remove_point(kk))
         menu.exec(gpos)
 
     def _pane_hover(self, fx, fy):
@@ -1435,6 +1934,7 @@ class PtzTab(QWidget):
     def _plan_done(self, plan, out):
         self.plan = plan
         self.plan_out = out
+        self._box_commit = None          # 새 계획 도착 — 낙관적 박스 해제
         self._redraw()
 
     def _start_link(self):
@@ -1450,12 +1950,314 @@ class PtzTab(QWidget):
     def _link_done(self, linked):
         self._linked = linked
         self._teams = linked.pop("teams", {}) or {}
+        if self.roles and self.analysis is not None:
+            self._teams = classify_teams(self.analysis, roles=self.roles)
         n_team = sum(1 for v in self._teams.values() if v < 2)
         self.log(f"[ptz] 트랙 연결 완료: {len(linked['tracks'])}개"
                  + (f", 팀 분류 선수 ID {n_team}개" if self._teams else
                     " (팀 분류: ID 포함 재분석 필요)"))
+        self._refresh_team_label(log_colors=True)
+        self._refresh_player_list()
         self._recompute_tracks()
         self._plan_dirty()
+
+    # ------------------------------------------------------ 선수(역할) 검수
+    def _player_cache(self):
+        """트랙릿 요약({tid: [f0, f1, n]})·대표색 캐시 — 분석 객체당 1회."""
+        if self.analysis is None:
+            return {}, {}
+        if self._pcache_id != id(self.analysis):
+            spans: dict[int, list] = {}
+            frames = self.analysis["frames"]
+            for si, prow in enumerate(self.analysis["players"]):
+                f = int(frames[si])
+                for p in prow:
+                    if len(p) >= 5 and p[4] >= 0:
+                        e = spans.get(int(p[4]))
+                        if e is None:
+                            spans[int(p[4])] = [f, f, 1]
+                        else:
+                            e[1] = f
+                            e[2] += 1
+            self._pspans = spans
+            self._pcolors = tracklet_colors(self.analysis)
+            self._pcache_id = id(self.analysis)
+        return self._pspans, self._pcolors
+
+    def _role_of(self, tid):
+        return self.roles.get(tid, self._teams.get(tid, 2))
+
+    def _refresh_team_label(self, log_colors=False):
+        """팀/GK/심판별 대표 유니폼 색 범례 (분석 후 '이 팀이 이 색')."""
+        spans, cols = self._player_cache()
+        if not self._teams or not cols:
+            self.lbl_team_colors.setText("팀 색: 분석 후 표시")
+            return
+        parts, logs = [], []
+        for r in (0, 1, 3, 4, 5):
+            member = [t for t in cols
+                      if self._role_of(t) == r and spans.get(t, [0, 0, 0])[2] >= 5]
+            if not member:
+                continue
+            # 대표색: 검출 수 가중 없이 BGR 중앙값 (스와치 용도라 충분)
+            bgr = np.median(np.array(
+                [cv2.cvtColor(np.uint8([[[int(cols[t][0]) % 180,
+                                          int(min(cols[t][1], 255)),
+                                          int(min(cols[t][2], 255))]]]),
+                              cv2.COLOR_HSV2BGR)[0, 0] for t in member]), axis=0)
+            hexc = f"#{int(bgr[2]):02x}{int(bgr[1]):02x}{int(bgr[0]):02x}"
+            parts.append(f"{ROLE_NAMES[r]} <span style='background:{hexc};"
+                         f"color:{hexc}'>&nbsp;██&nbsp;</span>"
+                         f" {len(member)}명")
+            logs.append(f"{ROLE_NAMES[r]} {hexc} ({len(member)}트랙릿)")
+        self.lbl_team_colors.setText("유니폼 색:  " + " &nbsp; ".join(parts)
+                                     if parts else "팀 색: 분석 후 표시")
+        if log_colors and logs:
+            self.log("[ptz] 팀 색 분류: " + ", ".join(logs))
+
+    def _refresh_player_list(self):
+        """선수 트랙릿 목록: 유니폼 색 스와치 + 역할 + 구간 (검출 수 순)."""
+        spans, cols = self._player_cache()
+        self._player_rows = sorted(spans, key=lambda t: -spans[t][2])
+        self.player_list.blockSignals(True)
+        self.player_list.clear()
+        for tid in self._player_rows:
+            f0, f1, n = spans[tid]
+            r = self._role_of(tid)
+            t0, t1 = f0 / self.fps, f1 / self.fps
+            mark = "● " if tid in self.roles else ""
+            it = QListWidgetItem(
+                f"#{tid}  {mark}{ROLE_NAMES[r]}  "
+                f"{int(t0//60):02d}:{t0%60:04.1f}~"
+                f"{int(t1//60):02d}:{t1%60:04.1f}  ({n}회)")
+            if tid in cols:
+                px = QPixmap(14, 14)
+                px.fill(QColor(_hsv_hex(cols[tid])))
+                it.setIcon(QIcon(px))
+            self.player_list.addItem(it)
+        self.player_list.blockSignals(False)
+        self.trackbar.set_players(
+            {t: (spans[t][0], spans[t][1], self._role_of(t)) for t in spans})
+
+    def _goto_player(self):
+        row = self.player_list.currentRow()
+        rows = getattr(self, "_player_rows", [])
+        if 0 <= row < len(rows):
+            spans, _ = self._player_cache()
+            self.slider.setValue(int(spans[rows[row]][0]))
+            self.trackbar.set_selection("player", rows[row])
+
+    def reset_edits(self, scope="all"):
+        """사용자 편집 무효화 → 순수 분석 원본 상태 (분석 메뉴에서 호출).
+
+        분석(.analysis.json)은 검수로 안 바뀌므로 에디트만 지우면 원본이다.
+        """
+        names = {"ball": "공 트랙 편집 (키프레임·무시·승격)",
+                 "roles": "선수 역할 지정",
+                 "field": "경기장 캘리브레이션",
+                 "all": "모든 사용자 편집"}
+        if self.pano_path is None:
+            QMessageBox.information(self, "초기화", "열린 파노라마가 없습니다.")
+            return
+        detail = (f"키프레임 {len(self.keyframes)} / 무시 {len(self.ignores)}"
+                  f" / 승격 {len(self.promotes)} / 역할 {len(self.roles)}"
+                  f" / 랜드마크 {len(self.field_points)}")
+        if QMessageBox.question(
+                self, "분석 원본으로 되돌리기",
+                f"{names[scope]}을(를) 삭제하고 분석 결과 원본으로 "
+                f"되돌립니다.\n(현재: {detail})\n계속할까요?") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        if scope in ("ball", "all"):
+            self.keyframes, self.ignores, self.promotes = [], [], []
+            self._box_commit = None
+        if scope in ("roles", "all"):
+            self.roles = {}
+        if scope in ("field", "all"):
+            self.field_points = {}
+        if self.analysis is not None:
+            self._teams = classify_teams(self.analysis, roles=self.roles)
+        self._write_sidecar()
+        self._refit_field()
+        self._refresh_field_list()
+        self._refresh_team_label()
+        self._refresh_player_list()
+        self._refresh_lists()
+        self._recompute_tracks()
+        self._plan_dirty()
+        self._redraw()
+        self.log(f"[ptz] {names[scope]} 초기화 — 분석 원본 상태로 되돌림")
+
+    def _timeline_pick(self, kind, key):
+        """타임라인 바 클릭 → 해당 목록 선택(→ 프레임 이동)."""
+        if kind in ("kf", "ball"):
+            want = ("kf" if kind == "kf" else "track", key)
+            for row, e in enumerate(getattr(self, "_top", [])):
+                if e == want:
+                    self.track_list.setCurrentRow(row)   # currentRowChanged=이동
+                    return
+            if kind == "kf" and 0 <= key < len(self.keyframes):
+                self.slider.setValue(int(self.keyframes[key][0]))
+        elif kind == "ignore":
+            if 0 <= key < len(self.ignores):
+                self.kf_list.setCurrentRow(key)
+                self.slider.setValue(int(self.ignores[key][0]))
+        elif kind == "player":
+            rows = getattr(self, "_player_rows", [])
+            if key in rows:
+                self.player_list.setCurrentRow(rows.index(key))
+            else:
+                spans, _ = self._player_cache()
+                if key in spans:
+                    self.slider.setValue(int(spans[key][0]))
+
+    def _assign_selected_role(self, role):
+        rows = getattr(self, "_player_rows", [])
+        sel = [rows[i.row()] for i in self.player_list.selectedIndexes()
+               if i.row() < len(rows)]
+        for tid in sel:
+            if role is None:
+                self.roles.pop(tid, None)
+            else:
+                self.roles[tid] = role
+        if sel:
+            self._roles_changed()
+
+    def _set_role(self, tid, role):
+        if role is None:
+            self.roles.pop(int(tid), None)
+        else:
+            self.roles[int(tid)] = int(role)
+        self._roles_changed()
+
+    def _roles_changed(self):
+        if self.analysis is not None:
+            self._teams = classify_teams(self.analysis, roles=self.roles)
+        self._refresh_team_label()
+        self._refresh_player_list()
+        self._save_keyframes()
+        self._redraw()
+
+    # ------------------------------------------------------ 경기장 캘리브레이션
+    def _review_tab_changed(self, idx):
+        if idx != 2:                      # 경기장 탭을 떠나면 찍기 모드 해제
+            self.btn_field_pick.setChecked(False)
+        self._redraw()
+
+    def _field_tab_active(self):
+        return self.tabs_review.currentIndex() == 2
+
+    def _cam_field_pos(self):
+        """카메라의 필드 좌표 (캘리브레이션 전엔 기본 가정값)."""
+        if self._field_calib is not None:
+            return (self._field_calib["ex"], self._field_calib["ey"])
+        return (0.0, -(self.field_size[1] / 2.0 + 5.0))
+
+    def _click_to_field(self, x, y):
+        """클릭 픽셀 → 필드 좌표. 캘리브레이션 전엔 기본 카메라 모델."""
+        if self._field_calib is not None:
+            fx, fy = pano_to_field(self._field_calib, [[x, y]])[0]
+            return (fx, fy) if np.isfinite(fx) else None
+        g = ground_positions([[x, y, 0.0, 0.0]], self.pano_w, self.pano_h)
+        if not g:
+            return None
+        cx, cy = self._cam_field_pos()
+        return (cx + g[0][0], cy + g[0][1])
+
+    def _match_landmark(self, x, y):
+        """클릭 위치를 가장 그럴듯한 랜드마크에 휴리스틱 매칭.
+
+        기본(또는 현재) 카메라 모델로 지면 좌표를 추정해 기대 랜드마크
+        위치와 최근접. 미지정 랜드마크 우선, 전부 지정됐으면 최근접을
+        옮긴다(재클릭 = 수정). 수평선 위 클릭은 None.
+        """
+        f = self._click_to_field(x, y)
+        if f is None:
+            return None
+        pos = landmark_positions(*self.field_size)
+        order = sorted(pos, key=lambda k: (pos[k][0] - f[0]) ** 2
+                       + (pos[k][1] - f[1]) ** 2)
+        for k in order:
+            if k not in self.field_points:
+                return k
+        return order[0]
+
+    def _field_set_point(self, key, x, y):
+        self.field_points[key] = [round(float(x), 1), round(float(y), 1)]
+        self._refit_field(log_result=True)
+        self._save_keyframes()
+        self._refresh_field_list()
+        self._redraw()
+
+    def _field_remove_point(self, key):
+        if self.field_points.pop(key, None) is not None:
+            self._refit_field()
+            self._save_keyframes()
+            self._refresh_field_list()
+            self._redraw()
+
+    def _field_clear_selected(self):
+        row = self.field_list.currentRow()
+        if 0 <= row < len(LANDMARKS):
+            self._field_remove_point(LANDMARKS[row][0])
+
+    def _field_size_changed(self, _v=None):
+        self.field_size = [self.spin_field_len.value(),
+                           self.spin_field_w.value()]
+        self._refit_field()
+        self._save_keyframes()
+        self._redraw()
+
+    def _refresh_field_list(self):
+        row = self.field_list.currentRow()
+        self.field_list.clear()
+        for key, name, req in LANDMARKS:
+            p = self.field_points.get(key)
+            mark = "★" if req else "☆"
+            where = f"({p[0]:.0f}, {p[1]:.0f})" if p else "— 미지정"
+            self.field_list.addItem(
+                f"{mark} [{LANDMARK_TAGS[key]}] {name}  {where}")
+        if row >= 0:
+            self.field_list.setCurrentRow(row)
+
+    def _refit_field(self, log_result=False):
+        self._field_calib = None
+        if self.pano_w and len(self.field_points) >= 4:
+            self._field_calib = fit_field_calibration(
+                self.field_points, self.pano_w, self.pano_h,
+                length=self.field_size[0], width=self.field_size[1])
+        c = self._field_calib
+        if c is not None:
+            msg = (f"캘리브레이션 OK — {c['n_points']}점, 잔차 "
+                   f"{c['rms']:.1f}px, 카메라 높이 {c['h']:.1f}m, "
+                   f"터치라인까지 {-(c['ey'] + c['width']/2):.1f}m")
+        elif len(self.field_points) >= 4:
+            msg = "캘리브레이션 실패 — 점 위치를 확인하세요"
+        else:
+            msg = (f"{len(self.field_points)}/8점 — 최소 4점 필요 "
+                   "(★ 먼쪽 코너 포함 권장)")
+        self.lbl_field_status.setText(msg)
+        if log_result:
+            self.log(f"[field] {msg}")
+        self.radar.set_field(
+            {"length": self.field_size[0], "width": self.field_size[1],
+             "cam": self._cam_field_pos()} if c is not None else None)
+
+    def _player_at(self, x, y):
+        """(x, y)를 포함하는 현재 샘플의 선수 박스 track id (없으면 None)."""
+        si = self._current_sample()
+        if self.analysis is None or si is None:
+            return None
+        best, bestd = None, None
+        for p in self.analysis["players"][si]:
+            if len(p) < 5 or p[4] < 0:
+                continue
+            if (abs(x - p[0]) <= p[2] / 2 + 10
+                    and abs(y - p[1]) <= p[3] / 2 + 10):
+                d = (x - p[0]) ** 2 + (y - p[1]) ** 2
+                if best is None or d < bestd:
+                    best, bestd = int(p[4]), d
+        return best
 
     def _recompute_tracks(self):
         """수락 트랙 구간 재계산 → 트랙바 갱신 (분석/무시 구간 변경 시).
@@ -1471,7 +2273,8 @@ class PtzTab(QWidget):
                 force_ranges=[tuple(p) for p in self.promotes],
                 linked=self._linked, log=self.log)
         self.trackbar.set_data(self.total, self.track_spans,
-                               self.ignores, self.keyframes)
+                               self.ignores, self.keyframes,
+                               promotes=self.promotes)
         self._refresh_track_list()
         self._plan_dirty()
 
@@ -1517,7 +2320,8 @@ class PtzTab(QWidget):
             self._save_keyframes()
             self._refresh_lists()
             self.trackbar.set_data(self.total, self.track_spans,
-                                   self.ignores, self.keyframes)
+                                   self.ignores, self.keyframes,
+                                   promotes=self.promotes)
             self._plan_dirty()
             self._redraw()
 

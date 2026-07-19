@@ -314,13 +314,25 @@ def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
             "players": players}
 
 
-def classify_teams(analysis, k=3):
-    """트랙릿(선수 ID)별 유니폼 색으로 팀 분류.
+# 역할 번호: classify_teams 반환값과 GUI 색상 테이블이 공유하는 규약.
+ROLE_TEAM0, ROLE_TEAM1, ROLE_OTHER = 0, 1, 2
+ROLE_GK0, ROLE_GK1, ROLE_REF = 3, 4, 5
+
+
+def classify_teams(analysis, k=3, roles=None):
+    """트랙릿(선수 ID)별 유니폼 색으로 팀/역할 분류.
 
     분석의 선수 행이 [cx,cy,w,h,id,h,s,v] 형식일 때만 동작. 특징은
     채도로 가중한 색상 벡터 (s·cos h, s·sin h, v) 의 트랙릿 중앙값.
     farthest-point 초기화 k-means (k=3) → 검출 수 기준 상위 2개 군집이
-    팀 0/1, 나머지는 2(심판·GK 등). 반환: {track_id: 팀번호}.
+    팀 0/1, 나머지는 2(심판·GK 등).
+
+    roles({track_id: 역할번호}, ROLE_*)가 주어지면 사용자 시드로 역할을
+    전파한다: 시드 트랙릿들의 색 중앙값을 역할 센터로 삼고, 자기 기본
+    군집 중심보다 그 센터가 더 가까운 트랙릿에 역할을 부여한다 (GK·심판은
+    필드 플레이어와 다른 색 옷이므로 시드 한 명이면 ID가 갈라져도 같은
+    사람/역할의 다른 트랙릿까지 잡힌다). 시드 자신은 무조건 그 역할.
+    반환: {track_id: 역할번호}.
     """
     feats: dict[int, list] = {}
     for prow in analysis["players"]:
@@ -353,7 +365,57 @@ def classify_teams(analysis, k=3):
     sizes = [n_det[lab == j].sum() for j in range(k)]
     order = np.argsort(sizes)[::-1]
     remap = {int(order[r]): min(r, 2) for r in range(k)}
-    return {t: remap[int(l)] for t, l in zip(ids, lab)}
+    base = {t: remap[int(l)] for t, l in zip(ids, lab)}
+    if not roles:
+        return base
+    pos = {t: i for i, t in enumerate(ids)}
+    seed_feats: dict[int, list] = {}
+    for t, r in roles.items():
+        if int(t) in pos:
+            seed_feats.setdefault(int(r), []).append(X[pos[int(t)]])
+    role_C = {r: np.median(np.array(v), axis=0)
+              for r, v in seed_feats.items()}
+    base_C = {remap[j]: X[lab == j].mean(0)
+              for j in range(k) if np.any(lab == j)}
+    team_C = [base_C[j] for j in (0, 1) if j in base_C]
+    out = {}
+    for t in ids:
+        x = X[pos[t]]
+        d_team = (min(np.linalg.norm(x - c) for c in team_C)
+                  if team_C else np.inf)
+        best_r, best_d = None, np.inf
+        for r, c in role_C.items():
+            d = np.linalg.norm(x - c)
+            if d < best_d:
+                best_r, best_d = r, d
+        # 시드 역할 색이 어느 팀 색보다 가까우면 그 역할 — GK/심판은 팀과
+        # 다른 색 옷이라는 전제. 아니면 기본 군집 결과 유지.
+        out[t] = int(best_r) if best_d < d_team else base[t]
+    for t, r in roles.items():              # 시드는 색과 무관하게 확정
+        if int(t) in pos:
+            out[int(t)] = int(r)
+    return out
+
+
+def tracklet_colors(analysis):
+    """트랙릿별 유니폼 대표색 {track_id: (h, s, v)} (OpenCV 스케일).
+
+    H 는 원형(빨강이 0/180 경계에 걸침)이라 채널별 중앙값 대신
+    classify_teams 와 같은 s-가중 벡터의 중앙값을 취해 되돌린다.
+    """
+    feats: dict[int, list] = {}
+    for prow in analysis["players"]:
+        for p in prow:
+            if len(p) >= 8 and p[4] >= 0:
+                a = p[5] / 90.0 * np.pi
+                feats.setdefault(int(p[4]), []).append(
+                    (p[6] * np.cos(a), p[6] * np.sin(a), p[7]))
+    out = {}
+    for t, v in feats.items():
+        cx, cy, vv = np.median(np.array(v), axis=0)
+        h = (np.arctan2(cy, cx) % (2 * np.pi)) * 90.0 / np.pi
+        out[t] = (float(h), float(min(np.hypot(cx, cy), 255.0)), float(vv))
+    return out
 
 
 def ground_positions(players_row, pano_w, pano_h, cam_height=4.0,

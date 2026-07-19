@@ -239,6 +239,55 @@ def test_classify_teams_by_kit_color():
     assert teams[30] == 2                                # 심판은 기타
 
 
+def test_classify_teams_role_seeds_propagate():
+    """GK/심판 시드 지정 → 같은 색 옷의 다른 트랙릿에 역할 전파."""
+    from pystitch.core.ptz import classify_teams
+    frames = list(range(0, 300, 3))
+    rng = np.random.default_rng(3)
+    def det(tid, h, s, v):
+        return [1000.0, 900.0, 40.0, 90.0, tid,
+                h + rng.normal(0, 3), s + rng.normal(0, 8), v + rng.normal(0, 8)]
+    players = []
+    for _ in frames:
+        row = []
+        for tid in range(0, 8):
+            row.append(det(tid, 120, 180, 150))    # 팀A: 파랑
+        for tid in range(10, 18):
+            row.append(det(tid, 3, 190, 160))      # 팀B: 빨강
+        row.append(det(20, 60, 200, 180))          # GK A: 초록 (ID 2개로 갈라짐)
+        row.append(det(21, 60, 200, 180))
+        row.append(det(22, 150, 190, 170))         # GK B: 보라 (ID 2개)
+        row.append(det(23, 150, 190, 170))
+        row.append(det(30, 25, 210, 210))          # 심판: 노랑
+        players.append(row)
+    a = _analysis(frames, [None] * len(frames), players)
+    # 시드: GK A=20, GK B=22, 심판=30 만 지정 — 21/23 은 색으로 전파돼야 함
+    teams = classify_teams(a, roles={20: 3, 22: 4, 30: 5})
+    assert teams[20] == 3 and teams[21] == 3             # 같은 초록 → GK A
+    assert teams[22] == 4 and teams[23] == 4             # 같은 보라 → GK B
+    assert teams[30] == 5
+    ta = {teams[t] for t in range(0, 8)}
+    tb = {teams[t] for t in range(10, 18)}
+    assert ta | tb == {0, 1} and ta != tb                # 필드 플레이어는 그대로
+    # 시드 없이 부르면 기존 0/1/2 동작 유지
+    base = classify_teams(a)
+    assert set(base.values()) <= {0, 1, 2}
+
+
+def test_tracklet_colors_circular_hue():
+    """유니폼 대표색: H 0/180 경계(빨강)에서도 중앙값이 튀지 않는다."""
+    from pystitch.core.ptz import tracklet_colors
+    frames = list(range(0, 60, 3))
+    players = []
+    for i, _ in enumerate(frames):
+        h = 178.0 if i % 2 == 0 else 2.0     # 경계 양쪽을 오가는 빨강
+        players.append([[1000.0, 900.0, 40.0, 90.0, 7, h, 200.0, 150.0]])
+    a = _analysis(frames, [None] * len(frames), players)
+    h, s, v = tracklet_colors(a)[7]
+    assert h <= 5.0 or h >= 175.0                        # 빨강 근방 유지
+    assert 150 <= s <= 210 and 130 <= v <= 170
+
+
 def test_ground_positions_geometry():
     """지면 투영 기하: 화면 중앙 열은 X=0, 아래 행일수록 가깝고 대칭."""
     from pystitch.core.ptz import ground_positions

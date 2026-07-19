@@ -86,6 +86,16 @@ class MainWindow(QMainWindow):
         m.addAction("프로젝트 다른 이름으로 저장...", lambda: self._save_project(as_new=True))
         m.addSeparator()
         m.addAction("종료", self.close)
+        a = self.menuBar().addMenu("분석(&A)")
+        a.addAction("공/키프레임 편집 초기화",
+                    lambda: self.ptz_tab.reset_edits("ball"))
+        a.addAction("선수 역할 지정 초기화",
+                    lambda: self.ptz_tab.reset_edits("roles"))
+        a.addAction("경기장 캘리브레이션 초기화",
+                    lambda: self.ptz_tab.reset_edits("field"))
+        a.addSeparator()
+        a.addAction("모든 사용자 편집 초기화 (분석 원본으로)",
+                    lambda: self.ptz_tab.reset_edits("all"))
         self._rebuild_recent_menu()
 
     # ------------------------------------------------------------ 최근 프로젝트
