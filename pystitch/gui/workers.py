@@ -1,19 +1,13 @@
 """백그라운드 워커 스레드 (동기화, 정합, 미리보기, 내보내기)."""
 from __future__ import annotations
 
-import queue
-import subprocess
-import tempfile
-import threading
 import time
-from pathlib import Path
 
-import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from ..core.align import Alignment, estimate_alignment
 from ..core.chapters import ChapteredVideo
-from ..core.encoders import encoder_args, ffmpeg_bin
+from ..core.export import export_pano
 from ..core.lens import LensProfile
 from ..core.render import Renderer
 from ..core.sync import estimate_offset
@@ -146,174 +140,21 @@ class ExportWorker(QThread):
 
     def run(self):
         try:
-            self._run()
+            out = export_pano(
+                self.lens, self.segments, self.left_files, self.right_files,
+                self.offset, self.t_start, self.t_end, self.out_path,
+                pitch_user=self.user[0], roll_user=self.user[1],
+                yaw_user=self.user[2],
+                codec=self.codec, crf=self.crf, scale=self.scale,
+                feather_px=self.feather_px, ptz=self.ptz,
+                persp_k=self.persp[0], persp_m=self.persp[1],
+                el0=self.el[0], el1=self.el[1],
+                progress=self.progress.emit,
+                log=self.log.emit,
+                cancel=lambda: self._cancel)
+            self.finished_ok.emit(out)
         except Exception as e:  # noqa: BLE001
             self.failed.emit(str(e))
-
-    def _run(self):
-        vid_l = ChapteredVideo(self.left_files)
-        vid_r = ChapteredVideo(self.right_files)
-        fps = vid_l.fps
-        f_start = int(round(self.t_start * fps))
-        f_end = min(int(round(self.t_end * fps)), vid_l.total_frames)
-        r_start = int(round((self.t_start + self.offset) * fps))
-        total = max(0, f_end - f_start)
-        if total == 0:
-            raise RuntimeError("내보낼 구간이 비어 있음")
-
-        def segment_index_at(t: float) -> int:
-            idx = 0
-            for i, s in enumerate(self.segments):
-                if s["start_sec"] <= t + 1e-6:
-                    idx = i
-            return idx
-
-        # 모든 세그먼트가 같은 출력 크기를 갖도록 yaw 범위 폭은 첫 세그먼트 기준 고정
-        first_a = self.segments[segment_index_at(self.t_start)]["alignment"]
-        w0, w1 = first_a.window(self.user[2])
-        half_range = (w1 - w0) / 2
-
-        def make_renderer(alignment, img_l, img_r) -> Renderer:
-            R_wl, R_wr = alignment.rotations(self.user[0], self.user[1])
-            yaw_c = alignment.yaw_auto + np.deg2rad(self.user[2])
-            el0 = self.el[0] if self.el[0] is not None else alignment.el0
-            el1 = self.el[1] if self.el[1] is not None else alignment.el1
-            r = Renderer(self.lens, R_wl, R_wr, yaw_c - half_range, yaw_c + half_range,
-                         el0, el1,
-                         scale=self.scale, feather_px=self.feather_px,
-                         persp_k=self.persp[0], persp_m=self.persp[1])
-            r.set_gains_from(img_l, img_r)
-            r.refine_seam(img_l, img_r, log=lambda s: self.log.emit(s))
-            return r
-
-        self.log.emit("정합 렌더러 준비 중...")
-        ok_l, img_l = vid_l.read_at(f_start)
-        ok_r, img_r = vid_r.read_at(r_start)
-        if not (ok_l and ok_r):
-            raise RuntimeError("시작 프레임 읽기 실패")
-        seg_idx = segment_index_at(self.t_start)
-        rend = make_renderer(self.segments[seg_idx]["alignment"], img_l, img_r)
-        pano_w, pano_h = rend.out_w, rend.out_h
-        out_w, out_h = pano_w, pano_h
-
-        vptz = None
-        if self.ptz:
-            from ..core.ptz import VirtualPTZ
-            self.log.emit("가상 PTZ 초기화 (YOLO 로드)...")
-            vptz = VirtualPTZ(pano_w, pano_h)
-            out_w, out_h = vptz.out_w, vptz.out_h
-        # 이번 내보내기 구간 안에 있는 이후 세그먼트 경계 (절대 프레임 번호)
-        pending = [(int(round(s["start_sec"] * fps)), i)
-                   for i, s in enumerate(self.segments)
-                   if i > seg_idx and s["start_sec"] < self.t_end]
-
-        # 오디오: 좌측 챕터 체인을 concat demuxer 로 연결
-        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tf:
-            for f in self.left_files:
-                tf.write(f"file '{Path(f).as_posix()}'\n")
-            concat_list = tf.name
-
-        duration = total / fps
-        cmd = ([ffmpeg_bin(), "-y", "-v", "error",
-                "-f", "rawvideo", "-pix_fmt", "bgr24",
-                "-s", f"{out_w}x{out_h}", "-r", f"{fps}", "-i", "-",
-                "-f", "concat", "-safe", "0", "-ss", f"{self.t_start}",
-                "-t", f"{duration}", "-i", concat_list,
-                "-map", "0:v", "-map", "1:a?"]
-               + encoder_args(self.codec, self.crf)
-               + ["-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", self.out_path])
-        enc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-
-        # 3단 파이프라인: 읽기 → 렌더(이 스레드) → 인코더 쓰기
-        vid_l.seek_frame(f_start)
-        vid_r.seek_frame(r_start)
-        q_in: queue.Queue = queue.Queue(maxsize=4)
-        q_out: queue.Queue = queue.Queue(maxsize=4)
-
-        def reader():
-            for _ in range(total):
-                if self._cancel:
-                    break
-                ok_l, im_l = vid_l.read()
-                ok_r, im_r = vid_r.read()
-                if not (ok_l and ok_r):
-                    break
-                q_in.put((im_l, im_r))
-            q_in.put(None)
-
-        def writer():
-            while True:
-                buf = q_out.get()
-                if buf is None:
-                    break
-                try:
-                    enc.stdin.write(buf)
-                except BrokenPipeError:
-                    self._cancel = True
-                    break
-
-        self.log.emit(f"인코딩 시작: {total}프레임 ({total/fps/60:.1f}분 분량)")
-        t_reader = threading.Thread(target=reader, daemon=True)
-        t_writer = threading.Thread(target=writer, daemon=True)
-        t_reader.start()
-        t_writer.start()
-
-        t0 = time.perf_counter()
-        last_log = t0
-        done = 0
-        try:
-            while True:
-                if self._cancel:
-                    self.log.emit("사용자 취소")
-                    break
-                item = q_in.get()
-                if item is None:
-                    break
-                abs_frame = f_start + done
-                if pending and abs_frame >= pending[0][0]:
-                    _, si = pending.pop(0)
-                    t_seg = self.segments[si]["start_sec"]
-                    self.log.emit(f"[segment] {t_seg:.1f}s 경계 — 렌더러 재구성")
-                    rend = make_renderer(self.segments[si]["alignment"], *item)
-                    if (rend.out_w, rend.out_h) != (pano_w, pano_h):
-                        raise RuntimeError("세그먼트 출력 크기 불일치")
-                frame = rend.render(*item)
-                if vptz is not None:
-                    frame = vptz.process(frame)
-                q_out.put(frame.tobytes())
-                done += 1
-                if done % 30 == 0:
-                    now = time.perf_counter()
-                    fps_now = done / (now - t0)
-                    self.progress.emit(done, total, fps_now)
-                    if now - last_log >= 15:   # 로그 창에도 주기적으로 생존 신고
-                        last_log = now
-                        remain = (total - done) / max(fps_now, 1e-9) / 60
-                        self.log.emit(
-                            f"[export] {done}/{total} ({done/total:.0%}) "
-                            f"{fps_now:.1f}fps, 남은 시간 {remain:.0f}분")
-        finally:
-            # reader 가 가득 찬 큐에 막혀 있지 않도록 비운 뒤 종료 대기
-            while not q_in.empty():
-                try:
-                    q_in.get_nowait()
-                except queue.Empty:
-                    break
-            t_reader.join(timeout=10)
-            q_out.put(None)
-            t_writer.join(timeout=60)
-            enc.stdin.close()
-            enc.wait()
-            vid_l.release()
-            vid_r.release()
-            Path(concat_list).unlink(missing_ok=True)
-
-        if self._cancel:
-            self.failed.emit("취소됨")
-        else:
-            el = time.perf_counter() - t0
-            self.log.emit(f"완료: {done} 프레임 / {el:.0f}s = {done/max(el,1e-9):.2f} fps")
-            self.finished_ok.emit(self.out_path)
 
 
 class PlaybackWorker(QThread):
