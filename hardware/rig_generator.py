@@ -58,6 +58,22 @@ TAB_BUMP_H = 2.0    # snap bump height above the floor
 ROOF_HOLE_W = 36.0  # roof finger-hole width (shutter button access)
 ROOF_HOLE_D = 20.0  # roof finger-hole depth
 
+# Thermal canopy (v6): elevated sunshade with a convection air gap.
+# A flush roof (v4/v5) soaks sun and conducts onto the camera top; an 8K-class
+# body (Ace Pro 2 candidate) throttles on heat, so the canopy floats above the
+# rails leaving an open channel on all four sides for airflow.
+CANOPY_GAP = 18.0    # air gap between rail tops and canopy underside
+CANOPY_T = 2.4       # canopy plate thickness (thin = low thermal mass)
+CANOPY_OVH = 12.0    # outboard/rear overhang beyond the footprint
+CANOPY_OVH_IN = 2.0  # inboard overhang (packing: cradles sit CAM_GAP apart)
+CANOPY_OVH_F = 6.0   # front overhang (limited — lens looks forward)
+CANOPY_VENT_W = 6.0  # rising-air vent slot width (near the side walls)
+# FOV clearance margins (HERO5 4K 16:9 wide ≈ 118°×69.5°): a canopy point
+# only matters if it is inside the horizontal FOV; there it must sit above
+# the vertical half-FOV. Both padded for the fisheye corner bulge.
+VFOV_HALF_DEG = 35.0
+HFOV_HALF_DEG = 65.0
+
 # Lens position within the body (HERO5 Black; lens sits in a top corner).
 # Confirmed: seen from behind, the lens is on the body's LEFT side
 # (front view: right). In cradle coords (+y forward, z up) that is -x.
@@ -149,7 +165,7 @@ def build_cradle_toploader():
     return union(parts), []
 
 
-def build_cradle_rearload(roof=False):
+def build_cradle_rearload(roof=False, canopy=False):
     """Camera faces +y, z up, origin at floor center; slides in from the back.
 
     Fully open back (touchscreen unobstructed), open top between two side
@@ -198,6 +214,72 @@ def build_cradle_rearload(roof=False):
                    -ROOF_HOLE_D / 2, ROOF_HOLE_D / 2,
                    z_top - 1, z_top + WALL + 1)
         parts.append(difference(plate, [hole]))
+
+    # thermal canopy (v6): an overhanging thin plate floats on raised side
+    # walls — the air gap keeps convection alive on all four sides while the
+    # overhang shades direct sun (and doubles as a lens hood). Integrated for
+    # now; a slide-on detachable variant (midsummer only) is a follow-up.
+    #
+    # canopy="top": plate above the rails — for the upright (right) camera.
+    # canopy="bottom": mirrored below the floor — the lens-inward placement
+    #   mounts the LEFT camera upside-down, so its sky-facing surface after
+    #   the flip is the cradle floor; the shade must hang under it locally.
+    # Inboard (-x) overhang is minimal so the v3-style tight packing holds.
+    if canopy:
+        if canopy is True or canopy == "top":
+            z_wall0, z_wall1 = z_top, z_top + CANOPY_GAP
+            z_pl0, z_pl1 = z_wall1, z_wall1 + CANOPY_T
+        else:                                   # "bottom" (좌측 뒤집힘용)
+            z_wall0, z_wall1 = -CANOPY_GAP, 0.0
+            z_pl0, z_pl1 = z_wall0 - CANOPY_T, z_wall0
+        for sx in (-1, 1):
+            x0, x1 = sorted((sx * ow / 2, sx * (ow / 2 - WALL)))
+            parts.append(box(x0, x1, y_rear, y_front_in + WALL,
+                             z_wall0, z_wall1))
+        plate = box(-ow / 2 - CANOPY_OVH_IN, ow / 2 + CANOPY_OVH,
+                    y_rear - CANOPY_OVH, y_front_in + WALL + CANOPY_OVH_F,
+                    z_pl0, z_pl1)
+        cut = []
+        if canopy is True or canopy == "top":   # shutter finger hole
+            cut.append(box(-ROOF_HOLE_W / 2, ROOF_HOLE_W / 2,
+                           -ROOF_HOLE_D / 2, ROOF_HOLE_D / 2,
+                           z_pl0 - 1, z_pl1 + 1))
+        for sx in (-1, 1):                       # rising-air vents
+            xc = sx * (iw / 2 - CANOPY_VENT_W)
+            cut.append(box(xc - CANOPY_VENT_W / 2, xc + CANOPY_VENT_W / 2,
+                           y_rear + 6, y_front_in - 6,
+                           z_pl0 - 1, z_pl1 + 1))
+        parts.append(difference(plate, cut))
+        # FOV clearance: sample the canopy plate perimeter from the lens
+        # (camera looks +y; canopy tilts with it). A point matters only when
+        # its azimuth is inside the horizontal FOV — there it must clear the
+        # vertical half-FOV (above for "top", below for "bottom"). Padded for
+        # the fisheye corner bulge.
+        lens = np.array([LENS_X, idp / 2,
+                         FLOOR + FIT_CLR / 2 + CAM_H - LENS_TOP])
+        z_near = z_pl0 if canopy in (True, "top") else z_pl1
+        xs = np.linspace(-ow / 2 - CANOPY_OVH_IN, ow / 2 + CANOPY_OVH, 60)
+        yf = y_front_in + WALL + CANOPY_OVH_F
+        edge = ([(x, yf) for x in xs]
+                + [(-ow / 2 - CANOPY_OVH_IN, y) for y in
+                   np.linspace(y_rear, yf, 30)]
+                + [(ow / 2 + CANOPY_OVH, y) for y in
+                   np.linspace(y_rear, yf, 30)])
+        worst = 90.0
+        for ex, ey in edge:
+            d = np.array([ex, ey, z_near]) - lens
+            if d[1] <= 0:                       # 렌즈 뒤쪽 — 비가시
+                continue
+            az = np.degrees(np.arctan2(abs(d[0]), d[1]))
+            if az > HFOV_HALF_DEG:              # 수평 화각 밖 — 비가시
+                continue
+            elev = np.degrees(np.arctan2(d[2], np.hypot(d[0], d[1])))
+            clear = elev if canopy in (True, "top") else -elev
+            worst = min(worst, clear)
+        print(f"  canopy FOV clearance ({canopy}): min in-FOV margin "
+              f"{worst:.1f} deg (needs > {VFOV_HALF_DEG:.0f})")
+        if worst <= VFOV_HALF_DEG:
+            raise RuntimeError("canopy intrudes into the lens FOV")
 
     # floor snap tab: bump with an insertion ramp, stop face behind the camera
     y_stop = y_rear - 0.1
@@ -302,7 +384,8 @@ def build_rig(cradle, local_cutters):
     return difference(rig, [hole, nut] + cutters), extrinsic
 
 
-def build_rig_lens_inward(cradle, local_cutters, pitch_deg=PITCH_DOWN_DEG):
+def build_rig_lens_inward(cradle, local_cutters, pitch_deg=PITCH_DOWN_DEG,
+                          cradle_left=None):
     """v3 placement: both cameras still aim outward (±yaw/2) but the LEFT
     camera is mounted upside-down (roll 180°). The HERO5 lens sits in a body
     corner (behind-view left), so flipping the left camera puts both lens
@@ -322,9 +405,8 @@ def build_rig_lens_inward(cradle, local_cutters, pitch_deg=PITCH_DOWN_DEG):
 
     flipT = trimesh.transformations.rotation_matrix(np.pi, (0, 1, 0),
                                                     point=(0, 0, zc))
-    lo, hi = cradle.bounds
-    corners = np.array([(x, y, z) for x in (lo[0], hi[0])
-                        for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
+    cradles = {-1: cradle_left if cradle_left is not None else cradle,
+               1: cradle}
 
     placed, wedge_pts, lens_axes, lens_pts, cutters = [], [], [], [], []
     lifts, rots = [], []
@@ -334,7 +416,8 @@ def build_rig_lens_inward(cradle, local_cutters, pitch_deg=PITCH_DOWN_DEG):
         if side < 0:  # left camera rides upside-down (lens moves inboard)
             R = R @ flipT
         rots.append(R)
-        lifts.append(-trimesh.transform_points(cradle.vertices, R)[:, 2].min())
+        lifts.append(-trimesh.transform_points(
+            cradles[side].vertices, R)[:, 2].min())
 
     # equalize lens heights by raising whichever side sits lower
     lz = [trimesh.transform_points(lens_local, rots[i])[0][2] + lifts[i]
@@ -343,14 +426,15 @@ def build_rig_lens_inward(cradle, local_cutters, pitch_deg=PITCH_DOWN_DEG):
 
     for i, side in enumerate((-1, 1)):
         R = rots[i]
-        verts = trimesh.transform_points(cradle.vertices, R)
+        cr = cradles[side]
+        verts = trimesh.transform_points(cr.vertices, R)
         if side < 0:
             dx = -CAM_GAP / 2 - verts[:, 0].max()
         else:
             dx = CAM_GAP / 2 - verts[:, 0].min()
         L = trimesh.transformations.translation_matrix(
             (dx, 0, lifts[i] + extra[i])) @ R
-        m = cradle.copy()
+        m = cr.copy()
         m.apply_transform(L)
         placed.append(m)
         lens_axes.append(R[:3, :3] @ np.array([0.0, 1.0, 0.0]))
@@ -359,6 +443,9 @@ def build_rig_lens_inward(cradle, local_cutters, pitch_deg=PITCH_DOWN_DEG):
             cutters.append(c.copy().apply_transform(L))
 
         # wedge under the lowest bbox face of the placed cradle
+        lo, hi = cr.bounds
+        corners = np.array([(x, y, z) for x in (lo[0], hi[0])
+                            for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
         c8 = trimesh.transform_points(corners, L)
         bottom4 = c8[np.argsort(c8[:, 2])[:4]]
         shadow = bottom4.copy()
@@ -366,8 +453,10 @@ def build_rig_lens_inward(cradle, local_cutters, pitch_deg=PITCH_DOWN_DEG):
         placed.append(hull(np.vstack([bottom4, shadow])))
         wedge_pts.append(shadow[:, :2])
 
-    left, right = union(placed[:2]), union(placed[2:])
-    if trimesh.boolean.intersection([left, right], engine="manifold").volume > 1e-6:
+    # 크래들끼리만 검사 — 웻지는 중앙에서 겹쳐도 union 되므로 무해
+    # (v6 캐노피 bbox 가 커져 웻지 풋프린트가 중심선을 살짝 넘는다)
+    if trimesh.boolean.intersection([placed[0], placed[2]],
+                                    engine="manifold").volume > 1e-6:
         raise RuntimeError("cradles intersect — increase CAM_GAP")
 
     a, b = lens_axes
@@ -540,3 +629,22 @@ if __name__ == "__main__":
          rig_builder=lambda c, cu: build_rig_lens_inward(c, cu, pitch_deg=28.0),
          deployment=DEPLOY_CLOSE | {
              "status": "recommended for the 1 m-setback venue"})
+    emit("GP5-DUAL-v6", "v5 aim (pitch 28) with the flush roof replaced by "
+         "an elevated thermal canopy: 18 mm convection air gap on raised "
+         "side walls, 12 mm outboard/rear + 6 mm front sun overhang (lens "
+         "hood effect), rising-air vent slots. The upside-down LEFT cradle "
+         "carries its canopy under the floor so it faces the sky after the "
+         "flip. Summer/8K-thermal prep — integrated; detachable slide-on "
+         "variant planned",
+         lambda: build_cradle_rearload(canopy="top"),
+         rig_builder=lambda c, cu: build_rig_lens_inward(
+             c, cu, pitch_deg=28.0,
+             cradle_left=build_cradle_rearload(canopy="bottom")[0]),
+         deployment=DEPLOY_CLOSE | {
+             "status": "recommended for summer sessions (thermal); "
+                       "same aim as v5",
+             "thermal_note": "flush roofs (v4/v5) soak sun onto the camera "
+                             "top; the canopy shades it while the air gap "
+                             "keeps convection alive — groundwork for "
+                             "8K-class bodies (Ace Pro 2 candidate) that "
+                             "throttle on heat"})
