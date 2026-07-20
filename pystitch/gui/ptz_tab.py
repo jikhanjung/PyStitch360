@@ -86,6 +86,7 @@ class TimelineView(QWidget):
 
     seek = pyqtSignal(int)
     pick = pyqtSignal(str, int)      # ("kf"|"ball"|"ignore"|"player", 키)
+    angle_pick = pyqtSignal(int)     # 앵글 레인 클릭 (alt 인덱스) — 카메라 전환
     range_menu = pyqtSignal(int, object)   # 우클릭: (프레임, 전역 좌표)
     view_changed = pyqtSignal(float, float, int)   # (t0, 보이는 폭, total)
 
@@ -131,7 +132,9 @@ class TimelineView(QWidget):
         self.airborne = []           # [(f0, f1, apex_z)] 공중 구간
         self.highlights = []         # [(f0, f1, state, label)] 하이라이트 구간
         self.pauses = []             # [(f0, f1)] 경기 중단 (시계 정지) 구간
-        self.coverage = []           # [(f0, f1, label)] 멀티캠 alt 커버리지 (P07)
+        # 멀티캠 앵글 레인 (P07): [{label, span:(f0,f1), whistles:[(t0,t1,db)]}]
+        # whistles 는 primary 초 단위 (시계 모델 변환 후)
+        self.angles = []
         self.role_palette = {}       # {역할: BGR} 실측/지정 팀 색 (바 색)
         self._press = None
         self._resize = None          # 레인 경계 드래그 상태
@@ -159,9 +162,20 @@ class TimelineView(QWidget):
         self.pauses = list(pauses)
         self.update()
 
-    def set_coverage(self, spans):
-        """멀티캠 alt 커버리지 [(f0, f1, label)] — 눈금자 아래 청록 스트립."""
-        self.coverage = list(spans)
+    def set_angles(self, angles):
+        """멀티캠 앵글 레인 구성 — 카메라별 레인이 기본 레인 뒤에 붙는다.
+
+        각 레인: 커버리지 밴드 + 그 카메라의 호각 마커 (primary 시간축
+        변환) — primary 호각 레인과의 정렬이 동기화 육안 검증이 된다.
+        클릭 = 시크 + 해당 카메라로 전환 (angle_pick).
+        """
+        self.angles = list(angles or [])
+        base_n = len(self.LANES)
+        self.lanes = self.lanes[:base_n] + \
+            [a["label"] for a in self.angles]
+        self.lane_h = self.lane_h[:base_n] + \
+            [self.LANE_H] * len(self.angles)
+        self._apply_height()
         self.update()
 
     def set_role_palette(self, palette):
@@ -477,19 +491,30 @@ class TimelineView(QWidget):
                            QColor(150, 150, 160, 45))
                 p.setPen(QColor(170, 170, 180))
                 p.drawText(max(x0_, self.GUTTER) + 3, self.RULER + 11, "II")
-        # 멀티캠 alt 커버리지: 눈금자 바로 아래 청록 스트립 (P07)
-        if self.coverage and self.total > 1:
-            for i, (f0, f1, label) in enumerate(self.coverage):
+        # 멀티캠 앵글 레인 (P07): 커버리지 밴드 + 그 카메라 호각 마커
+        # (primary 시간축 변환) — primary 호각 레인과 정렬 = 동기화 육안 검증
+        if self.angles and self.total > 1:
+            for i, ang in enumerate(self.angles):
+                y, lh = self._lane_rect(len(self.LANES) + i)
+                f0, f1 = ang["span"]
                 x0_ = self._x(max(0, f0))
                 x1_ = self._x(min(self.total - 1, f1))
-                if x1_ < self.GUTTER or x0_ > W:
-                    continue
-                y_ = self.RULER + 1 + i * 6
-                p.fillRect(max(x0_, self.GUTTER), y_,
-                           max(2, x1_ - max(x0_, self.GUTTER)), 4,
-                           QColor(60, 200, 210, 170))
-                p.setPen(QColor(120, 230, 240))
-                p.drawText(max(x0_, self.GUTTER) + 3, y_ + 4 + 9, label)
+                if x1_ >= self.GUTTER and x0_ <= W:
+                    p.fillRect(max(x0_, self.GUTTER), y + 2,
+                               max(2, x1_ - max(x0_, self.GUTTER)), lh - 4,
+                               QColor(50, 150, 160, 55))
+                for t0_, t1_, db in ang.get("whistles", []):
+                    if db < self.WHISTLE_MIN_DB:
+                        continue
+                    x_ = self._x(t0_ * self.fps)
+                    if not (self.GUTTER - 4 <= x_ <= W):
+                        continue
+                    w_ = max(3, self._x(t1_ * self.fps) - x_)
+                    c = QColor(80, 220, 230)
+                    p.fillRect(x_, y + 3, w_, lh - 6, c)
+                    if t1_ - t0_ >= 0.8:      # 긴 호각 강조 (primary 와 동일)
+                        p.setPen(c)
+                        p.drawLine(x_, y + 1, x_ + w_, y + 1)
         # 내보내기 구간: 바깥은 어둡게, IN/OUT 브래킷 표시
         if self.mark_in is not None or self.mark_out is not None:
             fi = 0 if self.mark_in is None else self.mark_in
@@ -620,6 +645,9 @@ class TimelineView(QWidget):
         elif ev.position().x() >= self.GUTTER:
             self.seek.emit(int(min(max(self._f(int(ev.position().x())), 0),
                                    self.total - 1)))
+            lane = self._lane_at(int(ev.position().y()))
+            if lane >= len(self.LANES):     # 앵글 레인 클릭 → 카메라 전환
+                self.angle_pick.emit(lane - len(self.LANES))
 
     def wheelEvent(self, ev):
         if self.total <= 1:
@@ -1682,6 +1710,7 @@ class PtzTab(QWidget):
         self.trackbar = TimelineView()
         self.trackbar.seek.connect(lambda f: self.slider.setValue(f))
         self.trackbar.pick.connect(self._timeline_pick)
+        self.trackbar.angle_pick.connect(lambda i: self._mc_select(i + 1))
         self.trackbar.range_menu.connect(self._timeline_menu)
         # I/O = 내보내기 구간 시작/끝 (NLE 관례)
         QShortcut(QKeySequence(Qt.Key.Key_I), self,
@@ -1955,7 +1984,7 @@ class PtzTab(QWidget):
             self.mc = MulticamViewer(self.pane, self._pane_split, self.log)
         self.mc.set_half(h.get("alts", []), redraw=self._redraw)
         self._rebuild_mc_bar()
-        self._set_coverage_lane()
+        self._set_angle_lanes()
         n = len(h.get("alts", []))
         self.log(f"[match] {doc.get('title') or '경기'} — {h['label']}: "
                  f"{Path(h['primary']).name} + 앵글 {n}개 "
@@ -2031,10 +2060,11 @@ class PtzTab(QWidget):
         self.mc.primary_tick(getattr(self, "_cur_frame", None))
         self._redraw()
 
-    def _set_coverage_lane(self):
-        """alt 커버리지를 타임라인에 표시 (primary 프레임 구간)."""
-        from ..core.match import alt_coverage
-        spans = []
+    def _set_angle_lanes(self):
+        """alt 카메라별 타임라인 레인: 커버리지 + 호각(시계 변환)."""
+        from ..core.audio import load_whistle_track
+        from ..core.match import alt_coverage, to_primary_time
+        angles = []
         alts = (self.match["halves"][self.match_half].get("alts", [])
                 if self.match else [])
         for a in alts:
@@ -2046,9 +2076,18 @@ class PtzTab(QWidget):
             if dur <= 0:
                 continue
             t0, t1 = alt_coverage(a["clock"], dur)
-            spans.append((int(t0 * self.fps), int(t1 * self.fps),
-                          Path(a["video"]).stem))
-        self.trackbar.set_coverage(spans)
+            whistles = []
+            try:                              # 그 카메라의 호각 → primary 초
+                _tr, ev = load_whistle_track(a["video"])
+                whistles = [(to_primary_time(a["clock"], w0),
+                             to_primary_time(a["clock"], w1), db)
+                            for w0, w1, db in (ev or [])]
+            except Exception as e:  # noqa: BLE001 — 호각 없인 밴드만
+                self.log(f"[match] {Path(a['video']).name} 호각 트랙 무시: {e}")
+            angles.append({"label": Path(a["video"]).stem,
+                           "span": (int(t0 * self.fps), int(t1 * self.fps)),
+                           "whistles": whistles})
+        self.trackbar.set_angles(angles)
 
     def open_path(self, path: str, quiet: bool = False):
         """파노라마 열기 (프로젝트 복원 경로 포함). 분석/키프레임 사이드카 자동 로드."""
@@ -2058,7 +2097,7 @@ class PtzTab(QWidget):
             if self.mc is not None:
                 self.mc.set_half([])
             self._rebuild_mc_bar()
-            self.trackbar.set_coverage([])
+            self.trackbar.set_angles([])
         if not Path(path).exists():
             from ..core.project import _cross_platform_candidates
             for cand in _cross_platform_candidates(path):
