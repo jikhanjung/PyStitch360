@@ -4,6 +4,17 @@
 가져가는 전체 절차. 분석 메뉴 항목들은 순서 의존성이 있으므로 아래
 순서를 따른다. (P03 로드맵 1~5 구현 기준, devlog 027~033)
 
+## 진입점 (P05 분리)
+
+| 실행 | 용도 |
+|---|---|
+| `python pitchstitch.py` | **PitchStitch** — 스티칭 전용 (탭 1~3, torch 불필요) |
+| `python pitchwatch.py [pano.mp4]` | **PitchWatch** — 경기 분석 전용 (이 문서의 본문) |
+| `python main.py` | 통합 실행 (전환기 호환 — 두 기능 모두) |
+
+PitchStitch 내보내기 완료 대화의 "PitchWatch 에서 열기" 버튼이 두 앱을
+잇는다 (통합 실행에서는 "PTZ 탭에서 열기").
+
 ## 0. 준비
 
 | 파일 | 내용 | 만든 주체 |

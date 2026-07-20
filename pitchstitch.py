@@ -18,6 +18,7 @@ from pystitch.gui.main_window import MainWindow
 def main():
     app = QApplication(sys.argv)
     win = MainWindow()
+    win._app_name = "PitchStitch"         # 프로젝트 열기/저장 제목에도 반영
     win.setWindowTitle("PitchStitch")
     i = win.tabs.indexOf(win.ptz_tab)     # 가상 PTZ 탭 제거 (PitchWatch 로)
     if i >= 0:

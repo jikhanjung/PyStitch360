@@ -34,7 +34,8 @@ from .workers import (
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PyStitch360")
+        self._app_name = "PyStitch360"    # 런처가 덮어씀 (PitchStitch)
+        self.setWindowTitle(self._app_name)
         self.resize(1500, 900)
 
         # 상태
@@ -183,7 +184,7 @@ class MainWindow(QMainWindow):
         finally:
             self._busy(False)
         self.project_path = Path(path)
-        self.setWindowTitle(f"PyStitch360 — {self.project_path.name}")
+        self.setWindowTitle(f"{self._app_name} — {self.project_path.name}")
         self.log(f"[project] 열기: {path}")
         self._remember_recent(path)
 
@@ -255,7 +256,7 @@ class MainWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001
             QMessageBox.warning(self, "저장 실패", str(e))
             return
-        self.setWindowTitle(f"PyStitch360 — {self.project_path.name}")
+        self.setWindowTitle(f"{self._app_name} — {self.project_path.name}")
         self.log(f"[project] 저장: {self.project_path}")
         self._remember_recent(self.project_path)
 
@@ -986,7 +987,27 @@ class MainWindow(QMainWindow):
         self.progress.setValue(1)
         self.progress.setFormat("완료")
         self.log(f"[export] 저장: {path}")
-        QMessageBox.information(self, "내보내기", f"완료: {path}")
+        # 핸드오프 (P05): 통합 실행이면 PTZ 탭으로, PitchStitch 단독
+        # 실행(탭 제거됨)이면 PitchWatch 프로세스로 잇는다.
+        box = QMessageBox(self)
+        box.setWindowTitle("내보내기")
+        box.setText(f"완료: {path}")
+        in_app = self.tabs.indexOf(self.ptz_tab) >= 0
+        b_open = box.addButton(
+            "PTZ 탭에서 열기" if in_app else "PitchWatch 에서 열기",
+            QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        box.exec()
+        if box.clickedButton() is b_open:
+            if in_app:
+                self.ptz_tab.open_path(str(path))
+                self.tabs.setCurrentWidget(self.ptz_tab)
+            else:
+                import subprocess
+                launcher = (Path(__file__).resolve().parents[2]
+                            / "pitchwatch.py")
+                subprocess.Popen([sys.executable, str(launcher), str(path)])
+                self.log(f"[export] PitchWatch 실행: {Path(path).name}")
 
     def _export_failed(self, msg):
         self.btn_export.setEnabled(True)
