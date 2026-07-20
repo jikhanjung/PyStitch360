@@ -22,12 +22,20 @@
   ffmpeg/NVENC 만 — 분리하면 스티칭 exe 가 가벼워짐 (Windows 패키징
   장기 항목과 직결).
 
+## 이름 (확정)
+
+- 스티칭 앱: **PitchStitch** (`pitchstitch.py`)
+- 경기 분석 앱: **PitchWatch** (`pitchwatch.py`)
+- -er 형(PitchStitcher/PitchWatcher)도 검토했으나 짧은 형의 라임
+  (-tch 운율 형제)을 우선 — 제품화 단계에서 재논의 여지만 남김.
+- 참고: PitchView 는 기존 제품(pitchview.app) 존재로 제외 확인.
+
 ## 작업 항목
 
 ### 1. 런처 분리
 
-- `stitch_app.py` — 탭 1~3(영상·동기화/정합/내보내기)만 있는 윈도우.
-- `match_app.py` — PtzTab 을 자체 MainWindow 로 승격:
+- `pitchstitch.py` — 탭 1~3(영상·동기화/정합/내보내기)만 있는 윈도우.
+- `pitchwatch.py` — PtzTab 을 자체 MainWindow 로 승격:
   - 자체 메뉴바 (현 분석 메뉴 + 파일 메뉴: 파노라마 열기)
   - **최근 파일 = 최근 pano.mp4 목록** (프로젝트 아님)
   - 자체 하단 없이 로그 탭만 (이미 구현)
@@ -37,15 +45,16 @@
 
 ### 2. 핸드오프 UX
 
-- 스티칭 앱 내보내기 완료 대화에 "분석 앱에서 열기" 버튼 —
-  `match_app.py <pano.mp4>` 프로세스 실행 (CLI 인자로 경로).
-- match_app 은 argv[1] 파노라마 자동 열기.
+- PitchStitch 내보내기 완료 대화에 "PitchWatch 에서 열기" 버튼 —
+  `pitchwatch.py <pano.mp4>` 프로세스 실행 (CLI 인자로 경로).
+- PitchWatch 는 argv[1] 파노라마 자동 열기.
 
-### 3. 이름/브랜딩 (사용자 결정 필요)
+### 3. 브랜딩 적용
 
-- 분석 앱은 PyStitch360 이름과 안 맞음 — 산출물 관점에서 분석이 주력.
-- 후보 계열: MatchScope / PitchView 류. QSettings 조직/앱 이름 분리
-  여부도 이때 결정 (설정 마이그레이션 주의).
+- 창 제목·About 에 PitchStitch/PitchWatch 반영. 저장소 이름 변경
+  여부는 별도 결정 (당분간 PyStitch360 유지 가능).
+- QSettings 는 당분간 현행 조직/앱 키 유지 (설정 유실 방지) —
+  앱별 분리는 필요해질 때 마이그레이션과 함께.
 
 ### 4. 패키징 (P05 범위 밖, 준비만)
 
@@ -55,9 +64,9 @@
 ## 완료 기준
 
 - 두 런처가 각각 단독 실행 (스티칭 런처는 torch 미설치 환경에서도 기동).
-- match_app: 파노라마 열기→검수→하이라이트→내보내기 전 과정이 통합
+- PitchWatch: 파노라마 열기→검수→하이라이트→내보내기 전 과정이 통합
   실행과 동일 동작 + CLI 경로 인자 동작.
-- 핸드오프 버튼으로 스티칭→분석 이어짐.
+- 핸드오프 버튼으로 PitchStitch→PitchWatch 이어짐.
 - docs/ptz_workflow.md 진입점 갱신.
 
 ## 비고
@@ -65,4 +74,3 @@
 - 스크립트(scripts/)는 이미 제3의 헤드리스 표면 — 변경 없음.
 - QSettings 키는 현행 유지가 안전 (두 앱이 같은 키를 읽어도 충돌하는
   키 없음 — 창 크기류만 앱별 분리 검토).
-- 이름 확정 전까지 match_app 가칭 사용.
