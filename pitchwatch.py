@@ -1,0 +1,128 @@
+"""PitchWatch — 경기 분석 앱 (P05 분리 런처).
+
+PtzTab 을 자체 메인 윈도우로 승격: 파노라마 mp4 를 직접 연다 (상태는
+전부 영상 사이드카 — 프로젝트 파일 불필요). 스티칭은 PitchStitch
+(pitchstitch.py) 에서.
+
+사용법: python pitchwatch.py [pano.mp4]
+"""
+import sys
+from pathlib import Path
+
+from PyQt6.QtCore import QSettings
+from PyQt6.QtWidgets import QApplication, QFileDialog, QMainWindow
+
+from pystitch.gui.ptz_tab import PtzTab
+
+_MAX_RECENT = 10
+
+
+class PitchWatchWindow(QMainWindow):
+    """PtzTab + 파일(최근 파노라마)/분석 메뉴만 있는 얇은 껍데기."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("PitchWatch")
+        self.resize(1600, 980)
+        self.ptz = PtzTab(self._log, self._last_dir, self._remember_dir)
+        self.setCentralWidget(self.ptz)
+        self._build_menu()
+
+    # ------------------------------------------------------------ 로그/폴더
+    def _log(self, msg):                  # PtzTab 자체 로그 탭이 주 화면
+        print(msg, flush=True)
+
+    def _last_dir(self) -> str:
+        return str(QSettings("PyStitch360", "PyStitch360")
+                   .value("last_video_dir", ""))
+
+    def _remember_dir(self, d: str):
+        QSettings("PyStitch360", "PyStitch360").setValue("last_video_dir", d)
+
+    # ------------------------------------------------------------ 메뉴
+    def _build_menu(self):
+        m = self.menuBar().addMenu("파일(&F)")
+        m.addAction("파노라마 열기...", self._open_pano)
+        self._recent_menu = m.addMenu("최근 파노라마")
+        m.addSeparator()
+        m.addAction("종료", self.close)
+        a = self.menuBar().addMenu("분석(&A)")
+        a.addAction("갭필 2차 패스 (트랙 갭 재검출)...",
+                    lambda: self.ptz.start_gapfill())
+        a.addAction("킥오프 검출 (호각 × 대형)",
+                    lambda: self.ptz.detect_events())
+        a.addAction("트랙릿 병합 제안 (ReID 라이트)",
+                    lambda: self.ptz.suggest_tracklet_merges())
+        a.addAction("등번호 OCR (근측 선수)...",
+                    lambda: self.ptz.run_jersey_ocr())
+        a.addSeparator()
+        a.addAction("하이라이트 후보 생성 (이벤트 융합)",
+                    lambda: self.ptz.detect_highlights())
+        a.addAction("하이라이트 일괄 내보내기...",
+                    lambda: self.ptz.export_highlights())
+        a.addAction("득점 역추론 (경기 중 킥오프 → 골 제안)",
+                    lambda: self.ptz.suggest_goals())
+        a.addAction("경기 정보 (시계 앵커·중단 구간)...",
+                    lambda: self.ptz.edit_match_info())
+        a.addAction("선수 히트맵/활동량 리포트",
+                    lambda: self.ptz.generate_report())
+        a.addSeparator()
+        a.addAction("공/키프레임 편집 초기화",
+                    lambda: self.ptz.reset_edits("ball"))
+        a.addAction("선수 역할 지정 초기화",
+                    lambda: self.ptz.reset_edits("roles"))
+        a.addAction("경기장 캘리브레이션 초기화",
+                    lambda: self.ptz.reset_edits("field"))
+        a.addSeparator()
+        a.addAction("모든 사용자 편집 초기화 (분석 원본으로)",
+                    lambda: self.ptz.reset_edits("all"))
+        self._rebuild_recent()
+
+    # ------------------------------------------------------------ 최근 파일
+    def _recent(self) -> list[str]:
+        v = QSettings("PyStitch360", "PyStitch360").value(
+            "pitchwatch_recent", [])
+        if isinstance(v, str):            # 원소 1개 리스트가 str 로 올 수 있음
+            v = [v]
+        return [p for p in (v or []) if Path(p).exists()]
+
+    def _remember_recent(self, path):
+        lst = [str(path)] + [p for p in self._recent() if p != str(path)]
+        QSettings("PyStitch360", "PyStitch360").setValue(
+            "pitchwatch_recent", lst[:_MAX_RECENT])
+        self._rebuild_recent()
+
+    def _rebuild_recent(self):
+        self._recent_menu.clear()
+        for p in self._recent():
+            self._recent_menu.addAction(
+                Path(p).name, lambda _=False, q=p: self.open_pano(q))
+        self._recent_menu.setEnabled(bool(self._recent()))
+
+    # ------------------------------------------------------------ 열기
+    def _open_pano(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "완성 파노라마 영상", self._last_dir(),
+            "영상 (*.mp4 *.MP4 *.mkv)")
+        if path:
+            self.open_pano(path)
+
+    def open_pano(self, path):
+        self.ptz.open_path(str(path))
+        if self.ptz.pano_path is not None:
+            self.setWindowTitle(f"PitchWatch — {Path(path).name}")
+            self._remember_recent(path)
+
+
+def main():
+    app = QApplication(sys.argv)
+    win = PitchWatchWindow()
+    win.show()
+    if len(sys.argv) > 1 and Path(sys.argv[1]).exists():
+        win.open_pano(sys.argv[1])        # PitchStitch 핸드오프 (P05-2)
+    app._pitchwatch_main = win            # 참조 유지
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
