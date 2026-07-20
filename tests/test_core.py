@@ -205,8 +205,11 @@ def test_project_resolves_cross_platform_paths(tmp_path):
     from pystitch.core.align import Alignment
     from pystitch.core.project import load_project, save_project
 
-    real = Path("/mnt/d/projects/PyStitch360/README.md")   # WSL 에 존재하는 파일
-    win_style = "D:\\projects\\PyStitch360\\README.md"
+    # WSL 에 존재하는 파일 — 저장소 이름에 독립적으로 저장소 자신을 쓴다
+    real = (Path(__file__).resolve().parents[1] / "README.md")
+    assert str(real).startswith("/mnt/"), "WSL 전용 테스트"
+    drive = real.parts[2]                                  # /mnt/<drive>/...
+    win_style = f"{drive.upper()}:\\" + "\\".join(real.parts[3:])
     a = Alignment(Rh=np.eye(3), yaw_split_deg=40.0,
                   pitch_auto=0.0, roll_auto=0.0, yaw_auto=0.0)
     proj = tmp_path / "p.json"

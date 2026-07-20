@@ -32,8 +32,9 @@ from .workers import (
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, with_ptz: bool = True):
         super().__init__()
+        self._with_ptz = with_ptz         # False: PitchStitch — PTZ 탭/분석 메뉴 없음
         self._app_name = "PyStitch360"    # 런처가 덮어씀 (PitchStitch)
         self.setWindowTitle(self._app_name)
         self.resize(1500, 900)
@@ -60,9 +61,13 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._build_sync_tab(), "1. 영상·동기화")
         tabs.addTab(self._build_align_tab(), "2. 정합·미리보기")
         tabs.addTab(self._build_export_tab(), "3. 내보내기")
-        from .ptz_tab import PtzTab
-        self.ptz_tab = PtzTab(self.log, self._last_video_dir, self._remember_video_dir)
-        tabs.addTab(self.ptz_tab, "4. 가상 PTZ")
+        if with_ptz:
+            from .ptz_tab import PtzTab
+            self.ptz_tab = PtzTab(self.log, self._last_video_dir,
+                                  self._remember_video_dir)
+            tabs.addTab(self.ptz_tab, "4. 가상 PTZ")
+        else:
+            self.ptz_tab = None
         tabs.currentChanged.connect(lambda _: self._stop_playback())
         self.tabs = tabs
 
@@ -79,6 +84,7 @@ class MainWindow(QMainWindow):
                                               is not self.ptz_tab))
 
         self.project_path: Path | None = None
+        self._loaded_ptz_pano: str | None = None
         self._build_menu()
         self._load_profiles()
 
@@ -93,6 +99,9 @@ class MainWindow(QMainWindow):
         m.addAction("프로젝트 다른 이름으로 저장...", lambda: self._save_project(as_new=True))
         m.addSeparator()
         m.addAction("종료", self.close)
+        if not self._with_ptz:            # PitchStitch — 분석 메뉴는 PitchWatch 로
+            self._rebuild_recent_menu()
+            return
         a = self.menuBar().addMenu("분석(&A)")
         a.addAction("갭필 2차 패스 (트랙 갭 재검출)...",
                     lambda: self.ptz_tab.start_gapfill())
@@ -239,8 +248,10 @@ class MainWindow(QMainWindow):
             },
             # PTZ 분석/키프레임 자체는 파노라마 옆 사이드카에 저장되고,
             # 프로젝트는 어떤 파노라마를 열어놨는지만 기억한다
-            "ptz": {"pano": str(self.ptz_tab.pano_path)
-                    if self.ptz_tab.pano_path else None},
+            # PitchStitch(ptz_tab 없음)에선 프로젝트에 있던 pano 참조를 보존
+            "ptz": {"pano": (str(self.ptz_tab.pano_path)
+                             if self.ptz_tab.pano_path else None)
+                    if self.ptz_tab is not None else self._loaded_ptz_pano},
         }
 
     def _save_project(self, as_new=False):
@@ -274,8 +285,11 @@ class MainWindow(QMainWindow):
                 != QMessageBox.StandardButton.Yes:
             return
         app = QApplication.instance()
-        app.removeEventFilter(self.ptz_tab)   # 구 윈도우 Space 필터 해제
-        win = MainWindow()
+        if self.ptz_tab is not None:
+            app.removeEventFilter(self.ptz_tab)   # 구 윈도우 Space 필터 해제
+        win = MainWindow(with_ptz=self._with_ptz)
+        win._app_name = self._app_name
+        win.setWindowTitle(self._app_name)
         win.setGeometry(self.geometry())
         win.show()
         app._pystitch_main = win              # 참조 유지 (GC 방지)
@@ -312,7 +326,8 @@ class MainWindow(QMainWindow):
         self.spin_persp_k.setValue(float(persp.get("k", 0.3)))
         self.spin_persp_m.setValue(float(persp.get("m", 1.3)))
         pano = d.get("ptz", {}).get("pano")
-        if pano:
+        self._loaded_ptz_pano = pano
+        if pano and self.ptz_tab is not None:
             self.ptz_tab.open_path(pano, quiet=True)
         self.segments = d.get("segments", [])
         self._refresh_segment_list()
@@ -992,7 +1007,8 @@ class MainWindow(QMainWindow):
         box = QMessageBox(self)
         box.setWindowTitle("내보내기")
         box.setText(f"완료: {path}")
-        in_app = self.tabs.indexOf(self.ptz_tab) >= 0
+        in_app = (self.ptz_tab is not None
+                  and self.tabs.indexOf(self.ptz_tab) >= 0)
         b_open = box.addButton(
             "PTZ 탭에서 열기" if in_app else "PitchWatch 에서 열기",
             QMessageBox.ButtonRole.ActionRole)

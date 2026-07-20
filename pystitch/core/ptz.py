@@ -20,11 +20,10 @@ _DEFAULT_WEIGHTS = Path(__file__).resolve().parents[2] / "presets" / "yolov8n.pt
 
 
 def ptz_available() -> bool:
-    try:
-        import ultralytics  # noqa: F401
-        return True
-    except ImportError:
-        return False
+    # 설치 여부만 본다 — import ultralytics 는 torch 전체(수 GB)를 끌고
+    # 들어와 GUI 생성 시점 호출(툴팁/버튼 활성)이 기동을 수 초 지연시킴
+    from importlib.util import find_spec
+    return find_spec("ultralytics") is not None
 
 
 class Detector:
