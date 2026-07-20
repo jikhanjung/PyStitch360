@@ -32,6 +32,8 @@ MANIFEST
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+# 수기 관리 스펙 (P05) — 템플릿 규칙의 예외
+!packaging/*.spec
 
 # Installer logs
 pip-log.txt
