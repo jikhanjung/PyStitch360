@@ -1,0 +1,150 @@
+"""core/rotcam.py — 회전 카메라 필드 정합 (P06-3) 합성 검증.
+
+GT 카메라: 반대편 사이드라인 (0, 45, 5.5m), f=1400px/1920 폭.
+검증: 기준 캘리브레이션(f·위치 복원), 팬+줌 시퀀스 체인 추적의
+누적 오차, 지면 투영 정확도.
+"""
+import numpy as np
+
+from pystitch.core.rotcam import (
+    calibrate_reference, decompose_H, field_to_pixel, make_K,
+    pixel_to_field, track_step,
+)
+
+W, H = 1920, 1080
+F_TRUE = 1400.0
+CAM = np.array([3.0, 45.0, 5.5])          # 반대편 사이드라인 위
+
+
+def look_at(pos, target):
+    """OpenCV 관례 (x우, y하, z전방) world→cam 회전 (행 = 카메라 축)."""
+    fwd = target - pos
+    fwd = fwd / np.linalg.norm(fwd)
+    right = np.cross(fwd, np.array([0.0, 0.0, 1.0]))
+    right = right / np.linalg.norm(right)
+    down = np.cross(fwd, right)
+    down /= np.linalg.norm(down)
+    return np.stack([right, down, fwd])
+
+
+def gt_state(yaw_deg=0.0, f=F_TRUE):
+    """센터 응시 기준에서 yaw 만큼 팬한 GT (R, t, K)."""
+    R0 = look_at(CAM, np.array([0.0, 0.0, 0.0]))
+    c, s = np.cos(np.deg2rad(yaw_deg)), np.sin(np.deg2rad(yaw_deg))
+    Rz = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    R = R0 @ Rz                              # world Z 축(연직) 팬
+    t = -R @ CAM
+    return R, t, make_K(f, W, H)
+
+
+def test_reference_calibration():
+    """랜드마크 → f·설치 위치 복원 (f 1%, 위치 0.5m)."""
+    rng = np.random.default_rng(2)
+    R, t, K = gt_state()
+    marks = np.array([[-52.5, 34], [0, 34], [52.5, 34], [-52.5, -34],
+                      [0, -34], [52.5, -34], [0, 0], [-41, 20.16],
+                      [41, 20.16], [-52.5, 0], [52.5, 0],
+                      [0, 9.15], [0, -9.15], [-9.15, 0], [9.15, 0],
+                      [-36, -20.16], [36, -20.16], [-11, 0], [11, 0],
+                      [-20, -10], [20, -10], [-30, 5], [30, 5]])
+    px = field_to_pixel(K, R, t, marks) + rng.normal(0, 1.0, (len(marks), 2))
+    vis = np.isfinite(px[:, 0]) & (px[:, 0] > -200) & (px[:, 0] < W + 200)
+    assert vis.sum() >= 6
+    c = calibrate_reference(px[vis], marks[vis], (W, H))
+    assert c is not None and c["rms_px"] < 3.0
+    assert abs(c["f"] - F_TRUE) / F_TRUE < 0.01
+    assert np.linalg.norm(c["cam_pos"] - CAM) < 0.5
+
+
+def _project_scene(R, t, K, scene):
+    xc = (R @ scene.T).T + t[None]
+    uv = (K @ xc.T).T
+    uv = uv[:, :2] / uv[:, 2:3]
+    ok = (xc[:, 2] > 1) & (uv[:, 0] > -50) & (uv[:, 0] < W + 50) \
+        & (uv[:, 1] > -50) & (uv[:, 1] < H + 50)
+    return uv, ok
+
+
+def test_decompose_pan_and_zoom():
+    """단일 스텝: 순수 팬과 팬+줌의 (R, f비율) 분해 정확도."""
+    rng = np.random.default_rng(4)
+    scene = np.column_stack([rng.uniform(-55, 55, 400),
+                             rng.uniform(-36, 36, 400),
+                             rng.uniform(0, 2.0, 400)])
+    for dyaw, ratio in ((1.5, 1.0), (0.8, 1.05), (-2.0, 0.95)):
+        R1, t1, K1 = gt_state(0.0)
+        R2, t2, _ = gt_state(dyaw)
+        K2 = make_K(F_TRUE * ratio, W, H)
+        uv1, ok1 = _project_scene(R1, t1, K1, scene)
+        uv2, ok2 = _project_scene(R2, t2, K2, scene)
+        m = ok1 & ok2
+        p1 = uv1[m] + rng.normal(0, 0.5, (m.sum(), 2))
+        p2 = uv2[m] + rng.normal(0, 0.5, (m.sum(), 2))
+        import cv2
+        Hm, _ = cv2.findHomography(p1, p2, cv2.RANSAC, 3.0)
+        R_rel, r_est, res = decompose_H(Hm, K1)
+        ang = np.rad2deg(np.arccos(
+            np.clip((np.trace(R_rel @ (R2 @ R1.T).T) - 1) / 2, -1, 1)))
+        assert ang < 0.25, f"회전 오차 {ang:.3f}°"   # 0.5px 노이즈 기준
+        assert abs(r_est - ratio) < 0.005, f"줌비 {r_est} vs {ratio}"
+
+
+MARKS = np.array([[-52.5, 34], [0, 34], [52.5, 34], [-52.5, -34],
+                  [0, -34], [52.5, -34], [0, 0], [-41, 20.16],
+                  [41, 20.16], [-52.5, 0], [52.5, 0],
+                  [0, 9.15], [0, -9.15], [-9.15, 0], [9.15, 0],
+                  [-36, -20.16], [36, -20.16], [-30, 5], [30, 5]])
+
+
+def test_chain_tracking_with_anchor():
+    """80스텝 팬(±20°)+중간 줌: 체인만으론 드리프트 누적(랜덤워크) →
+    20스텝마다 랜드마크 재정렬(anchor_rotation)로 지면 오차 < 1.5m."""
+    from pystitch.core.rotcam import anchor_rotation
+    rng = np.random.default_rng(9)
+    scene = np.column_stack([rng.uniform(-55, 55, 500),
+                             rng.uniform(-36, 36, 500),
+                             rng.uniform(0, 2.0, 500)])
+    yaws = 20 * np.sin(np.linspace(0, 2 * np.pi, 81))
+    fs = np.where((np.arange(81) > 30) & (np.arange(81) < 50),
+                  F_TRUE * 1.2, F_TRUE)
+    R0, t0, K0 = gt_state(yaws[0], fs[0])
+    state = {"f": float(fs[0]), "K": make_K(fs[0], W, H), "R": R0}
+    for k in range(1, 81):
+        Ra, ta, Ka = gt_state(yaws[k - 1], fs[k - 1])
+        Rb, tb, Kb = gt_state(yaws[k], fs[k])
+        uva, oka = _project_scene(Ra, ta, Ka, scene)
+        uvb, okb = _project_scene(Rb, tb, Kb, scene)
+        m = oka & okb
+        pa = uva[m] + rng.normal(0, 0.5, (m.sum(), 2))
+        pb = uvb[m] + rng.normal(0, 0.5, (m.sum(), 2))
+        state = track_step(state, pa, pb)
+        assert state is not None, f"스텝 {k} 추적 실패"
+        if k % 20 == 0:                     # 주기 재정렬 (흰 라인/랜드마크)
+            mk_px = field_to_pixel(Kb, Rb, tb, MARKS)
+            vis = (np.isfinite(mk_px[:, 0]) & (mk_px[:, 0] > 0)
+                   & (mk_px[:, 0] < W) & (mk_px[:, 1] > 0)
+                   & (mk_px[:, 1] < H))
+            assert vis.sum() >= 3
+            a = anchor_rotation(CAM, mk_px[vis]
+                                + rng.normal(0, 1.0, (vis.sum(), 2)),
+                                MARKS[vis], state["f"], (W, H))
+            assert a is not None and a["res_deg"] < 0.2
+            state.update(R=a["R"], f=a["f"], K=a["K"])
+    # 마지막 프레임에서 알려진 필드 점의 지면 투영 오차
+    Rg, tg, Kg = gt_state(yaws[-1], fs[-1])
+    probe = np.array([[0.0, 0.0], [-30.0, 10.0], [20.0, -20.0]])
+    px = field_to_pixel(Kg, Rg, tg, probe)
+    est = pixel_to_field(state["K"], state["R"], CAM, px)
+    err = np.hypot(*(est - probe).T)
+    assert np.nanmax(err) < 1.5, f"지면 오차 {err}"
+    assert abs(state["f"] - fs[-1]) / fs[-1] < 0.02
+
+
+def test_track_step_rejects_garbage():
+    state = {"f": F_TRUE, "K": make_K(F_TRUE, W, H), "R": np.eye(3)}
+    rng = np.random.default_rng(1)
+    assert track_step(state, rng.uniform(0, W, (10, 2)),
+                      rng.uniform(0, W, (10, 2))) is None   # 매칭 부족
+    p = rng.uniform(0, W, (60, 2))
+    q = rng.uniform(0, W, (60, 2))                          # 무상관 → 기각
+    assert track_step(state, p, q) is None
