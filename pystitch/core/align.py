@@ -116,9 +116,10 @@ def _fit_line_coeffs(pts):
 def auto_level(imgs, Rs, lens: LensProfile, yaw_range, scale=0.2, log=print):
     """먼 쪽 터치라인 기반 pitch/roll 자동 추정. 반환 (pitch, roll, ok).
 
-    ok=False 는 터치라인 점 부족으로 한 번도 측정하지 못했다는 뜻 —
-    반환된 0°는 "수평" 이 아니라 "모름" 이다 (헤드리스는 이때 다른
-    프레임에서 재시도).
+    ok=False 는 한 번도 측정하지 못했거나(반환 0° 는 "수평" 아니라
+    "모름") 최종 잔차가 커서 수렴하지 못했다는 뜻 — 헤드리스는 이때
+    다른 프레임에서 재시도한다. GUI 는 값은 그대로 쓰되 사용자가
+    슬라이더로 만회.
 
     부호를 관례로 가정하지 않는다: 시험 회전(+2°)의 계수 변화(수치 야코비안)를
     측정해 2x2 선형계를 푼다. (해석적 부호 유도는 roll 발산 이력 있음 — devlog 001)
@@ -184,7 +185,12 @@ def auto_level(imgs, Rs, lens: LensProfile, yaw_range, scale=0.2, log=print):
     pitch, roll = best[1], best[2]
     if max(abs(pitch), abs(roll)) >= np.deg2rad(34):
         log("[auto-level] 경고: 보정값이 한계(±35°) 부근 — 정합 기하가 비정상일 가능성")
-    return pitch, roll, True
+    # 수렴 판정: 최종 해의 실측 잔차(터치라인 기울기)가 커면 부분 수렴 —
+    # 헤드리스는 이 프레임을 버리고 다음 후보에서 다시 시도한다.
+    ok = best[0] < np.deg2rad(0.4)
+    if not ok:
+        log(f"[auto-level] 잔차 {np.rad2deg(best[0]):.2f}° ≥ 0.4° — 미수렴")
+    return pitch, roll, ok
 
 
 def find_halfway_line_yaw(imgs, Rs, lens: LensProfile, yaw_range, el0, el1,
@@ -250,7 +256,7 @@ def estimate_alignment(img_l, img_r, lens: LensProfile, log=print,
                                           yaw_range, log=log)
         if require_level and not leveled:
             raise RuntimeError(
-                "auto-level 실패 (터치라인 점 부족) — 다른 프레임에서 재시도")
+                "auto-level 실패 (측정 불가 또는 미수렴) — 다른 프레임에서 재시도")
         R_adj = rot_xz(pitch, roll)
         yaw_c = find_halfway_line_yaw([img_l, img_r], [Rh @ R_adj, Rh.T @ R_adj],
                                       lens, yaw_range, EL0_RAD, EL1_RAD)
