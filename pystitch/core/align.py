@@ -144,17 +144,23 @@ def auto_level(imgs, Rs, lens: LensProfile, yaw_range, scale=0.2, log=print):
         return coef, n_in
 
     pitch, roll = 0.0, 0.0
-    measured = False
+    best = None                     # (측정 잔차 노름, pitch, roll)
     delta = np.deg2rad(2.0)
-    for it in range(2):
+    # 마지막 반복은 검증 측정만 — 뉴턴 스텝은 인라이어 ~30개의 노이즈로
+    # 발산할 수 있어 (실사례: 반복 2에서 roll -32.7°), 스텝 결과를
+    # 실측하지 않은 채 채택하지 않는다. 최소 잔차 해를 최종값으로.
+    for it in range(4):
         base, n = measure(pitch, roll)
         if base is None:
-            log(f"[auto-level] 터치라인 점 부족 ({n}) — 보정 중단")
-            return pitch, roll, measured
-        measured = True
-        bc0 = base[1:3]
-        if np.linalg.norm(bc0) < np.deg2rad(0.15):
+            log(f"[auto-level] 터치라인 점 부족 ({n})"
+                + (" — 이전 최적값 유지" if best else " — 보정 중단"))
             break
+        norm = float(np.linalg.norm(base[1:3]))
+        if best is None or norm < best[0]:
+            best = (norm, pitch, roll)
+        if norm < np.deg2rad(0.15) or it == 3:
+            break
+        bc0 = base[1:3]
         mp, _ = measure(pitch + delta, roll)
         mr, _ = measure(pitch, roll + delta)
         if mp is None or mr is None:
@@ -170,9 +176,15 @@ def auto_level(imgs, Rs, lens: LensProfile, yaw_range, scale=0.2, log=print):
         pitch += step[0]
         roll += step[1]
         log(f"[auto-level] 반복 {it+1}: 인라이어 {n} → pitch {np.rad2deg(pitch):+.2f}°, roll {np.rad2deg(roll):+.2f}°")
+    if best is None:
+        return 0.0, 0.0, False
+    if (pitch, roll) != best[1:]:
+        log(f"[auto-level] 발산 감지 — 최소 잔차 해 채택: "
+            f"pitch {np.rad2deg(best[1]):+.2f}°, roll {np.rad2deg(best[2]):+.2f}°")
+    pitch, roll = best[1], best[2]
     if max(abs(pitch), abs(roll)) >= np.deg2rad(34):
         log("[auto-level] 경고: 보정값이 한계(±35°) 부근 — 정합 기하가 비정상일 가능성")
-    return pitch, roll, measured
+    return pitch, roll, True
 
 
 def find_halfway_line_yaw(imgs, Rs, lens: LensProfile, yaw_range, el0, el1,
