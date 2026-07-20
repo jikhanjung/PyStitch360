@@ -36,6 +36,7 @@ class Alignment:
     residual_deg: float = 0.0
     el0: float = EL0_RAD
     el1: float = EL1_RAD
+    level_resid_deg: float = 0.0   # auto-level 최종 실측 잔차 (inf=측정 불가)
 
     def rotations(self, pitch_user_deg=0.0, roll_user_deg=0.0):
         """월드→L, 월드→R 회전 (자동 보정 + 사용자 오프셋 적용)."""
@@ -113,13 +114,14 @@ def _fit_line_coeffs(pts):
     return coef, keep.sum()
 
 
-def auto_level(imgs, Rs, lens: LensProfile, yaw_range, scale=0.2, log=print):
-    """먼 쪽 터치라인 기반 pitch/roll 자동 추정. 반환 (pitch, roll, ok).
+def auto_level(imgs, Rs, lens: LensProfile, yaw_range, scale=0.2, log=print,
+               init=(0.0, 0.0)):
+    """먼 쪽 터치라인 기반 pitch/roll 자동 추정. 반환 (pitch, roll, resid).
 
-    ok=False 는 한 번도 측정하지 못했거나(반환 0° 는 "수평" 아니라
-    "모름") 최종 잔차가 커서 수렴하지 못했다는 뜻 — 헤드리스는 이때
-    다른 프레임에서 재시도한다. GUI 는 값은 그대로 쓰되 사용자가
-    슬라이더로 만회.
+    resid 는 채택 해의 실측 잔차(rad), 한 번도 측정하지 못했으면 None
+    (반환 0° 는 "수평" 아니라 "모름"). init 으로 시작점을 시드하면 이미
+    아는 근사 해 근처에서 출발해 수렴이 훨씬 안정적이다 — 헤드리스는
+    앞 프레임의 최선 해를 넘긴다.
 
     부호를 관례로 가정하지 않는다: 시험 회전(+2°)의 계수 변화(수치 야코비안)를
     측정해 2x2 선형계를 푼다. (해석적 부호 유도는 roll 발산 이력 있음 — devlog 001)
@@ -144,7 +146,7 @@ def auto_level(imgs, Rs, lens: LensProfile, yaw_range, scale=0.2, log=print):
         coef, n_in = _fit_line_coeffs(pts)
         return coef, n_in
 
-    pitch, roll = 0.0, 0.0
+    pitch, roll = float(init[0]), float(init[1])
     best = None                     # (측정 잔차 노름, pitch, roll)
     delta = np.deg2rad(2.0)
     # 마지막 반복은 검증 측정만 — 뉴턴 스텝은 인라이어 ~30개의 노이즈로
@@ -178,19 +180,15 @@ def auto_level(imgs, Rs, lens: LensProfile, yaw_range, scale=0.2, log=print):
         roll += step[1]
         log(f"[auto-level] 반복 {it+1}: 인라이어 {n} → pitch {np.rad2deg(pitch):+.2f}°, roll {np.rad2deg(roll):+.2f}°")
     if best is None:
-        return 0.0, 0.0, False
+        return float(init[0]), float(init[1]), None
     if (pitch, roll) != best[1:]:
         log(f"[auto-level] 발산 감지 — 최소 잔차 해 채택: "
-            f"pitch {np.rad2deg(best[1]):+.2f}°, roll {np.rad2deg(best[2]):+.2f}°")
+            f"pitch {np.rad2deg(best[1]):+.2f}°, roll {np.rad2deg(best[2]):+.2f}° "
+            f"(잔차 {np.rad2deg(best[0]):.2f}°)")
     pitch, roll = best[1], best[2]
     if max(abs(pitch), abs(roll)) >= np.deg2rad(34):
         log("[auto-level] 경고: 보정값이 한계(±35°) 부근 — 정합 기하가 비정상일 가능성")
-    # 수렴 판정: 최종 해의 실측 잔차(터치라인 기울기)가 커면 부분 수렴 —
-    # 헤드리스는 이 프레임을 버리고 다음 후보에서 다시 시도한다.
-    ok = best[0] < np.deg2rad(0.4)
-    if not ok:
-        log(f"[auto-level] 잔차 {np.rad2deg(best[0]):.2f}° ≥ 0.4° — 미수렴")
-    return pitch, roll, ok
+    return pitch, roll, best[0]
 
 
 def find_halfway_line_yaw(imgs, Rs, lens: LensProfile, yaw_range, el0, el1,
@@ -216,7 +214,7 @@ def find_halfway_line_yaw(imgs, Rs, lens: LensProfile, yaw_range, el0, el1,
 
 def estimate_alignment(img_l, img_r, lens: LensProfile, log=print,
                        reuse_level: "Alignment | None" = None,
-                       require_level=False) -> Alignment:
+                       require_level=False, level_init=None) -> Alignment:
     """프레임 쌍에서 전체 정합 추정 (상대 회전 + 자동 수평 + 자동 센터링).
 
     reuse_level 이 주어지면 수평(pitch/roll)·센터링(yaw)은 그 값을 그대로 쓰고
@@ -225,7 +223,9 @@ def estimate_alignment(img_l, img_r, lens: LensProfile, log=print,
 
     require_level=True 면 auto-level 이 한 번도 측정하지 못했을 때
     RuntimeError — 무인(헤드리스) 실행은 0° 를 수평으로 오인하면 안 된다
-    (GUI 는 사용자가 슬라이더로 만회할 수 있어 기본 False).
+    (GUI 는 사용자가 슬라이더로 만회할 수 있어 기본 False). 수렴 품질은
+    반환 Alignment.level_resid_deg 로 판단한다. level_init 은 auto-level
+    시작점 시드 ((pitch, roll) rad).
     """
     pts_l, pts_r = match_overlap(img_l, img_r)
     if len(pts_l) < 20:
@@ -246,25 +246,33 @@ def estimate_alignment(img_l, img_r, lens: LensProfile, log=print,
     Rh = half_rotation(R_lr)
     yaw_range = np.deg2rad(yaw_split / 2) + HALF_HFOV_RAD
 
+    level_resid = 0.0
     if reuse_level is not None:
         pitch, roll = reuse_level.pitch_auto, reuse_level.roll_auto
         yaw_c = reuse_level.yaw_auto
         log(f"[align] 수평/센터링 기존 값 재사용: pitch {np.rad2deg(pitch):+.2f}° "
             f"roll {np.rad2deg(roll):+.2f}° yaw {np.rad2deg(yaw_c):+.2f}°")
     else:
-        pitch, roll, leveled = auto_level([img_l, img_r], [Rh, Rh.T], lens,
-                                          yaw_range, log=log)
-        if require_level and not leveled:
-            raise RuntimeError(
-                "auto-level 실패 (측정 불가 또는 미수렴) — 다른 프레임에서 재시도")
+        pitch, roll, resid = auto_level([img_l, img_r], [Rh, Rh.T], lens,
+                                        yaw_range, log=log,
+                                        init=level_init or (0.0, 0.0))
+        if resid is None:
+            if require_level:
+                raise RuntimeError(
+                    "auto-level 측정 불가 (터치라인 점 부족) — 다른 프레임에서 재시도")
+            level_resid = float("inf")
+        else:
+            level_resid = float(np.rad2deg(resid))
         R_adj = rot_xz(pitch, roll)
         yaw_c = find_halfway_line_yaw([img_l, img_r], [Rh @ R_adj, Rh.T @ R_adj],
                                       lens, yaw_range, EL0_RAD, EL1_RAD)
-        log(f"[align] 수평 pitch {np.rad2deg(pitch):+.2f}° roll {np.rad2deg(roll):+.2f}°, 하프라인 {np.rad2deg(yaw_c):+.2f}°")
+        log(f"[align] 수평 pitch {np.rad2deg(pitch):+.2f}° roll {np.rad2deg(roll):+.2f}° "
+            f"(잔차 {level_resid:.2f}°), 하프라인 {np.rad2deg(yaw_c):+.2f}°")
 
     return Alignment(
         Rh=Rh, yaw_split_deg=yaw_split,
         pitch_auto=float(pitch), roll_auto=float(roll), yaw_auto=float(yaw_c),
         n_matches=len(pts_l), n_inliers=int(inliers.sum()),
         residual_deg=float(np.median(errs)),
+        level_resid_deg=level_resid,
     )

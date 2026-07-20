@@ -44,7 +44,10 @@ from .core.sync import estimate_offset
 
 # 정합 프레임 후보 (구간 내 비율) — 앞쪽 우선: 드리프트 스캔이 여기서
 # 시작해 앞으로만 진행하므로, 초반 정합이 서야 전체 구간이 커버된다.
-_ALIGN_FRACS = (0.05, 0.2, 0.35, 0.5, 0.7)
+# auto-level 은 프레임 민감도가 커서 후보를 촘촘히 두고 최선 잔차를 고른다.
+_ALIGN_FRACS = (0.05, 0.12, 0.2, 0.28, 0.36, 0.5, 0.65, 0.8)
+_LEVEL_GOOD_DEG = 0.4     # 이 잔차면 즉시 채택
+_LEVEL_MAX_DEG = 2.0      # 전 후보 중 최선이 이보다 나쁘면 실패
 
 # 설치(settle) 탐지: 이 시간 안의 자이로 방향 변경 이벤트는 녹화 시작 후
 # 각도 조절·삼각대 세우기로 본다 — 마지막 이벤트 + 여유 이후에서 정합.
@@ -113,21 +116,39 @@ def _read_pair(vid_l, vid_r, offset, t):
 
 
 def _estimate_align(vid_l, vid_r, offset, lens, t0, t1):
-    """구간 내 후보 시각들에서 정합 시도, 첫 성공을 반환."""
+    """구간 내 후보 시각들에서 정합 시도.
+
+    auto-level 잔차(level_resid_deg)가 _LEVEL_GOOD_DEG 미만이면 즉시
+    채택, 아니면 전 후보 중 최선을 쓴다. 앞 프레임의 최선 해를 다음
+    auto-level 의 시작점으로 시드해 수렴을 돕는다.
+    """
+    best = None                # (resid_deg, alignment, t)
     last_err = None
     for frac in _ALIGN_FRACS:
         t = t0 + frac * (t1 - t0)
         imgs = _read_pair(vid_l, vid_r, offset, t)
         if imgs is None:
             continue
+        seed = (best[1].pitch_auto, best[1].roll_auto) if best else None
         try:
             a = estimate_alignment(imgs[0], imgs[1], lens, log=_log,
-                                   require_level=True)
-            return a, t
+                                   require_level=True, level_init=seed)
         except RuntimeError as e:
             last_err = e
             _log(f"[align] t={t:.0f}s 실패: {e}")
-    raise RuntimeError(f"모든 후보 프레임에서 정합 실패: {last_err}")
+            continue
+        if best is None or a.level_resid_deg < best[0]:
+            best = (a.level_resid_deg, a, t)
+        if a.level_resid_deg < _LEVEL_GOOD_DEG:
+            return a, t
+    if best is not None and best[0] < _LEVEL_MAX_DEG:
+        _log(f"[align] 완전 수렴 실패 — 최선 해 채택 "
+             f"(잔차 {best[0]:.2f}°, t={best[2]:.0f}s)")
+        return best[1], best[2]
+    raise RuntimeError(
+        f"모든 후보 프레임에서 정합 실패 (최선 잔차 "
+        f"{best[0]:.2f}°): {last_err}" if best else
+        f"모든 후보 프레임에서 정합 실패: {last_err}")
 
 
 # ------------------------------------------------------------ 드리프트 스캔
