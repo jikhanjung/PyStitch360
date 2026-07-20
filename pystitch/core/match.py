@@ -60,7 +60,8 @@ def _portable(p: str, base: Path) -> str:
 def load_match(path: str | Path) -> dict:
     """match.json 로드 + 멤버 경로 복원. 형식 오류는 ValueError."""
     path = Path(path)
-    d = json.loads(path.read_text())
+    # 인코딩 명시 필수 — Windows 기본(cp949)은 한글 제목의 UTF-8 을 못 읽는다
+    d = json.loads(path.read_text(encoding="utf-8"))
     if d.get("version", 0) > MATCH_VERSION:
         raise ValueError(f"match.json v{d['version']} — 지원은 v{MATCH_VERSION} 까지")
     if not d.get("halves"):
@@ -95,7 +96,8 @@ def save_match(path: str | Path, doc: dict) -> Path:
                        for a in h.get("alts", [])]}
         out["halves"].append(oh)
     tmp = Path(str(path) + ".tmp")
-    tmp.write_text(json.dumps(out, ensure_ascii=False, indent=1))
+    tmp.write_text(json.dumps(out, ensure_ascii=False, indent=1),
+                   encoding="utf-8")
     tmp.replace(path)
     return path
 
