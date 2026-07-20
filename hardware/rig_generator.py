@@ -68,6 +68,16 @@ CANOPY_OVH = 12.0    # outboard/rear overhang beyond the footprint
 CANOPY_OVH_IN = 2.0  # inboard overhang (packing: cradles sit CAM_GAP apart)
 CANOPY_OVH_F = 6.0   # front overhang (limited — lens looks forward)
 CANOPY_VENT_W = 6.0  # rising-air vent slot width (near the side walls)
+
+# Cooling fan (v7): 40 mm 5V USB axial fan on the canopy plate, blowing
+# down into the air gap; the open sides exhaust. USB power is already at
+# the mast for the cameras.
+FAN_HOLE_D = 38.0    # through opening diameter
+FAN_SCREW_SP = 32.0  # screw square spacing (40 mm fan standard)
+FAN_SCREW_D = 2.8    # M3 self-tap pilot
+FAN_OFF_Y = -10.0    # fan center shifted rearward — keeps a front shutter slot
+FAN_SLOT_W = 30.0    # reduced front finger slot (shutter) width
+CABLE_NOTCH = 5.0    # fan cable pass-through notch in the +x wall rear
 # FOV clearance margins (HERO5 4K 16:9 wide ≈ 118°×69.5°): a canopy point
 # only matters if it is inside the horizontal FOV; there it must sit above
 # the vertical half-FOV. Both padded for the fisheye corner bulge.
@@ -165,7 +175,7 @@ def build_cradle_toploader():
     return union(parts), []
 
 
-def build_cradle_rearload(roof=False, canopy=False):
+def build_cradle_rearload(roof=False, canopy=False, fan=False):
     """Camera faces +y, z up, origin at floor center; slides in from the back.
 
     Fully open back (touchscreen unobstructed), open top between two side
@@ -234,16 +244,43 @@ def build_cradle_rearload(roof=False, canopy=False):
             z_pl0, z_pl1 = z_wall0 - CANOPY_T, z_wall0
         for sx in (-1, 1):
             x0, x1 = sorted((sx * ow / 2, sx * (ow / 2 - WALL)))
-            parts.append(box(x0, x1, y_rear, y_front_in + WALL,
-                             z_wall0, z_wall1))
+            wall = box(x0, x1, y_rear, y_front_in + WALL, z_wall0, z_wall1)
+            if fan and sx == 1:                  # fan cable notch, rear end
+                nz = ((z_wall1 - CABLE_NOTCH, z_wall1 + 0.1)
+                      if canopy in (True, "top")
+                      else (z_wall0 - 0.1, z_wall0 + CABLE_NOTCH))
+                wall = difference(wall, [box(x0 - 1, x1 + 1,
+                                             y_rear + 2, y_rear + 2 + 6,
+                                             nz[0], nz[1])])
+            parts.append(wall)
         plate = box(-ow / 2 - CANOPY_OVH_IN, ow / 2 + CANOPY_OVH,
                     y_rear - CANOPY_OVH, y_front_in + WALL + CANOPY_OVH_F,
                     z_pl0, z_pl1)
         cut = []
-        if canopy is True or canopy == "top":   # shutter finger hole
-            cut.append(box(-ROOF_HOLE_W / 2, ROOF_HOLE_W / 2,
-                           -ROOF_HOLE_D / 2, ROOF_HOLE_D / 2,
-                           z_pl0 - 1, z_pl1 + 1))
+        if canopy is True or canopy == "top":   # shutter finger hole/slot
+            if fan:                              # fan takes the center —
+                cut.append(box(-FAN_SLOT_W / 2, FAN_SLOT_W / 2,   # front slot
+                               FAN_OFF_Y + FAN_HOLE_D / 2 + 2,
+                               y_front_in + WALL + CANOPY_OVH_F - 1,
+                               z_pl0 - 1, z_pl1 + 1))
+            else:
+                cut.append(box(-ROOF_HOLE_W / 2, ROOF_HOLE_W / 2,
+                               -ROOF_HOLE_D / 2, ROOF_HOLE_D / 2,
+                               z_pl0 - 1, z_pl1 + 1))
+        if fan:                                  # 40 mm fan: opening + M3 pilots
+            c = trimesh.creation.cylinder(radius=FAN_HOLE_D / 2,
+                                          height=CANOPY_T + 2, sections=64)
+            c.apply_translation((0, FAN_OFF_Y, (z_pl0 + z_pl1) / 2))
+            cut.append(c)
+            for px in (-1, 1):
+                for py in (-1, 1):
+                    s = trimesh.creation.cylinder(radius=FAN_SCREW_D / 2,
+                                                  height=CANOPY_T + 2,
+                                                  sections=24)
+                    s.apply_translation((px * FAN_SCREW_SP / 2,
+                                         FAN_OFF_Y + py * FAN_SCREW_SP / 2,
+                                         (z_pl0 + z_pl1) / 2))
+                    cut.append(s)
         for sx in (-1, 1):                       # rising-air vents
             xc = sx * (iw / 2 - CANOPY_VENT_W)
             cut.append(box(xc - CANOPY_VENT_W / 2, xc + CANOPY_VENT_W / 2,
@@ -641,10 +678,28 @@ if __name__ == "__main__":
              c, cu, pitch_deg=28.0,
              cradle_left=build_cradle_rearload(canopy="bottom")[0]),
          deployment=DEPLOY_CLOSE | {
-             "status": "recommended for summer sessions (thermal); "
-                       "same aim as v5",
+             "status": "passive-cooling variant (no fan); see v7 for "
+                       "forced-air summer sessions",
              "thermal_note": "flush roofs (v4/v5) soak sun onto the camera "
                              "top; the canopy shades it while the air gap "
                              "keeps convection alive — groundwork for "
                              "8K-class bodies (Ace Pro 2 candidate) that "
                              "throttle on heat"})
+    emit("GP5-DUAL-v7", "v6 + 40 mm 5V USB fan mounts on both canopies "
+         "(38 mm opening, M3 pilots at 32 mm square, rear-shifted so a "
+         "reduced front shutter slot survives on the upright cradle; fan "
+         "cable notch in the outboard wall). Fan blows into the air gap, "
+         "open sides exhaust",
+         lambda: build_cradle_rearload(canopy="top", fan=True),
+         rig_builder=lambda c, cu: build_rig_lens_inward(
+             c, cu, pitch_deg=28.0,
+             cradle_left=build_cradle_rearload(canopy="bottom",
+                                               fan=True)[0]),
+         deployment=DEPLOY_CLOSE | {
+             "status": "recommended for midsummer sessions (forced air); "
+                       "same aim as v5/v6",
+             "fan": "40x40x10 mm 5V USB axial, one per cradle, blowing "
+                    "down into the gap; power from the mast USB bank",
+             "thermal_note": "8K-class bodies (Ace Pro 2 candidate) "
+                             "throttle on heat — shade + forced airflow "
+                             "is the field remedy"})
