@@ -130,9 +130,15 @@ def _estimate_align(vid_l, vid_r, offset, lens, t0, t1):
         if imgs is None:
             continue
         seed = (best[1].pitch_auto, best[1].roll_auto) if best else None
+        extras = []
+        for dt in (15.0, 30.0):        # auto-level 점 풀링용 추가 프레임
+            p = _read_pair(vid_l, vid_r, offset, min(t + dt, t1 - 1.0))
+            if p is not None:
+                extras.append(p)
         try:
             a = estimate_alignment(imgs[0], imgs[1], lens, log=_log,
-                                   require_level=True, level_init=seed)
+                                   require_level=True, level_init=seed,
+                                   level_frames=extras)
         except RuntimeError as e:
             last_err = e
             _log(f"[align] t={t:.0f}s 실패: {e}")

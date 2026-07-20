@@ -118,6 +118,12 @@ def auto_level(imgs, Rs, lens: LensProfile, yaw_range, scale=0.2, log=print,
                init=(0.0, 0.0)):
     """먼 쪽 터치라인 기반 pitch/roll 자동 추정. 반환 (pitch, roll, resid).
 
+    imgs 는 [img_l, img_r] 한 쌍 또는 [(img_l, img_r), ...] 여러 쌍 —
+    여러 쌍이면 검출점을 풀링해서 피팅한다. 프레임 한 장의 터치라인
+    점은 ~30개뿐이라 선수 가림·경계 잡음에 추정이 크게 흔들리는데
+    (동일 시각 ±1 프레임으로 발산/수렴이 갈린 실사례), 몇 프레임만
+    합쳐도 점이 수 배로 늘어 피팅이 안정된다.
+
     resid 는 채택 해의 실측 잔차(rad), 한 번도 측정하지 못했으면 None
     (반환 0° 는 "수평" 아니라 "모름"). init 으로 시작점을 시드하면 이미
     아는 근사 해 근처에서 출발해 수렴이 훨씬 안정적이다 — 헤드리스는
@@ -126,21 +132,31 @@ def auto_level(imgs, Rs, lens: LensProfile, yaw_range, scale=0.2, log=print,
     부호를 관례로 가정하지 않는다: 시험 회전(+2°)의 계수 변화(수치 야코비안)를
     측정해 2x2 선형계를 푼다. (해석적 부호 유도는 roll 발산 이력 있음 — devlog 001)
     """
+    if len(imgs) == 2 and isinstance(imgs[0], np.ndarray):
+        pairs = [(imgs[0], imgs[1])]
+    else:
+        pairs = [tuple(p) for p in imgs]
     f = lens.focal
     el0, el1 = np.deg2rad(-45), np.deg2rad(35)
     out_w = int(2 * yaw_range * f * scale)
     out_h = int((np.tan(el1) - np.tan(el0)) * f * scale)
     t1, t0 = np.tan(el1), np.tan(el0)
+    yaws = np.linspace(-yaw_range, yaw_range, out_w)
 
     def el_of_row(rows):
         return np.arctan(t1 + (np.asarray(rows, dtype=np.float64) / (out_h - 1)) * (t0 - t1))
 
     def measure(pitch, roll):
         R_adj = rot_xz(pitch, roll)
-        pano = render_pano(imgs, [R @ R_adj for R in Rs], lens, out_w, out_h,
-                           -yaw_range, yaw_range, el0, el1, feather_px=30)
-        yaws = np.linspace(-yaw_range, yaw_range, out_w)
-        pts = detect_far_touchline(pano, yaws, el_of_row)
+        Rs_adj = [R @ R_adj for R in Rs]
+        found = []
+        for im_l, im_r in pairs:
+            pano = render_pano([im_l, im_r], Rs_adj, lens, out_w, out_h,
+                               -yaw_range, yaw_range, el0, el1, feather_px=30)
+            pts = detect_far_touchline(pano, yaws, el_of_row)
+            if len(pts):
+                found.append(pts)
+        pts = np.concatenate(found) if found else np.empty((0, 2))
         if len(pts) < 30:
             return None, len(pts)
         coef, n_in = _fit_line_coeffs(pts)
@@ -214,7 +230,8 @@ def find_halfway_line_yaw(imgs, Rs, lens: LensProfile, yaw_range, el0, el1,
 
 def estimate_alignment(img_l, img_r, lens: LensProfile, log=print,
                        reuse_level: "Alignment | None" = None,
-                       require_level=False, level_init=None) -> Alignment:
+                       require_level=False, level_init=None,
+                       level_frames=None) -> Alignment:
     """프레임 쌍에서 전체 정합 추정 (상대 회전 + 자동 수평 + 자동 센터링).
 
     reuse_level 이 주어지면 수평(pitch/roll)·센터링(yaw)은 그 값을 그대로 쓰고
@@ -225,7 +242,8 @@ def estimate_alignment(img_l, img_r, lens: LensProfile, log=print,
     RuntimeError — 무인(헤드리스) 실행은 0° 를 수평으로 오인하면 안 된다
     (GUI 는 사용자가 슬라이더로 만회할 수 있어 기본 False). 수렴 품질은
     반환 Alignment.level_resid_deg 로 판단한다. level_init 은 auto-level
-    시작점 시드 ((pitch, roll) rad).
+    시작점 시드 ((pitch, roll) rad), level_frames 는 auto-level 점 풀링에
+    추가할 (img_l, img_r) 쌍 목록.
     """
     pts_l, pts_r = match_overlap(img_l, img_r)
     if len(pts_l) < 20:
@@ -253,9 +271,9 @@ def estimate_alignment(img_l, img_r, lens: LensProfile, log=print,
         log(f"[align] 수평/센터링 기존 값 재사용: pitch {np.rad2deg(pitch):+.2f}° "
             f"roll {np.rad2deg(roll):+.2f}° yaw {np.rad2deg(yaw_c):+.2f}°")
     else:
-        pitch, roll, resid = auto_level([img_l, img_r], [Rh, Rh.T], lens,
-                                        yaw_range, log=log,
-                                        init=level_init or (0.0, 0.0))
+        pitch, roll, resid = auto_level(
+            [(img_l, img_r)] + list(level_frames or []), [Rh, Rh.T], lens,
+            yaw_range, log=log, init=level_init or (0.0, 0.0))
         if resid is None:
             if require_level:
                 raise RuntimeError(
