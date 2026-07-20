@@ -26,6 +26,34 @@ TRANSFORMS = (
 TRANSFORM_NAMES = ("identity", "flip_x", "flip_y", "rot180")
 
 
+def to_other_time(clock, t_a):
+    """A 시각 → B(다른 카메라) 시각 — t_A = offset + drift·t_B 의 역."""
+    return (t_a - clock["offset"]) / clock["drift"]
+
+
+def cut_synced_clip(other_path, clock, t0_a, t1_a, out_path,
+                    codec="libx264", crf=23):
+    """A 기준 구간 [t0_a, t1_a] 를 동기화된 다른 카메라에서 잘라 인코딩.
+
+    P06-2 조기 성과물: 하이라이트 구간의 고화질 대체 앵글 (AX700 등).
+    -ss 를 입력 앞에 두고 재인코딩 — 트랜스코딩 시크는 프레임 정밀.
+    반환: 출력 경로 (실패 시 CalledProcessError).
+    """
+    import subprocess
+
+    from .encoders import encoder_args, ffmpeg_bin
+    b0 = max(0.0, to_other_time(clock, t0_a))
+    dur = max(0.1, (t1_a - t0_a) / clock.get("drift", 1.0))
+    cmd = ([ffmpeg_bin(), "-y", "-v", "error",
+            "-ss", f"{b0:.3f}", "-i", str(other_path),
+            "-t", f"{dur:.3f}"]
+           + encoder_args(codec, crf)
+           + ["-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k",
+              str(out_path)])
+    subprocess.run(cmd, check=True)
+    return out_path
+
+
 def sync_by_whistles(events_a, events_b, min_db=15.0, tol_s=0.6,
                      max_offset_s=1800.0, bin_s=0.25, min_matches=4):
     """호각 이벤트 [(t0, t1, db)] 두 벌 → 시계 모델 (거친 동기화).

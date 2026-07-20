@@ -87,6 +87,40 @@ def test_symmetry_detection():
         assert r["rms_m"] < 1.0                # 정합 후 궤적 거리
 
 
+def test_to_other_time_roundtrip():
+    from pystitch.core.sync_multi import to_other_time
+    clock = {"offset": TRUE_OFFSET, "drift": TRUE_DRIFT}
+    for tb in (0.0, 500.0, 1800.0):
+        assert abs(to_other_time(clock, _t_a(tb)) - tb) < 1e-9
+
+
+def test_cut_synced_clip(tmp_path):
+    """동기화 클립 컷: 프레임 번호를 화소에 새겨 시작점·길이 검증."""
+    import shutil
+
+    import cv2
+    import pytest
+
+    from pystitch.core.sync_multi import cut_synced_clip
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg 없음")
+    src = tmp_path / "other.mp4"
+    vw = cv2.VideoWriter(str(src), cv2.VideoWriter_fourcc(*"mp4v"),
+                         30, (320, 240))
+    for f in range(300):                       # 10초, 밝기 = 프레임 번호
+        vw.write(np.full((240, 320, 3), min(f, 255), np.uint8))
+    vw.release()
+    clock = {"offset": 100.0, "drift": 1.0}    # A 시각 = B 시각 + 100
+    out = tmp_path / "clip.mp4"
+    cut_synced_clip(src, clock, 103.0, 105.0, out, crf=28)
+    cap = cv2.VideoCapture(str(out))
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    ok, first = cap.read()
+    cap.release()
+    assert ok and abs(n - 60) <= 2             # 2초 분량
+    assert abs(float(first.mean()) - 90) <= 3  # B 시각 3.0s = 프레임 90
+
+
 def test_whistle_sync_insufficient_events():
     ev = [(10.0, 10.5, 25.0), (20.0, 20.5, 25.0)]
     assert sync_by_whistles(ev, ev) is None

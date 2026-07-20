@@ -27,6 +27,16 @@ def main():
     ap.add_argument("--detect-every", type=int, default=3)
     ap.add_argument("--backup-tag", default="v8n",
                     help="기존 분석 백업 접미사 (없으면 백업 안 함)")
+    # AX700 등 비파노라마 소스용 오버라이드 (P06-2): 기본값들은 초광폭
+    # 파노라마 튜닝 — det_w=폭/2, field_top 0.26, far_boost 원경 밴드.
+    ap.add_argument("--det-w", type=int, default=None,
+                    help="검출 해상도 폭 (기본: 소스 폭/2 — 16:9 소스는 "
+                         "폭 전체 권장, 예: 1920)")
+    ap.add_argument("--field-top", type=float, default=0.26,
+                    help="이 비율 위 검출은 장외로 버림 (0=끄기 — "
+                         "팬 카메라는 프레임 상단이 늘 관중석이 아님)")
+    ap.add_argument("--no-far-boost", action="store_true",
+                    help="원경 공 부스트 끄기 (근측 뷰 소스는 불필요)")
     args = ap.parse_args()
 
     pano = Path(args.pano)
@@ -53,6 +63,8 @@ def main():
     print(f"재분석 시작: {pano.name}, weights={args.weights}", flush=True)
     d = analyze_video(str(pano), weights=args.weights,
                       detect_every=args.detect_every,
+                      det_w=args.det_w, field_top_frac=args.field_top,
+                      far_boost=not args.no_far_boost,
                       checkpoint_path=str(ckpt),
                       progress=progress, log=lambda s: print(s, flush=True))
     if d is None:

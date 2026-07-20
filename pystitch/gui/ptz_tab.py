@@ -1171,11 +1171,11 @@ class HighlightBatchWorker(QThread):
 
     def __init__(self, pano_path, out_dir, stem, analysis, keyframes, codec,
                  crf, ignores=None, far_zoom=1.0, promotes=None, radar=None,
-                 segments=(), clock=None):
+                 segments=(), clock=None, alt=None):
         super().__init__()
         self.args = (pano_path, out_dir, stem, analysis, keyframes, codec,
                      crf, ignores or [], far_zoom, promotes or [], radar,
-                     list(segments), clock)
+                     list(segments), clock, alt)
         self._cancel = False
 
     def cancel(self):
@@ -1183,7 +1183,7 @@ class HighlightBatchWorker(QThread):
 
     def run(self):
         (pano, out_dir, stem, analysis, kfs, codec, crf, ignores, far_zoom,
-         promotes, radar, segs, clock) = self.args
+         promotes, radar, segs, clock, alt) = self.args
         try:
             out_w, out_h = 1920, 1080
             plan = build_plan(analysis, analysis["pano_w"], analysis["pano_h"],
@@ -1205,6 +1205,18 @@ class HighlightBatchWorker(QThread):
                                 self.progress.emit(b + d, total, f),
                             cancel=lambda: self._cancel, radar=radar,
                             start=s, end=e, clock=clock)
+                if alt is not None and not self._cancel:
+                    # 동기화된 다른 카메라 앵글 (P06-2 조기 성과물)
+                    from ..core.sync_multi import cut_synced_clip
+                    fps = analysis["fps"]
+                    out_a = Path(out_dir) / (
+                        f"{stem}_h{k:02d}_{name}_{alt['label']}.mp4")
+                    try:
+                        cut_synced_clip(alt["path"], alt, s / fps, e / fps,
+                                        out_a, codec=codec, crf=crf)
+                        self.log.emit(f"[hl] 대체 앵글: {out_a.name}")
+                    except Exception as ex:  # noqa: BLE001
+                        self.log.emit(f"[hl] 대체 앵글 실패: {ex}")
                 base += e - s
             if self._cancel:
                 self.failed.emit("취소됨")
@@ -1218,7 +1230,7 @@ class HighlightExportDialog(QDialog):
     """하이라이트 일괄 내보내기 — 구간 체크 목록·출력 폴더·코덱/CRF/미니맵."""
 
     def __init__(self, parent, highlights, fps, encoders, crf, radar_on,
-                 default_dir, clock_on=None):
+                 default_dir, clock_on=None, alt_label=None):
         super().__init__(parent)
         self.setWindowTitle("하이라이트 일괄 내보내기")
         self.fps = fps
@@ -1278,6 +1290,17 @@ class HighlightExportDialog(QDialog):
             self.check_clock.setChecked(bool(clock_on))
         form.addRow("경기 시계", self.check_clock)
 
+        self.check_alt = QCheckBox(
+            f"동기화된 다른 카메라 앵글 동시 추출 ({alt_label})"
+            if alt_label else "동기화된 다른 카메라 없음")
+        if alt_label is None:
+            self.check_alt.setEnabled(False)
+            self.check_alt.setToolTip(
+                "scripts/sync_cams.py 로 두 영상을 먼저 동기화하세요")
+        else:
+            self.check_alt.setChecked(True)
+        form.addRow("대체 앵글", self.check_alt)
+
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
                               | QDialogButtonBox.StandardButton.Cancel)
         bb.button(QDialogButtonBox.StandardButton.Ok).setText("일괄 내보내기")
@@ -1302,7 +1325,8 @@ class HighlightExportDialog(QDialog):
                 "codec_name": self.combo_codec.currentText(),
                 "crf": self.spin_crf.value(),
                 "radar": self.check_radar.isChecked(),
-                "clock": self.check_clock.isChecked()}
+                "clock": self.check_clock.isChecked(),
+                "alt": self.check_alt.isChecked()}
 
 
 class PtzTab(QWidget):
@@ -4068,13 +4092,29 @@ class PtzTab(QWidget):
         self._stop_play()
         st = QSettings("PyStitch360", "PyStitch360")
         clock_avail = self._clock_config() is not None
+        # 동기화된 다른 카메라 (sync_cams.py 결과, P06)
+        alt = None
+        try:
+            from ..core.events import load_events_doc
+            sync = load_events_doc(self.pano_path).get("sync")
+            if sync and Path(sync.get("other", "")).exists():
+                import re as _re
+                label = _re.sub(r"[^0-9A-Za-z가-힣]+", "_",
+                                Path(sync["other"]).stem)[:16] or "alt"
+                alt = {"path": sync["other"],
+                       "offset": float(sync["offset"]),
+                       "drift": float(sync.get("drift", 1.0)),
+                       "label": label}
+        except Exception as e:  # noqa: BLE001
+            self.log(f"[hl] 동기화 정보 무시: {e}")
         dlg = HighlightExportDialog(
             self, cands, self.fps, self.encoders,
             int(st.value("ptz_export_crf", 20)),
             st.value("ptz_export_radar", "true") == "true",
             str(self.pano_path.parent),
             clock_on=(st.value("ptz_export_clock", "true") == "true"
-                      if clock_avail else None))
+                      if clock_avail else None),
+            alt_label=alt["label"] if alt else None)
         if not dlg.exec():
             return
         cfg = dlg.config()
@@ -4112,7 +4152,8 @@ class PtzTab(QWidget):
             far_zoom=self.spin_far_zoom.value(),
             promotes=[tuple(p) for p in self.promotes],
             radar=radar, segments=segs,
-            clock=self._clock_config() if cfg["clock"] else None)
+            clock=self._clock_config() if cfg["clock"] else None,
+            alt=alt if cfg["alt"] else None)
         w.log.connect(self.log)
         w.progress.connect(self._render_progress)
         w.finished_ok.connect(self._batch_done)
