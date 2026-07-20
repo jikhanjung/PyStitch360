@@ -1953,7 +1953,7 @@ class PtzTab(QWidget):
         self.match, self.match_half = doc, half
         if self.mc is None:
             self.mc = MulticamViewer(self.pane, self._pane_split, self.log)
-        self.mc.set_half(h.get("alts", []), swap_redraw=self._redraw)
+        self.mc.set_half(h.get("alts", []), redraw=self._redraw)
         self._rebuild_mc_bar()
         self._set_coverage_lane()
         n = len(h.get("alts", []))
@@ -1977,19 +1977,7 @@ class PtzTab(QWidget):
         style = ("QPushButton { color: white; background: rgba(20,20,20,150);"
                  " padding: 2px 8px; border-radius: 4px; }"
                  "QPushButton:checked { background: rgba(0,120,215,200); }")
-        self._mc_btns = []
-        names = ["1 파노라마"] + [f"{i + 2} {Path(a['video']).stem}"
-                                  for i, a in enumerate(alts)]
-        for i, name in enumerate(names):
-            b = QPushButton(name)
-            b.setCheckable(True)
-            b.setStyleSheet(style)
-            b.setChecked(i == 0 if not self.mc.enabled
-                         else i == self.mc.active + 1)
-            b.clicked.connect(lambda _, idx=i: self._mc_select(idx))
-            self._mc_row.addWidget(b)
-            self._mc_btns.append(b)
-        self._mc_row.addSpacing(12)
+        # 모드가 상위 개념 (좌측), 카메라 선택은 모드 안의 배치 (우측)
         self._mc_mode_btns = {}
         for key, name in (("pip", "PiP"), ("split", "분할"), ("swap", "전환")):
             b = QPushButton(name)
@@ -1999,21 +1987,38 @@ class PtzTab(QWidget):
             b.clicked.connect(lambda _, k=key: self._mc_mode(k))
             self._mc_row.addWidget(b)
             self._mc_mode_btns[key] = b
+        self._mc_row.addSpacing(12)
+        self._mc_btns = []
+        names = ["1 파노라마"] + [f"{i + 2} {Path(a['video']).stem}"
+                                  for i, a in enumerate(alts)]
+        for i, name in enumerate(names):
+            b = QPushButton(name)
+            b.setCheckable(True)
+            b.setStyleSheet(style)
+            b.setChecked(i == self.mc.focus)
+            b.clicked.connect(lambda _, idx=i: self._mc_select(idx))
+            self._mc_row.addWidget(b)
+            self._mc_btns.append(b)
+        self._mc_cam_enable()
+
+    def _mc_cam_enable(self):
+        """분할 모드는 둘 다 보이므로 카메라 선택이 무의미 — 비활성."""
+        both = self.mc is not None and self.mc.mode == "split"
+        for b in getattr(self, "_mc_btns", []):
+            b.setEnabled(not both)
 
     def _mc_select(self, idx: int):
-        """카메라 선택: 0=파노라마, 1..=alt (숫자키/버튼 공용)."""
+        """카메라 선택 (모드 안의 배치): 0=파노라마, 1..=alt."""
         if self.mc is None or self.match is None:
             return
         alts = self.match["halves"][self.match_half].get("alts", [])
-        if idx > len(alts):
+        if idx > len(alts) or self.mc.mode == "split":
             return
-        if idx == 0:
-            self.mc.set_enabled(False)
-        else:
-            self.mc.active = idx - 1
-            self.mc.set_enabled(True)
+        self.mc.set_focus(idx)
         for i, b in enumerate(getattr(self, "_mc_btns", [])):
             b.setChecked(i == idx)
+        # focus 가 alt 인 PiP 는 파노라마를 안쪽에 즉시 공급
+        self.mc.primary_tick(getattr(self, "_cur_frame", None))
         self._redraw()
 
     def _mc_mode(self, mode: str):
@@ -2022,6 +2027,8 @@ class PtzTab(QWidget):
         self.mc.set_mode(mode)
         for k, b in getattr(self, "_mc_mode_btns", {}).items():
             b.setChecked(k == mode)
+        self._mc_cam_enable()
+        self.mc.primary_tick(getattr(self, "_cur_frame", None))
         self._redraw()
 
     def _set_coverage_lane(self):
@@ -2553,6 +2560,7 @@ class PtzTab(QWidget):
         self._cur_frame, self._cur_frame_idx = frame, f
         if self.mc is not None:
             self.mc.update(f / self.fps, playing=True)
+            self.mc.primary_tick(frame, playing=True)
         self._play_sync = True      # 워커 발 갱신 표시 — 사용자 시크와 구분
         try:
             self.slider.setValue(f)  # _show_frame 은 재생 중 가드로 무시됨
@@ -2866,7 +2874,7 @@ class PtzTab(QWidget):
 
     def _pane_pressed(self, fx, fy):
         """좌버튼 프레스: 랜드마크(경기장 탭) 또는 크롭 박스 편집 시작."""
-        if self.mc is not None and self.mc.swap_active:
+        if self.mc is not None and self.mc.alt_on_main:
             return                        # 전환 모드: alt 표시 중 편집 입력 차단
         if self.cap is None:
             return
@@ -2899,7 +2907,7 @@ class PtzTab(QWidget):
                                            self.slider.value())}
 
     def _pane_dragged(self, fx, fy):
-        if self.mc is not None and self.mc.swap_active:
+        if self.mc is not None and self.mc.alt_on_main:
             return                        # 전환 모드: alt 표시 중 편집 입력 차단
         if self._lm_drag is not None:        # 랜드마크 이동 — 라이브 재피팅
             self.field_points[self._lm_drag] = \
@@ -2939,7 +2947,7 @@ class PtzTab(QWidget):
         self._redraw()
 
     def _pane_released(self, fx, fy):
-        if self.mc is not None and self.mc.swap_active:
+        if self.mc is not None and self.mc.alt_on_main:
             return                        # 전환 모드: alt 표시 중 편집 입력 차단
         if self._lm_drag is not None:
             key, self._lm_drag = self._lm_drag, None
@@ -2987,12 +2995,13 @@ class PtzTab(QWidget):
         self._cur_frame, self._cur_frame_idx = frame, f
         if self.mc is not None:
             self.mc.update(f / self.fps, playing=False)
+            self.mc.primary_tick(frame)
         self._redraw()
 
     def _redraw(self):
         """오버레이만 다시 그림 — 키프레임/무시/계획 변경 시 디코딩 없이 즉시."""
-        if self.mc is not None and self.mc.swap_active:
-            sf = self.mc.swap_frame()     # 전환 모드: alt 프레임 원본 표시
+        if self.mc is not None and self.mc.alt_on_main:
+            sf = self.mc.main_frame()     # focus 카메라(alt) 원본 표시
             if sf is not None:
                 self.pane.set_frame(sf)
                 return
@@ -3217,7 +3226,7 @@ class PtzTab(QWidget):
     # ------------------------------------------------------ 화면 오브젝트 조작
     def _pane_clicked(self, fx, fy):
         """좌클릭: 오브젝트 상태별 기본 동작 / 빈 곳은 키프레임 추가."""
-        if self.mc is not None and self.mc.swap_active:
+        if self.mc is not None and self.mc.alt_on_main:
             return                        # 전환 모드: alt 표시 중 편집 입력 차단
         if self.cap is None:
             return
@@ -3259,7 +3268,7 @@ class PtzTab(QWidget):
 
     def _pane_context(self, fx, fy, gpos):
         """우클릭: 오브젝트별 전체 동작 메뉴."""
-        if self.mc is not None and self.mc.swap_active:
+        if self.mc is not None and self.mc.alt_on_main:
             return                        # 전환 모드: alt 표시 중 편집 입력 차단
         if self.cap is None or self.analysis is None:
             return
@@ -3388,7 +3397,7 @@ class PtzTab(QWidget):
 
     def _pane_hover(self, fx, fy):
         """커서 근처 오브젝트/크롭 박스를 하이라이트 (바뀔 때만 리드로우)."""
-        if self.mc is not None and self.mc.swap_active:
+        if self.mc is not None and self.mc.alt_on_main:
             return                        # 전환 모드: alt 표시 중 편집 입력 차단
         if self.analysis is None or getattr(self, "_cur_frame", None) is None:
             return

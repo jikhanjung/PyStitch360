@@ -124,13 +124,22 @@ class AltPane(FramePane):
 
 
 class MulticamViewer:
-    """PtzTab 에 얹히는 컨트롤러 — alt 목록·모드·활성 카메라.
+    """PtzTab 에 얹히는 컨트롤러 — 모드가 상위, 카메라는 모드 안의 배치.
+
+    모드(사용자 확정 2026-07-21):
+      - pip:   focus 카메라가 메인, 다른 카메라가 구석 PiP.
+               focus=파노라마 → PiP 에 alt / focus=alt → PiP 에 파노라마.
+      - split: 파노라마 | alt 좌우 동시 — focus 무관.
+      - swap:  focus 카메라 하나만 (swap+1 = 순수 파노라마 화면).
+    focus 는 숫자키/버튼: 0=파노라마(primary), 1..=alt.
 
     호출 계약 (PtzTab):
-      - set_half(alts): 하프 전환/경기 열기 때 alt 목록 교체
-      - update(t_primary, playing): 표시 갱신 (재생 중엔 내부 스로틀)
-      - swap_frame(): 전환 모드에서 메인 페인에 대신 그릴 프레임 (없으면 None)
-      - close(): 정리
+      - set_half(alts, redraw): 경기 열기/하프 전환 때 alt 목록 교체
+      - update(t_primary, playing): alt 프레임 요청 (재생 중 스로틀)
+      - primary_tick(frame): 현재 파노라마 프레임 공급 (PiP 용, 디코드 재사용)
+      - main_frame(): 메인 페인에 파노라마 대신 그릴 프레임 (없으면 None)
+      - alt_on_main: 메인이 alt 표시 중 (편집 입력 차단용)
+      - close(): 디코드 스레드 정리
     """
 
     MODES = ("pip", "split", "swap")
@@ -140,15 +149,16 @@ class MulticamViewer:
         self._pane = pane                     # 메인 FramePane (PiP 부모)
         self._split = pane_split              # 가로 QSplitter (분할 모드)
         self._log = log_fn
-        self.alts: list[dict] = []            # [{video, clock, label}]
-        self.active = 0                       # 활성 alt 인덱스
+        self.alts: list[dict] = []            # [{video, clock}]
+        self.focus = 0                        # 0=primary, 1..=alt
         self.mode = str(QSettings("PyStitch360", "PyStitch360")
                         .value("mc_mode", "pip"))
-        self.enabled = False                  # 카메라 2 이상 선택 시 True
+        if self.mode not in self.MODES:
+            self.mode = "pip"
         self._last_t = None
         self._last_emit = 0.0
-        self._swap_frame = None               # 전환 모드용 최신 alt 프레임
-        self._swap_redraw = None              # 프레임 도착 시 메인 재그리기 콜백
+        self._main_frame = None               # focus>0 일 때 메인용 alt 프레임
+        self._redraw = None                   # 메인 재그리기 콜백
         self.pane_alt = AltPane()
         self.pane_alt.hide()
         self._worker = AltDecodeWorker()
@@ -156,35 +166,40 @@ class MulticamViewer:
         self._worker.start()
 
     # ------------------------------------------------------------ 구성
-    def set_half(self, alts: list[dict], swap_redraw=None):
+    def set_half(self, alts: list[dict], redraw=None):
         self.alts = alts or []
-        self.active = 0
-        self._swap_frame = None
-        self._swap_redraw = swap_redraw
-        if not self.alts:
-            self.set_enabled(False)
-
-    def set_enabled(self, on: bool):
-        """카메라 선택: on = alt 표시 (모드에 따라 배치), off = primary 만."""
-        self.enabled = bool(on and self.alts)
+        self.focus = 0
+        self._main_frame = None
+        self._redraw = redraw
         self._apply_layout()
-        if self._swap_redraw:
-            self._swap_redraw()
-        if self.enabled and self._last_t is not None:
+
+    def set_focus(self, idx: int):
+        """카메라 선택 (모드 안의 배치): 0=파노라마, 1..=alt."""
+        if not (0 <= idx <= len(self.alts)):
+            return
+        self.focus = idx
+        self._main_frame = None
+        self._apply_layout()
+        if self._redraw:
+            self._redraw()
+        if self._last_t is not None:
             self._request(self._last_t)
 
     def set_mode(self, mode: str):
         if mode in self.MODES:
             self.mode = mode
             QSettings("PyStitch360", "PyStitch360").setValue("mc_mode", mode)
+            self._main_frame = None
             self._apply_layout()
-            if self._swap_redraw:
-                self._swap_redraw()
+            if self._redraw:
+                self._redraw()
+            if self._last_t is not None:
+                self._request(self._last_t)
 
     def _apply_layout(self):
         p = self.pane_alt
-        if not self.enabled or self.mode == "swap":
-            # 전환 모드는 메인 페인을 쓰므로 alt 위젯 자체는 숨김
+        show_pane = bool(self.alts) and self.mode in ("pip", "split")
+        if not show_pane:
             if p.parent() is self._split:
                 p.setParent(None)
             p.hide()
@@ -203,7 +218,7 @@ class MulticamViewer:
                 p.setGeometry(self._pane.width() - w - 10, 10, w, w * 9 // 16)
             p.raise_()
             p.show()
-        elif self.mode == "split":
+        else:                                 # split — 오른쪽에 alt
             p.floating = False
             if p.parent() is not self._split:
                 p.setParent(None)
@@ -211,10 +226,30 @@ class MulticamViewer:
                 self._split.setSizes([3, 2])
             p.show()
 
+    # ------------------------------------------------------------ 배치 규칙
+    def _shown_alt(self) -> int | None:
+        """지금 표시해야 하는 alt 인덱스 (없으면 None).
+
+        pip: focus=0 → 첫 alt 가 PiP / focus>0 → 그 alt 가 메인.
+        split: 첫 alt (v1 — 다중 페인은 v2). swap: focus>0 인 alt.
+        """
+        if not self.alts:
+            return None
+        if self.mode == "split":
+            return 0
+        if self.focus > 0:
+            return self.focus - 1
+        return 0 if self.mode == "pip" else None
+
+    @property
+    def alt_on_main(self) -> bool:
+        """메인 페인이 alt 를 표시 중 — 편집 입력 차단 조건."""
+        return bool(self.alts) and self.mode != "split" and self.focus > 0
+
     # ------------------------------------------------------------ 갱신
     def update(self, t_primary: float, playing: bool = False):
         self._last_t = t_primary
-        if not self.enabled:
+        if self._shown_alt() is None:
             return
         now = time.monotonic()
         if playing and now - self._last_emit < self.RATE_PLAY_S:
@@ -222,31 +257,46 @@ class MulticamViewer:
         self._last_emit = now
         self._request(t_primary)
 
-    def _request(self, t_primary: float):
-        if not (0 <= self.active < len(self.alts)):
+    def primary_tick(self, frame_bgr, playing: bool = False):
+        """현재 파노라마 프레임 — focus 가 alt 인 PiP 의 안쪽 그림.
+
+        메인 디코드를 재사용하므로 공짜지만, 5900px 폭 변환이 아깝다 —
+        PiP 크기에 맞춰 축소 + 재생 중 저주기.
+        """
+        if self.mode != "pip" or self.focus == 0 or frame_bgr is None:
             return
-        a = self.alts[self.active]
-        self._worker.request(a["video"], to_alt_time(a["clock"], t_primary),
-                             self.active)
+        now = time.monotonic()
+        if playing and now - getattr(self, "_last_pip", 0.0) < self.RATE_PLAY_S:
+            return
+        self._last_pip = now
+        w = frame_bgr.shape[1]
+        tw = max(320, self.pane_alt.width())
+        if w > tw * 1.5:
+            h = int(frame_bgr.shape[0] * tw / w)
+            frame_bgr = cv2.resize(frame_bgr, (tw, h),
+                                   interpolation=cv2.INTER_AREA)
+        self.pane_alt.set_frame(frame_bgr)
+
+    def _request(self, t_primary: float):
+        i = self._shown_alt()
+        if i is None:
+            return
+        a = self.alts[i]
+        self._worker.request(a["video"], to_alt_time(a["clock"], t_primary), i)
 
     def _on_frame(self, frame, cam_idx):
-        if cam_idx != self.active or not self.enabled:
-            return
-        if self.mode == "swap":
-            self._swap_frame = frame
-            if self._swap_redraw:
-                self._swap_redraw()
+        if cam_idx != self._shown_alt():
+            return                            # 늦게 도착한 옛 카메라 프레임
+        if self.alt_on_main:
+            self._main_frame = frame          # 메인 페인으로 (pip/swap)
+            if self._redraw:
+                self._redraw()
         else:
-            self.pane_alt.set_frame(frame)
+            self.pane_alt.set_frame(frame)    # PiP/분할 페인으로
 
-    @property
-    def swap_active(self) -> bool:
-        """전환 모드 활성 — 메인 페인이 alt 표시 중 (편집 입력 차단용)."""
-        return self.enabled and self.mode == "swap"
-
-    def swap_frame(self):
-        """전환 모드에서 메인 페인에 그릴 프레임 (아니면 None)."""
-        return self._swap_frame if self.swap_active else None
+    def main_frame(self):
+        """메인 페인에 파노라마 대신 그릴 alt 프레임 (아니면 None)."""
+        return self._main_frame if self.alt_on_main else None
 
     def close(self):
         self._worker.stop()
