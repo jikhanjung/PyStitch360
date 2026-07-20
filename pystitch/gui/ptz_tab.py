@@ -131,6 +131,7 @@ class TimelineView(QWidget):
         self.airborne = []           # [(f0, f1, apex_z)] 공중 구간
         self.highlights = []         # [(f0, f1, state, label)] 하이라이트 구간
         self.pauses = []             # [(f0, f1)] 경기 중단 (시계 정지) 구간
+        self.coverage = []           # [(f0, f1, label)] 멀티캠 alt 커버리지 (P07)
         self.role_palette = {}       # {역할: BGR} 실측/지정 팀 색 (바 색)
         self._press = None
         self._resize = None          # 레인 경계 드래그 상태
@@ -156,6 +157,11 @@ class TimelineView(QWidget):
     def set_pauses(self, pauses):
         """경기 중단 구간 [(f0, f1)] — 회색 세로 밴드 (시계 정지)."""
         self.pauses = list(pauses)
+        self.update()
+
+    def set_coverage(self, spans):
+        """멀티캠 alt 커버리지 [(f0, f1, label)] — 눈금자 아래 청록 스트립."""
+        self.coverage = list(spans)
         self.update()
 
     def set_role_palette(self, palette):
@@ -471,6 +477,19 @@ class TimelineView(QWidget):
                            QColor(150, 150, 160, 45))
                 p.setPen(QColor(170, 170, 180))
                 p.drawText(max(x0_, self.GUTTER) + 3, self.RULER + 11, "II")
+        # 멀티캠 alt 커버리지: 눈금자 바로 아래 청록 스트립 (P07)
+        if self.coverage and self.total > 1:
+            for i, (f0, f1, label) in enumerate(self.coverage):
+                x0_ = self._x(max(0, f0))
+                x1_ = self._x(min(self.total - 1, f1))
+                if x1_ < self.GUTTER or x0_ > W:
+                    continue
+                y_ = self.RULER + 1 + i * 6
+                p.fillRect(max(x0_, self.GUTTER), y_,
+                           max(2, x1_ - max(x0_, self.GUTTER)), 4,
+                           QColor(60, 200, 210, 170))
+                p.setPen(QColor(120, 230, 240))
+                p.drawText(max(x0_, self.GUTTER) + 3, y_ + 4 + 9, label)
         # 내보내기 구간: 바깥은 어둡게, IN/OUT 브래킷 표시
         if self.mark_in is not None or self.mark_out is not None:
             fi = 0 if self.mark_in is None else self.mark_in
@@ -1412,6 +1431,10 @@ class PtzTab(QWidget):
         self.disp_scale = 1.0
         self.plan = None
         self.plan_out = (1920, 1080)
+        self.match: dict | None = None    # 멀티캠 경기 문서 (P07, match.json)
+        self.match_half = 0
+        self.mc = None                    # MulticamViewer — 경기 열 때 생성
+        self._opening_match = False
         self._build_ui()
         st = QSettings("PyStitch360", "PyStitch360")
         for cb, key in ((self.check_players, "ptz_show_players"),
@@ -1515,16 +1538,25 @@ class PtzTab(QWidget):
         가져도 동작하고, 커서가 딴 데 있으면 이벤트를 그대로 통과시켜
         다른 위젯의 Space 동작(목록 선택 등)을 깨지 않는다.
         """
-        if ev.type() == QEvent.Type.KeyPress \
-                and ev.key() == Qt.Key.Key_Space and not ev.isAutoRepeat() \
+        if ev.type() == QEvent.Type.KeyPress and not ev.isAutoRepeat() \
                 and self.cap is not None:
-            w = QApplication.widgetAt(QCursor.pos())
-            hot = (self.trackbar, self.slider, self.tl_scroll, self.pane)
-            while w is not None:
-                if w in hot:
-                    self._toggle_play()
-                    return True
-                w = w.parentWidget()
+            k = ev.key()
+            space = k == Qt.Key.Key_Space
+            # 숫자 1..9 = 카메라 선택 (멀티캠 경기 열려 있을 때, 같은 관례)
+            digit = (self.match is not None
+                     and Qt.Key.Key_1 <= k <= Qt.Key.Key_9)
+            if space or digit:
+                w = QApplication.widgetAt(QCursor.pos())
+                hot = (self.trackbar, self.slider, self.tl_scroll, self.pane,
+                       self._pane_split)
+                while w is not None:
+                    if w in hot:
+                        if space:
+                            self._toggle_play()
+                        else:
+                            self._mc_select(k - Qt.Key.Key_1)
+                        return True
+                    w = w.parentWidget()
         return super().eventFilter(obj, ev)
 
     # ------------------------------------------------------------ UI
@@ -1586,6 +1618,9 @@ class PtzTab(QWidget):
                 "QCheckBox { color: white; background: rgba(20,20,20,150);"
                 " padding: 2px 8px; border-radius: 4px; }")
             ov_row.addWidget(cb)
+        # 멀티캠 카메라/모드 바 (경기 열면 채워짐 — _rebuild_mc_bar)
+        self._mc_row = QHBoxLayout()
+        self._mc_row.addStretch(1)
         self.sld_radar_alpha = QSlider(Qt.Orientation.Horizontal)
         self.sld_radar_alpha.setRange(10, 95)
         self.sld_radar_alpha.setFixedWidth(80)
@@ -1595,6 +1630,7 @@ class PtzTab(QWidget):
             " padding: 2px 6px; }")
         ov_row.addWidget(self.sld_radar_alpha)
         ov.addLayout(ov_row)
+        ov.addLayout(self._mc_row)
         ov.addStretch(1)
         # pane/타임라인/정보 3행은 세로 스플리터로 — 아래에서 합침
 
@@ -1840,9 +1876,14 @@ class PtzTab(QWidget):
         strip.addWidget(self.tabs_review, 1)
         w_strip = QWidget()
         w_strip.setLayout(strip)
+        # 영상 행: 가로 스플리터 — 평소엔 pane 단독, 멀티캠 분할 모드에서
+        # alt 페인이 오른쪽에 붙는다 (multicam.MulticamViewer)
+        self._pane_split = QSplitter(Qt.Orientation.Horizontal)
+        self._pane_split.addWidget(self.pane)
+        self._pane_split.setCollapsible(0, False)
         # 영상/타임라인/정보 3행 — 스플리터로 높이 조절 (크기 저장/복원)
         self._rows = QSplitter(Qt.Orientation.Vertical)
-        self._rows.addWidget(self.pane)
+        self._rows.addWidget(self._pane_split)
         self._rows.addWidget(self._w_tl)
         self._rows.addWidget(w_strip)
         self._rows.setStretchFactor(0, 1)     # 창 리사이즈 여분은 영상에
@@ -1895,8 +1936,122 @@ class PtzTab(QWidget):
         if path:
             self.open_path(path)
 
+    # ------------------------------------------------------ 멀티캠 (P07)
+    def open_match(self, doc: dict, half: int = 0, quiet: bool = False):
+        """match.json 문서 열기 — half 의 primary 를 열고 alt 뷰어 구성."""
+        from .multicam import MulticamViewer
+        half = max(0, min(half, len(doc["halves"]) - 1))
+        h = doc["halves"][half]
+        self._opening_match = True
+        try:
+            self.open_path(h["primary"], quiet=quiet)
+        finally:
+            self._opening_match = False
+        if self.pano_path is None \
+                or str(self.pano_path) != str(Path(h["primary"])):
+            return                            # primary 열기 실패
+        self.match, self.match_half = doc, half
+        if self.mc is None:
+            self.mc = MulticamViewer(self.pane, self._pane_split, self.log)
+        self.mc.set_half(h.get("alts", []), swap_redraw=self._redraw)
+        self._rebuild_mc_bar()
+        self._set_coverage_lane()
+        n = len(h.get("alts", []))
+        self.log(f"[match] {doc.get('title') or '경기'} — {h['label']}: "
+                 f"{Path(h['primary']).name} + 앵글 {n}개 "
+                 f"(커서를 영상 위에 두고 1={h['label']} 파노라마, "
+                 f"2..{n + 1}=앵글)" if n else
+                 f"[match] {h['label']}: 동기화된 앵글 없음")
+
+    def _rebuild_mc_bar(self):
+        """페인 오버레이의 카메라/모드 바 재구성."""
+        while self._mc_row.count():
+            it = self._mc_row.takeAt(0)
+            if it.widget() is not None:
+                it.widget().deleteLater()
+        self._mc_row.addStretch(1)
+        alts = (self.match["halves"][self.match_half].get("alts", [])
+                if self.match else [])
+        if not alts:
+            return
+        style = ("QPushButton { color: white; background: rgba(20,20,20,150);"
+                 " padding: 2px 8px; border-radius: 4px; }"
+                 "QPushButton:checked { background: rgba(0,120,215,200); }")
+        self._mc_btns = []
+        names = ["1 파노라마"] + [f"{i + 2} {Path(a['video']).stem}"
+                                  for i, a in enumerate(alts)]
+        for i, name in enumerate(names):
+            b = QPushButton(name)
+            b.setCheckable(True)
+            b.setStyleSheet(style)
+            b.setChecked(i == 0 if not self.mc.enabled
+                         else i == self.mc.active + 1)
+            b.clicked.connect(lambda _, idx=i: self._mc_select(idx))
+            self._mc_row.addWidget(b)
+            self._mc_btns.append(b)
+        self._mc_row.addSpacing(12)
+        self._mc_mode_btns = {}
+        for key, name in (("pip", "PiP"), ("split", "분할"), ("swap", "전환")):
+            b = QPushButton(name)
+            b.setCheckable(True)
+            b.setStyleSheet(style)
+            b.setChecked(self.mc.mode == key)
+            b.clicked.connect(lambda _, k=key: self._mc_mode(k))
+            self._mc_row.addWidget(b)
+            self._mc_mode_btns[key] = b
+
+    def _mc_select(self, idx: int):
+        """카메라 선택: 0=파노라마, 1..=alt (숫자키/버튼 공용)."""
+        if self.mc is None or self.match is None:
+            return
+        alts = self.match["halves"][self.match_half].get("alts", [])
+        if idx > len(alts):
+            return
+        if idx == 0:
+            self.mc.set_enabled(False)
+        else:
+            self.mc.active = idx - 1
+            self.mc.set_enabled(True)
+        for i, b in enumerate(getattr(self, "_mc_btns", [])):
+            b.setChecked(i == idx)
+        self._redraw()
+
+    def _mc_mode(self, mode: str):
+        if self.mc is None:
+            return
+        self.mc.set_mode(mode)
+        for k, b in getattr(self, "_mc_mode_btns", {}).items():
+            b.setChecked(k == mode)
+        self._redraw()
+
+    def _set_coverage_lane(self):
+        """alt 커버리지를 타임라인에 표시 (primary 프레임 구간)."""
+        from ..core.match import alt_coverage
+        spans = []
+        alts = (self.match["halves"][self.match_half].get("alts", [])
+                if self.match else [])
+        for a in alts:
+            cap = cv2.VideoCapture(a["video"])
+            dur = (cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                   / (cap.get(cv2.CAP_PROP_FPS) or 30.0)) if cap.isOpened() \
+                else 0.0
+            cap.release()
+            if dur <= 0:
+                continue
+            t0, t1 = alt_coverage(a["clock"], dur)
+            spans.append((int(t0 * self.fps), int(t1 * self.fps),
+                          Path(a["video"]).stem))
+        self.trackbar.set_coverage(spans)
+
     def open_path(self, path: str, quiet: bool = False):
         """파노라마 열기 (프로젝트 복원 경로 포함). 분석/키프레임 사이드카 자동 로드."""
+        if not self._opening_match and self.match is not None:
+            # 단독 파노라마 열기 = 멀티캠 경기 컨텍스트 해제
+            self.match = None
+            if self.mc is not None:
+                self.mc.set_half([])
+            self._rebuild_mc_bar()
+            self.trackbar.set_coverage([])
         if not Path(path).exists():
             from ..core.project import _cross_platform_candidates
             for cand in _cross_platform_candidates(path):
@@ -2396,6 +2551,8 @@ class PtzTab(QWidget):
 
     def _play_frame(self, frame, f):
         self._cur_frame, self._cur_frame_idx = frame, f
+        if self.mc is not None:
+            self.mc.update(f / self.fps, playing=True)
         self._play_sync = True      # 워커 발 갱신 표시 — 사용자 시크와 구분
         try:
             self.slider.setValue(f)  # _show_frame 은 재생 중 가드로 무시됨
@@ -2709,6 +2866,8 @@ class PtzTab(QWidget):
 
     def _pane_pressed(self, fx, fy):
         """좌버튼 프레스: 랜드마크(경기장 탭) 또는 크롭 박스 편집 시작."""
+        if self.mc is not None and self.mc.swap_active:
+            return                        # 전환 모드: alt 표시 중 편집 입력 차단
         if self.cap is None:
             return
         if self._playing:
@@ -2740,6 +2899,8 @@ class PtzTab(QWidget):
                                            self.slider.value())}
 
     def _pane_dragged(self, fx, fy):
+        if self.mc is not None and self.mc.swap_active:
+            return                        # 전환 모드: alt 표시 중 편집 입력 차단
         if self._lm_drag is not None:        # 랜드마크 이동 — 라이브 재피팅
             self.field_points[self._lm_drag] = \
                 [round(fx * self.pano_w, 1), round(fy * self.pano_h, 1)]
@@ -2778,6 +2939,8 @@ class PtzTab(QWidget):
         self._redraw()
 
     def _pane_released(self, fx, fy):
+        if self.mc is not None and self.mc.swap_active:
+            return                        # 전환 모드: alt 표시 중 편집 입력 차단
         if self._lm_drag is not None:
             key, self._lm_drag = self._lm_drag, None
             self._refit_field(log_result=True)
@@ -2822,10 +2985,17 @@ class PtzTab(QWidget):
         if not ok:
             return
         self._cur_frame, self._cur_frame_idx = frame, f
+        if self.mc is not None:
+            self.mc.update(f / self.fps, playing=False)
         self._redraw()
 
     def _redraw(self):
         """오버레이만 다시 그림 — 키프레임/무시/계획 변경 시 디코딩 없이 즉시."""
+        if self.mc is not None and self.mc.swap_active:
+            sf = self.mc.swap_frame()     # 전환 모드: alt 프레임 원본 표시
+            if sf is not None:
+                self.pane.set_frame(sf)
+                return
         if getattr(self, "_cur_frame", None) is None:
             return
         frame = self._cur_frame.copy()
@@ -3047,6 +3217,8 @@ class PtzTab(QWidget):
     # ------------------------------------------------------ 화면 오브젝트 조작
     def _pane_clicked(self, fx, fy):
         """좌클릭: 오브젝트 상태별 기본 동작 / 빈 곳은 키프레임 추가."""
+        if self.mc is not None and self.mc.swap_active:
+            return                        # 전환 모드: alt 표시 중 편집 입력 차단
         if self.cap is None:
             return
         if self._playing:
@@ -3087,6 +3259,8 @@ class PtzTab(QWidget):
 
     def _pane_context(self, fx, fy, gpos):
         """우클릭: 오브젝트별 전체 동작 메뉴."""
+        if self.mc is not None and self.mc.swap_active:
+            return                        # 전환 모드: alt 표시 중 편집 입력 차단
         if self.cap is None or self.analysis is None:
             return
         if self._playing:
@@ -3214,6 +3388,8 @@ class PtzTab(QWidget):
 
     def _pane_hover(self, fx, fy):
         """커서 근처 오브젝트/크롭 박스를 하이라이트 (바뀔 때만 리드로우)."""
+        if self.mc is not None and self.mc.swap_active:
+            return                        # 전환 모드: alt 표시 중 편집 입력 차단
         if self.analysis is None or getattr(self, "_cur_frame", None) is None:
             return
         if self._box_edit is not None:

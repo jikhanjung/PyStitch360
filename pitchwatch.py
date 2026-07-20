@@ -45,6 +45,12 @@ class PitchWatchWindow(QMainWindow):
         m.addAction("파노라마 열기...", self._open_pano)
         self._recent_menu = m.addMenu("최근 파노라마")
         m.addSeparator()
+        m.addAction("경기 열기 (멀티캠)...", self._open_match)
+        self._recent_match_menu = m.addMenu("최근 경기")
+        m.addAction("멀티캠 경기 만들기...", self._build_match)
+        self._half_menu = m.addMenu("하프")
+        self._half_menu.setEnabled(False)
+        m.addSeparator()
         m.addAction("종료", self.close)
         a = self.menuBar().addMenu("분석(&A)")
         a.addAction("갭필 2차 패스 (트랙 갭 재검출)...",
@@ -77,6 +83,7 @@ class PitchWatchWindow(QMainWindow):
         a.addAction("모든 사용자 편집 초기화 (분석 원본으로)",
                     lambda: self.ptz.reset_edits("all"))
         self._rebuild_recent()
+        self._rebuild_recent_matches()
 
     # ------------------------------------------------------------ 최근 파일
     def _recent(self) -> list[str]:
@@ -112,6 +119,86 @@ class PitchWatchWindow(QMainWindow):
         if self.ptz.pano_path is not None:
             self.setWindowTitle(f"PitchWatch — {Path(path).name}")
             self._remember_recent(path)
+            self._half_menu.setEnabled(False)
+
+    # ------------------------------------------------------ 멀티캠 (P07)
+    def _open_match(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "멀티캠 경기", self._last_dir(), "경기 (*.match.json)")
+        if path:
+            self.open_match(path)
+
+    def open_match(self, path, half=0):
+        from pystitch.core.match import load_match
+        try:
+            doc = load_match(path)
+        except (OSError, ValueError) as e:
+            self.ptz.log(f"[match] 열기 실패: {e}")
+            return
+        self._match_path = str(path)
+        self.ptz.open_match(doc, half=half)
+        if self.ptz.match is None:
+            return
+        title = doc.get("title") or Path(path).stem
+        label = doc["halves"][self.ptz.match_half]["label"]
+        self.setWindowTitle(f"PitchWatch — {title} [{label}]")
+        self._remember_recent_match(path)
+        self._half_menu.clear()
+        self._half_menu.setEnabled(len(doc["halves"]) > 1)
+        for i, h in enumerate(doc["halves"]):
+            act = self._half_menu.addAction(
+                h["label"], lambda _=False, j=i: self.open_match(path, j))
+            act.setCheckable(True)
+            act.setChecked(i == self.ptz.match_half)
+
+    def _build_match(self):
+        from PyQt6.QtWidgets import QFileDialog as FD
+
+        from pystitch.core.match import MATCH_SUFFIX, save_match
+        from pystitch.gui.multicam import MatchBuildDialog
+        dlg = MatchBuildDialog(self, self.ptz.log, self._last_dir())
+        if dlg.exec() != MatchBuildDialog.DialogCode.Accepted:
+            return
+        doc = dlg.doc()
+        if doc is None:
+            return
+        first = Path(doc["halves"][0]["primary"])
+        default = str(first.parent / (first.parent.name + MATCH_SUFFIX))
+        path, _ = FD.getSaveFileName(self, "경기 저장", default,
+                                     "경기 (*.match.json)")
+        if not path:
+            return
+        if not path.endswith(MATCH_SUFFIX):
+            path += MATCH_SUFFIX
+        save_match(path, doc)
+        self.ptz.log(f"[match] 저장: {path}")
+        self.open_match(path)
+
+    def _recent_matches(self) -> list[str]:
+        v = QSettings("PyStitch360", "PyStitch360").value(
+            "pitchwatch_recent_matches", [])
+        if isinstance(v, str):
+            v = [v]
+        return [p for p in (v or []) if Path(p).exists()]
+
+    def _remember_recent_match(self, path):
+        lst = [str(path)] + [p for p in self._recent_matches()
+                             if p != str(path)]
+        QSettings("PyStitch360", "PyStitch360").setValue(
+            "pitchwatch_recent_matches", lst[:_MAX_RECENT])
+        self._rebuild_recent_matches()
+
+    def _rebuild_recent_matches(self):
+        self._recent_match_menu.clear()
+        for p in self._recent_matches():
+            self._recent_match_menu.addAction(
+                Path(p).name, lambda _=False, q=p: self.open_match(q))
+        self._recent_match_menu.setEnabled(bool(self._recent_matches()))
+
+    def closeEvent(self, ev):
+        if self.ptz.mc is not None:
+            self.ptz.mc.close()           # alt 디코드 스레드 정리
+        super().closeEvent(ev)
 
 
 def main():
@@ -119,7 +206,11 @@ def main():
     win = PitchWatchWindow()
     win.show()
     if len(sys.argv) > 1 and Path(sys.argv[1]).exists():
-        win.open_pano(sys.argv[1])        # PitchStitch 핸드오프 (P05-2)
+        arg = sys.argv[1]
+        if arg.endswith(".match.json"):
+            win.open_match(arg)           # 멀티캠 경기 직접 열기 (P07)
+        else:
+            win.open_pano(arg)            # PitchStitch 핸드오프 (P05-2)
     app._pitchwatch_main = win            # 참조 유지
     sys.exit(app.exec())
 

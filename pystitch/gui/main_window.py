@@ -339,6 +339,11 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ 공통
 
+    def closeEvent(self, ev):
+        if self.ptz_tab is not None and self.ptz_tab.mc is not None:
+            self.ptz_tab.mc.close()       # 멀티캠 alt 디코드 스레드 정리
+        super().closeEvent(ev)
+
     def log(self, msg: str):
         self.log_box.appendPlainText(msg)
 
