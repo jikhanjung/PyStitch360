@@ -54,33 +54,8 @@ def cut_synced_clip(other_path, clock, t0_a, t1_a, out_path,
     return out_path
 
 
-def sync_by_whistles(events_a, events_b, min_db=15.0, tol_s=0.6,
-                     max_offset_s=1800.0, bin_s=0.25, min_matches=4):
-    """호각 이벤트 [(t0, t1, db)] 두 벌 → 시계 모델 (거친 동기화).
-
-    온셋 시각 전체 쌍의 차이를 히스토그램 투표해 지배적 오프셋을 찾고,
-    그 근방에서 1:1 매칭(가까운 순 그리디) 후 IRLS(Huber) 선형 피팅.
-    반환: {"offset", "drift", "n", "rms_s", "pairs"} 또는 None.
-    """
-    ta = np.array(sorted(t0 for t0, _t1, db in events_a if db >= min_db))
-    tb = np.array(sorted(t0 for t0, _t1, db in events_b if db >= min_db))
-    if len(ta) < min_matches or len(tb) < min_matches:
-        return None
-    diffs = (ta[:, None] - tb[None, :]).ravel()
-    diffs = diffs[np.abs(diffs) <= max_offset_s]
-    if len(diffs) == 0:
-        return None
-    # 투표: bin_s 격자 + 이웃 bin 합산 (경계 분산 방지)
-    q = np.round(diffs / bin_s).astype(np.int64)
-    vals, counts = np.unique(q, return_counts=True)
-    score = counts.copy()
-    for i, v in enumerate(vals):
-        for dv in (-1, 1):
-            j = np.searchsorted(vals, v + dv)
-            if j < len(vals) and vals[j] == v + dv:
-                score[i] += counts[j]
-    off0 = float(vals[np.argmax(score)] * bin_s)
-    # 매칭: 각 b 온셋에 가장 가까운 a 온셋 (tol 내, a 는 1회만)
+def _fit_at_offset(ta, tb, off0, tol_s, min_matches):
+    """오프셋 후보 근방 1:1 그리디 매칭 + IRLS(Huber) 선형 피팅."""
     pairs = []
     used = set()
     order = sorted(range(len(tb)),
@@ -114,6 +89,57 @@ def sync_by_whistles(events_a, events_b, min_db=15.0, tol_s=0.6,
     return {"offset": float(a), "drift": float(b), "n": len(pairs),
             "rms_s": float(np.sqrt(np.mean(r ** 2))),
             "pairs": pairs}
+
+
+def sync_by_whistles(events_a, events_b, min_db=15.0, tol_s=0.6,
+                     max_offset_s=None, bin_s=0.25, min_matches=4,
+                     top_k=5):
+    """호각 이벤트 [(t0, t1, db)] 두 벌 → 시계 모델 (거친 동기화).
+
+    온셋 시각 전체 쌍의 차이를 히스토그램 투표하되, 최다 득표 하나가
+    아니라 **상위 top_k 피크를 각각 피팅해 (매칭 수, 잔차) 로 선택**한다
+    — 잡음 호각(옆 구장·워밍업)이 만든 우연 피크가 이기지 못하게.
+    max_offset_s 기본 무제한: 20241020 실경기에서 참 오프셋(1871s)이
+    옛 기본 창(1800s) 밖이라 존재하지 않는 답을 뽑은 전례.
+    반환: {"offset", "drift", "n", "rms_s", "pairs"} 또는 None.
+    """
+    ta = np.array(sorted(t0 for t0, _t1, db in events_a if db >= min_db))
+    tb = np.array(sorted(t0 for t0, _t1, db in events_b if db >= min_db))
+    if len(ta) < min_matches or len(tb) < min_matches:
+        return None
+    diffs = (ta[:, None] - tb[None, :]).ravel()
+    if max_offset_s is not None:
+        diffs = diffs[np.abs(diffs) <= max_offset_s]
+    if len(diffs) == 0:
+        return None
+    # 투표: bin_s 격자 + 이웃 bin 합산 (경계 분산 방지)
+    q = np.round(diffs / bin_s).astype(np.int64)
+    vals, counts = np.unique(q, return_counts=True)
+    score = counts.copy()
+    for i, v in enumerate(vals):
+        for dv in (-1, 1):
+            j = np.searchsorted(vals, v + dv)
+            if j < len(vals) and vals[j] == v + dv:
+                score[i] += counts[j]
+    # 상위 피크들 (서로 2 bin 초과 떨어진 것만 별개 후보로)
+    cand = []
+    for i in np.argsort(score)[::-1]:
+        v = vals[i]
+        if any(abs(v - c) <= 2 for c in cand):
+            continue
+        cand.append(v)
+        if len(cand) >= top_k:
+            break
+    best = None
+    for v in cand:
+        fit = _fit_at_offset(ta, tb, float(v * bin_s), tol_s, min_matches)
+        if fit is None:
+            continue
+        # 매칭 수 우선, 동수면 잔차 — 참 오프셋은 매칭이 압도적으로 많다
+        key = (fit["n"], -fit["rms_s"])
+        if best is None or key > (best["n"], -best["rms_s"]):
+            best = fit
+    return best
 
 
 def _interp_track(t_query, t_src, xy_src, max_gap_s=0.5):

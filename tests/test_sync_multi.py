@@ -62,6 +62,31 @@ def test_whistle_coarse_sync():
     # 음속 지터 때문에 프레임 정밀은 기대하지 않는다 (정밀화가 담당)
 
 
+def test_whistle_sync_large_offset_with_decoy():
+    """참 오프셋이 옛 탐색 창(1800s) 밖 + 미끼 우연 피크 → 정답 복원.
+
+    20241020 실경기 회귀: pano_5316↔C0011 참 오프셋 1871s 가
+    max_offset_s=1800 밖이라, 워밍업 잡음 호각이 만든 창 안의 우연
+    피크(1383.7s)가 뽑혔다. 상위 K 피크 피팅 선택이 이를 막는다.
+    """
+    rng = np.random.default_rng(7)
+    big = 1871.3                   # A 가 B 보다 훨씬 먼저 시작 (창 밖)
+    tb = np.sort(rng.uniform(30, 2200, 20))
+    ev_b = [(float(t), float(t + 0.5), 25.0) for t in tb]
+    ev_a = [(float(big + 1.00004 * t + rng.uniform(-0.3, 0.3)),
+             0.0, 25.0) for t in tb]
+    ev_a = [(t0, t0 + 0.5, db) for t0, _z, db in ev_a]
+    # 미끼: 좁은 오프셋(487s 차이 흉내)에서 우연히 겹치는 쌍 5개
+    decoy = big - 487.0
+    td = np.sort(rng.uniform(100, 1500, 5))
+    ev_a += [(float(decoy + t), float(decoy + t + 0.3), 20.0) for t in td]
+    ev_b += [(float(t), float(t + 0.3), 20.0) for t in td]
+    r = sync_by_whistles(ev_a, ev_b)
+    assert r is not None
+    assert abs(r["offset"] - big) < 0.3, r["offset"]
+    assert r["n"] >= 15
+
+
 def test_ball_refine_reaches_frame_accuracy():
     rng = np.random.default_rng(7)
     ev_a, ev_b = make_whistles(rng)
