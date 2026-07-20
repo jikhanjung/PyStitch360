@@ -114,7 +114,11 @@ def _fit_line_coeffs(pts):
 
 
 def auto_level(imgs, Rs, lens: LensProfile, yaw_range, scale=0.2, log=print):
-    """먼 쪽 터치라인 기반 pitch/roll 자동 추정.
+    """먼 쪽 터치라인 기반 pitch/roll 자동 추정. 반환 (pitch, roll, ok).
+
+    ok=False 는 터치라인 점 부족으로 한 번도 측정하지 못했다는 뜻 —
+    반환된 0°는 "수평" 이 아니라 "모름" 이다 (헤드리스는 이때 다른
+    프레임에서 재시도).
 
     부호를 관례로 가정하지 않는다: 시험 회전(+2°)의 계수 변화(수치 야코비안)를
     측정해 2x2 선형계를 푼다. (해석적 부호 유도는 roll 발산 이력 있음 — devlog 001)
@@ -140,12 +144,14 @@ def auto_level(imgs, Rs, lens: LensProfile, yaw_range, scale=0.2, log=print):
         return coef, n_in
 
     pitch, roll = 0.0, 0.0
+    measured = False
     delta = np.deg2rad(2.0)
     for it in range(2):
         base, n = measure(pitch, roll)
         if base is None:
             log(f"[auto-level] 터치라인 점 부족 ({n}) — 보정 중단")
-            return pitch, roll
+            return pitch, roll, measured
+        measured = True
         bc0 = base[1:3]
         if np.linalg.norm(bc0) < np.deg2rad(0.15):
             break
@@ -166,7 +172,7 @@ def auto_level(imgs, Rs, lens: LensProfile, yaw_range, scale=0.2, log=print):
         log(f"[auto-level] 반복 {it+1}: 인라이어 {n} → pitch {np.rad2deg(pitch):+.2f}°, roll {np.rad2deg(roll):+.2f}°")
     if max(abs(pitch), abs(roll)) >= np.deg2rad(34):
         log("[auto-level] 경고: 보정값이 한계(±35°) 부근 — 정합 기하가 비정상일 가능성")
-    return pitch, roll
+    return pitch, roll, measured
 
 
 def find_halfway_line_yaw(imgs, Rs, lens: LensProfile, yaw_range, el0, el1,
@@ -191,12 +197,17 @@ def find_halfway_line_yaw(imgs, Rs, lens: LensProfile, yaw_range, el0, el1,
 
 
 def estimate_alignment(img_l, img_r, lens: LensProfile, log=print,
-                       reuse_level: "Alignment | None" = None) -> Alignment:
+                       reuse_level: "Alignment | None" = None,
+                       require_level=False) -> Alignment:
     """프레임 쌍에서 전체 정합 추정 (상대 회전 + 자동 수평 + 자동 센터링).
 
     reuse_level 이 주어지면 수평(pitch/roll)·센터링(yaw)은 그 값을 그대로 쓰고
     상대 회전만 재추정한다 — 한 경기 안에서 수평이 바뀌는 일은 거의 없고,
     재추정 노이즈로 세그먼트마다 뷰가 미세하게 달라지는 것을 막는다.
+
+    require_level=True 면 auto-level 이 한 번도 측정하지 못했을 때
+    RuntimeError — 무인(헤드리스) 실행은 0° 를 수평으로 오인하면 안 된다
+    (GUI 는 사용자가 슬라이더로 만회할 수 있어 기본 False).
     """
     pts_l, pts_r = match_overlap(img_l, img_r)
     if len(pts_l) < 20:
@@ -223,7 +234,11 @@ def estimate_alignment(img_l, img_r, lens: LensProfile, log=print,
         log(f"[align] 수평/센터링 기존 값 재사용: pitch {np.rad2deg(pitch):+.2f}° "
             f"roll {np.rad2deg(roll):+.2f}° yaw {np.rad2deg(yaw_c):+.2f}°")
     else:
-        pitch, roll = auto_level([img_l, img_r], [Rh, Rh.T], lens, yaw_range, log=log)
+        pitch, roll, leveled = auto_level([img_l, img_r], [Rh, Rh.T], lens,
+                                          yaw_range, log=log)
+        if require_level and not leveled:
+            raise RuntimeError(
+                "auto-level 실패 (터치라인 점 부족) — 다른 프레임에서 재시도")
         R_adj = rot_xz(pitch, roll)
         yaw_c = find_halfway_line_yaw([img_l, img_r], [Rh @ R_adj, Rh.T @ R_adj],
                                       lens, yaw_range, EL0_RAD, EL1_RAD)

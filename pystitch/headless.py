@@ -121,7 +121,8 @@ def _estimate_align(vid_l, vid_r, offset, lens, t0, t1):
         if imgs is None:
             continue
         try:
-            a = estimate_alignment(imgs[0], imgs[1], lens, log=_log)
+            a = estimate_alignment(imgs[0], imgs[1], lens, log=_log,
+                                   require_level=True)
             return a, t
         except RuntimeError as e:
             last_err = e

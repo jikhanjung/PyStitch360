@@ -63,21 +63,30 @@ def export_pano(lens, segments, left_files, right_files, offset_sec,
     w0, w1 = first_a.window(user[2])
     half_range = (w1 - w0) / 2
 
-    # 게인·심 보정 측정용 프레임: 각 세그먼트의 정합 프레임(align_sec).
-    # 경계/시작 프레임은 무늬 없는 잔디뿐일 수 있어 측정이 생략되곤 한다
-    # — 정합이 성공한 프레임이면 특징이 충분하다. 스트리밍 시작 전에
-    # 미리 읽어둔다 (경계 재구성 시 reader 스레드와 디코더 경합 방지).
-    calib_imgs: dict[int, tuple] = {}
+    # 게인·심 보정 측정용 프레임: 각 세그먼트의 정합 프레임(align_sec) +
+    # 이후 120초 간격 후보 (해당 세그먼트 범위 안). 시작/경계 프레임은
+    # 무늬 없는 잔디뿐일 수 있어 측정이 생략되곤 한다 — 심 밴드에 특징이
+    # 잡히는 프레임이 나올 때까지 시도. 스트리밍 시작 전에 미리 읽어둔다
+    # (경계 재구성 시 reader 스레드와 디코더 경합 방지).
+    calib_imgs: dict[int, list] = {}
     for i, s in enumerate(segments):
-        t = s.get("align_sec", s["start_sec"])
-        ok_l, cl = vid_l.read_at(int(round(t * fps)))
-        ok_r, cr = vid_r.read_at(int(round((t + offset_sec) * fps)))
-        if ok_l and ok_r:
-            calib_imgs[i] = (cl, cr)
+        seg_end = (segments[i + 1]["start_sec"] if i + 1 < len(segments)
+                   else end_sec)
+        base_t = s.get("align_sec", s["start_sec"])
+        frames_i = []
+        for dt in (0.0, 120.0, 240.0):
+            t = base_t + dt
+            if frames_i and t >= seg_end:
+                break
+            ok_l, cl = vid_l.read_at(int(round(t * fps)))
+            ok_r, cr = vid_r.read_at(int(round((t + offset_sec) * fps)))
+            if ok_l and ok_r:
+                frames_i.append((cl, cr))
+        calib_imgs[i] = frames_i
 
     def make_renderer(seg_i, img_l, img_r) -> Renderer:
         alignment = segments[seg_i]["alignment"]
-        cal_l, cal_r = calib_imgs.get(seg_i, (img_l, img_r))
+        cands = calib_imgs.get(seg_i) or [(img_l, img_r)]
         R_wl, R_wr = alignment.rotations(user[0], user[1])
         yaw_c = alignment.yaw_auto + np.deg2rad(user[2])
         e0 = el0 if el0 is not None else alignment.el0
@@ -85,8 +94,10 @@ def export_pano(lens, segments, left_files, right_files, offset_sec,
         r = Renderer(lens, R_wl, R_wr, yaw_c - half_range, yaw_c + half_range,
                      e0, e1, scale=scale, feather_px=feather_px,
                      persp_k=persp_k, persp_m=persp_m)
-        r.set_gains_from(cal_l, cal_r)
-        r.refine_seam(cal_l, cal_r, log=log)
+        r.set_gains_from(*cands[0])
+        for cal_l, cal_r in cands:
+            if r.refine_seam(cal_l, cal_r, log=log) > 0:
+                break
         return r
 
     log("정합 렌더러 준비 중...")
