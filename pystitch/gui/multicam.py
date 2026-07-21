@@ -34,7 +34,7 @@ class AltDecodeWorker(QThread):
     카메라 수만큼 request 를 걸 수 있는 구조로 둔다.
     """
 
-    frame_ready = pyqtSignal(object, int)     # (BGR frame, cam_idx)
+    frame_ready = pyqtSignal(object, int, float)   # (BGR, cam_idx, t_alt)
 
     def __init__(self):
         super().__init__()
@@ -71,7 +71,7 @@ class AltDecodeWorker(QThread):
             cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, t_alt * 1000.0))
             ok, frame = cap.read()
             if ok:
-                self.frame_ready.emit(frame, cam_idx)
+                self.frame_ready.emit(frame, cam_idx, t_alt)
         for c in self._caps.values():
             c.release()
 
@@ -284,9 +284,56 @@ class MulticamViewer:
         a = self.alts[i]
         self._worker.request(a["video"], to_alt_time(a["clock"], t_primary), i)
 
-    def _on_frame(self, frame, cam_idx):
+    def _alt_analysis(self, idx):
+        """alt 의 .analysis.json 지연 로드 (없으면 False 캐시)."""
+        cache = getattr(self, "_ana_cache", None)
+        if cache is None:
+            cache = self._ana_cache = {}
+        if idx not in cache:
+            cache[idx] = False
+            try:
+                import json
+                p = Path(self.alts[idx]["video"]).with_suffix(
+                    ".analysis.json")
+                if p.exists():
+                    d = json.loads(p.read_text())
+                    import numpy as np
+                    cache[idx] = {"t": np.asarray(d["frames"], float)
+                                  / float(d["fps"]),
+                                  "balls": d["balls"],
+                                  "players": d["players"],
+                                  "w": d.get("pano_w"), "h": d.get("pano_h")}
+            except Exception as e:  # noqa: BLE001
+                self._log(f"[mc] alt 분석 무시: {e}")
+        return cache[idx]
+
+    def _draw_overlay(self, frame, idx, t_alt):
+        """alt 분석 사이드카의 공/선수 박스 (P07-2 일부, 픽셀 좌표)."""
+        ana = self._alt_analysis(idx)
+        if not ana:
+            return frame
+        import numpy as np
+        si = int(np.argmin(np.abs(ana["t"] - t_alt)))
+        if abs(ana["t"][si] - t_alt) > 0.5:
+            return frame
+        sx = frame.shape[1] / (ana["w"] or frame.shape[1])
+        sy = frame.shape[0] / (ana["h"] or frame.shape[0])
+        out = frame.copy()
+        for pl in ana["players"][si]:
+            cx, cy, w, h = pl[0] * sx, pl[1] * sy, pl[2] * sx, pl[3] * sy
+            cv2.rectangle(out, (int(cx - w / 2), int(cy - h / 2)),
+                          (int(cx + w / 2), int(cy + h / 2)),
+                          (90, 220, 90), 2)
+        b = ana["balls"][si]
+        if b is not None:
+            cv2.circle(out, (int(b[0] * sx), int(b[1] * sy)), 10,
+                       (40, 180, 255), 3)
+        return out
+
+    def _on_frame(self, frame, cam_idx, t_alt=0.0):
         if cam_idx != self._shown_alt():
             return                            # 늦게 도착한 옛 카메라 프레임
+        frame = self._draw_overlay(frame, cam_idx, t_alt)
         if self.alt_on_main:
             self._main_frame = frame          # 메인 페인으로 (pip/swap)
             if self._redraw:
