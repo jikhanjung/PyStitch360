@@ -145,3 +145,18 @@ def test_render_passmap():
                          numbers={7: "7", 9: "10"}, title="팀1")
     assert img.shape[0] > 400 and img.shape[2] == 3
     assert img.mean() > 40                # 필드+마킹이 그려짐
+
+
+def test_write_match_report(tmp_path):
+    from pystitch.core.metrics import write_match_report
+    m = {"summary": {"share0": 0.6, "share1": 0.4, "team0_s": 900.0,
+                     "team1_s": 600.0, "contested_s": 100.0,
+                     "loose_s": 200.0, "unobserved_s": 300.0,
+                     "coverage": 0.85},
+         "passes": [{"from_tid": 7, "to_tid": 9, "team": 0, "t": 1.0}],
+         "turnovers": [], "unobserved_transitions": 2, "spans": []}
+    files = write_match_report(tmp_path / "r", m, ("홈", "원정"),
+                               dist_rows=[("홈", "7", 5400.0, 1.4, 7.2, 0.9)])
+    md = (tmp_path / "r" / "match.md").read_text(encoding="utf-8")
+    assert "60%" in md and "미관측 전이 2건" in md and "5400" in md
+    assert files[0].endswith("match.md")

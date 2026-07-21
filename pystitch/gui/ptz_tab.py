@@ -4028,7 +4028,9 @@ class PtzTab(QWidget):
               sp["team"]) for sp in m["spans"]])
         dlg = StatsDialog(self, m, team_names=tuple(self.team_names),
                           numbers=nums, passmaps=maps,
-                          dist_rows=dist_rows)
+                          dist_rows=dist_rows,
+                          save_dir=str(self.pano_path.parent
+                                       / f"{self.pano_path.stem}_report"))
         dlg.show()
         self._stats_dlg = dlg             # GC 방지
 

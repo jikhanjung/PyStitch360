@@ -303,3 +303,55 @@ def mean_positions(analysis, calib, role_of, rep_of, team):
             e[2] += 1
     return {rep: (e[0] / e[2], e[1] / e[2])
             for rep, e in acc.items() if e[2] >= 30}
+
+
+def write_match_report(out_dir, metrics, team_names=("팀1", "팀2"),
+                       passmaps=None, dist_rows=None, numbers=None):
+    """지표 → 보관용 산출물: match.md + 패스맵 PNG (P08-3).
+
+    통계 창과 같은 데이터의 파일 판 — 커버리지/미관측 명시 그대로.
+    반환: 생성 파일 경로 목록.
+    """
+    import cv2
+    from pathlib import Path
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    files = []
+    s = metrics["summary"] or {}
+    L = ["# 경기 지표", "",
+         f"공 관측 커버리지 **{s.get('coverage', 0):.0%}** — 미관측 "
+         "구간은 어느 팀에도 배정하지 않음.", "",
+         f"| | {team_names[0]} | {team_names[1]} |", "|---|---|---|",
+         f"| 점유율 | {s.get('share0', float('nan')):.0%} "
+         f"| {s.get('share1', float('nan')):.0%} |",
+         f"| 소유 시간 | {s.get('team0_s', 0):.0f}s "
+         f"| {s.get('team1_s', 0):.0f}s |",
+         f"| 경합 {s.get('contested_s', 0):.0f}s · 루즈볼 "
+         f"{s.get('loose_s', 0):.0f}s · 미관측 "
+         f"{s.get('unobserved_s', 0):.0f}s | | |", "",
+         f"패스 {len(metrics['passes'])}회 · 턴오버 "
+         f"{len(metrics['turnovers'])}회 · 미관측 전이 "
+         f"{metrics['unobserved_transitions']}건 (집계 제외)", ""]
+    mat = pass_matrix(metrics["passes"], numbers)
+    if mat:
+        L += ["## 패스 연결 (상위)", "", "| from → to | 횟수 |", "|---|---|"]
+        for (a, b), n in sorted(mat.items(), key=lambda kv: -kv[1])[:20]:
+            L.append(f"| {a} → {b} | {n} |")
+        L.append("")
+    for i, img in enumerate(passmaps or []):
+        p = out / f"passmap_team{i + 1}.png"
+        cv2.imwrite(str(p), img)
+        files.append(p)
+        L += [f"![{team_names[i]} 패스맵]({p.name})", ""]
+    if dist_rows:
+        L += ["## 뛴 거리 (관측 비율 병기 — 낮으면 실제보다 적게 잡힘)",
+              "", "| 팀 | 번호/ID | 거리(m) | 평균(m/s) | 최고(m/s) | 관측 |",
+              "|---|---|---|---|---|---|"]
+        for tm, num, dm, avg, mx, obs in dist_rows:
+            L.append(f"| {tm} | {num} | {dm:.0f} | {avg:.1f} "
+                     f"| {mx:.1f} | {obs:.0%} |")
+        L.append("")
+    md = out / "match.md"
+    md.write_text("\n".join(L), encoding="utf-8")
+    files.insert(0, md)
+    return [str(f) for f in files]

@@ -20,7 +20,7 @@ class StatsDialog(QDialog):
     """점유율/패스 요약 — 비모달, 검수 화면과 나란히 띄운다."""
 
     def __init__(self, parent, metrics, team_names=("팀1", "팀2"),
-                 numbers=None, passmaps=None, dist_rows=None):
+                 numbers=None, passmaps=None, dist_rows=None, save_dir=None):
         super().__init__(parent)
         self.setWindowTitle("경기 지표 (점유율·패스)")
         self.setModal(False)
@@ -93,6 +93,18 @@ class StatsDialog(QDialog):
             v.addWidget(sc, 2)
             self.resize(920, 760)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        if save_dir:
+            b = bb.addButton("리포트 저장 (match.md + PNG)",
+                             QDialogButtonBox.ButtonRole.ActionRole)
+
+            def _save():
+                from ..core.metrics import write_match_report
+                files = write_match_report(
+                    save_dir, metrics, team_names, passmaps=passmaps,
+                    dist_rows=dist_rows, numbers=numbers)
+                b.setText(f"저장됨: {len(files)}개 파일")
+                b.setEnabled(False)
+
+            b.clicked.connect(_save)
         bb.rejected.connect(self.reject)
-        bb.clicked.connect(self.close)
         v.addWidget(bb)
