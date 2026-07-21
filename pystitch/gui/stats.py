@@ -20,7 +20,7 @@ class StatsDialog(QDialog):
     """점유율/패스 요약 — 비모달, 검수 화면과 나란히 띄운다."""
 
     def __init__(self, parent, metrics, team_names=("팀1", "팀2"),
-                 numbers=None):
+                 numbers=None, passmaps=None):
         super().__init__(parent)
         self.setWindowTitle("경기 지표 (점유율·패스)")
         self.setModal(False)
@@ -61,6 +61,25 @@ class StatsDialog(QDialog):
             f"소유 구간 {len(metrics['spans'])}개 / 샘플 "
             f"{metrics['n_samples']}개. 원경 공백은 멀티캠 융합(P06-4)이 "
             f"개선 경로."))
+        if passmaps:
+            import cv2
+            from PyQt6.QtGui import QImage, QPixmap
+            from PyQt6.QtWidgets import QHBoxLayout, QScrollArea, QWidget
+            row = QHBoxLayout()
+            for img in passmaps:
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                qi = QImage(rgb.data, rgb.shape[1], rgb.shape[0],
+                            rgb.strides[0], QImage.Format.Format_RGB888)
+                lbl = QLabel()
+                lbl.setPixmap(QPixmap.fromImage(qi.copy()).scaledToWidth(430))
+                row.addWidget(lbl)
+            wrap = QWidget()
+            wrap.setLayout(row)
+            sc = QScrollArea()
+            sc.setWidget(wrap)
+            sc.setMinimumHeight(300)
+            v.addWidget(sc, 2)
+            self.resize(920, 760)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         bb.rejected.connect(self.reject)
         bb.clicked.connect(self.close)

@@ -237,3 +237,69 @@ def match_metrics(analysis, calib, role_of, rep_of, pauses=None):
     ev = extract_passes(spans, t, ball_f, states)
     return {"summary": possession_summary(t, states, pauses),
             "spans": spans, "n_samples": len(t), **ev}
+
+
+def render_passmap(passes, positions, length=105.0, width=68.0,
+                   px_per_m=8, numbers=None, title=""):
+    """패스맵 PNG (BGR) — 노드=선수 평균 위치, 화살표 두께=횟수.
+
+    positions: {tid: (x, y)} 필드 좌표 (m). 히트맵과 동일 등방 좌표계.
+    """
+    import cv2
+    hl, hw = length / 2.0, width / 2.0
+    pad = 3.0
+    W = int((length + 2 * pad) * px_per_m)
+    H = int((width + 2 * pad) * px_per_m)
+    img = np.full((H, W, 3), (60, 110, 60), np.uint8)
+
+    def P(x, y):
+        return (int((x + hl + pad) * px_per_m),
+                int((hw - y + pad) * px_per_m))
+
+    white = (235, 235, 235)
+    cv2.rectangle(img, P(-hl, hw), P(hl, -hw), white, 2)
+    cv2.line(img, P(0, hw), P(0, -hw), white, 2)
+    cv2.circle(img, P(0, 0), int(9.15 * px_per_m), white, 2)
+    mat = pass_matrix(passes)
+    lab = (lambda tid: numbers.get(tid, str(tid))) if numbers \
+        else (lambda tid: str(tid))
+    inv = {}
+    for tid, xy in positions.items():
+        inv[lab(tid)] = xy
+    for (a, b), n in sorted(mat.items(), key=lambda kv: kv[1]):
+        if a not in inv or b not in inv:
+            continue
+        cv2.arrowedLine(img, P(*inv[a]), P(*inv[b]), (40, 210, 240),
+                        max(1, min(n, 6)), tipLength=0.06)
+    for tid, (x, y) in positions.items():
+        cv2.circle(img, P(x, y), 11, (30, 30, 30), -1)
+        cv2.putText(img, lab(tid), (P(x, y)[0] - 9, P(x, y)[1] + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, white, 1)
+    if title:
+        cv2.putText(img, title, (12, 26), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, white, 2)
+    return img
+
+
+def mean_positions(analysis, calib, role_of, rep_of, team):
+    """팀 소속 대표 tid 별 필드 평균 위치 {rep: (x, y)} — 패스맵 노드."""
+    from .field import pano_to_field
+    team_of_role = {0: 0, 3: 0, 1: 1, 4: 1}
+    acc: dict = {}
+    for prow in analysis["players"]:
+        for p in prow:
+            if len(p) < 5 or p[4] < 0:
+                continue
+            role = role_of(int(p[4]))
+            if team_of_role.get(role) != team:
+                continue
+            xy = pano_to_field(calib, [(p[0], p[1] + p[3] / 2.0)])[0]
+            if not np.all(np.isfinite(xy)):
+                continue
+            rep = rep_of(int(p[4]))
+            e = acc.setdefault(rep, [0.0, 0.0, 0])
+            e[0] += xy[0]
+            e[1] += xy[1]
+            e[2] += 1
+    return {rep: (e[0] / e[2], e[1] / e[2])
+            for rep, e in acc.items() if e[2] >= 30}

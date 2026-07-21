@@ -136,3 +136,12 @@ def test_match_metrics_end_to_end():
     finally:
         if orig is not None:
             F.pano_to_field = orig
+
+
+def test_render_passmap():
+    from pystitch.core.metrics import render_passmap
+    passes = [{"from_tid": 7, "to_tid": 9, "team": 0, "t": 1.0}] * 4
+    img = render_passmap(passes, {7: (-20.0, 5.0), 9: (15.0, -10.0)},
+                         numbers={7: "7", 9: "10"}, title="팀1")
+    assert img.shape[0] > 400 and img.shape[2] == 3
+    assert img.mean() > 40                # 필드+마킹이 그려짐

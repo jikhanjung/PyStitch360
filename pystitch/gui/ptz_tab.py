@@ -3978,10 +3978,19 @@ class PtzTab(QWidget):
         if m is None or m["summary"] is None:
             QMessageBox.information(self, "경기 지표", "계산 실패 — 로그 확인")
             return
+        from ..core.metrics import mean_positions, render_passmap
         from .stats import StatsDialog
         nums = {r: n for r, n in self.player_nums.items() if n}
+        maps = []
+        for team in (0, 1):
+            pos = mean_positions(self.analysis, self._field_calib,
+                                 self._role_of, self._rep, team)
+            tp = [p for p in m["passes"] if p["team"] == team]
+            if pos:
+                maps.append(render_passmap(tp, pos, numbers=nums,
+                                           title=self.team_names[team]))
         dlg = StatsDialog(self, m, team_names=tuple(self.team_names),
-                          numbers=nums)
+                          numbers=nums, passmaps=maps)
         dlg.show()
         self._stats_dlg = dlg             # GC 방지
 
