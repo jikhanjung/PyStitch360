@@ -63,3 +63,40 @@ def test_loose_and_empty():
     st, _ = possession_samples(None, [], [])
     assert st == "unobserved"
     assert possession_summary([0.0], ["loose"]) is None
+
+
+def test_pass_extraction_and_kick_snap():
+    from pystitch.core.metrics import extract_passes, kick_instant, pass_matrix
+    # 소유: 팀0 #7 (0~10s) → 팀0 #9 (10.8~15) → 팀1 #22 (17~20, 턴오버)
+    spans = [{"t0": 0.0, "t1": 10.0, "team": 0, "tid": 7},
+             {"t0": 10.8, "t1": 15.0, "team": 0, "tid": 9},
+             {"t0": 17.0, "t1": 20.0, "team": 1, "tid": 22}]
+    # 공 궤적: 10.2s 에 방향 급변 (킥)
+    t = np.arange(0, 21, 0.1)
+    ball = np.zeros((len(t), 2))
+    ball[:, 0] = np.where(t < 10.2, t * 1.0, 10.2 + (t - 10.2) * 8.0)
+    ball[:, 1] = np.where(t < 10.2, 0.0, (t - 10.2) * 5.0)
+    states = ["observed"] * len(t)
+    r = extract_passes(spans, t, ball, states)
+    assert len(r["passes"]) == 1 and len(r["turnovers"]) == 1
+    assert abs(r["passes"][0]["t"] - 10.2) < 0.15   # 킥 스냅
+    assert r["passes"][0]["from_tid"] == 7 and r["passes"][0]["to_tid"] == 9
+    assert r["turnovers"][0]["to_team"] == 1
+    mat = pass_matrix(r["passes"], numbers={7: "7", 9: "9"})
+    assert mat[("7", "9")] == 1
+    assert abs(kick_instant(t, ball, 10.0) - 10.2) < 0.15
+
+
+def test_pass_unobserved_transition():
+    from pystitch.core.metrics import extract_passes
+    spans = [{"t0": 0.0, "t1": 5.0, "team": 0, "tid": 7},
+             {"t0": 7.5, "t1": 9.0, "team": 0, "tid": 9}]
+    t = np.arange(0, 10, 0.1)
+    states = ["unobserved" if 5.0 < ti < 7.5 else "observed" for ti in t]
+    r = extract_passes(spans, t, None, states)
+    assert r["unobserved_transitions"] == 1 and not r["passes"]
+    # 긴 공백 (>max_gap) 도 미관측 전이
+    spans2 = [{"t0": 0.0, "t1": 5.0, "team": 0, "tid": 7},
+              {"t0": 9.0, "t1": 10.0, "team": 1, "tid": 22}]
+    r2 = extract_passes(spans2, t, None, ["observed"] * len(t))
+    assert r2["unobserved_transitions"] == 1 and not r2["turnovers"]

@@ -116,3 +116,76 @@ def possession_summary(t, states, pauses=None):
     acc["coverage"] = (total - acc["unobserved_s"]) / total if total else 0.0
     return {k: (round(v, 3) if isinstance(v, float) else v)
             for k, v in acc.items()}
+
+
+# ---------------------------------------------------------------- P08-2 패스
+def kick_instant(t, ball_xy, t0, window=1.0):
+    """t0 근처 공 속도/방향 급변 시점으로 스냅 (패스 시작 정밀화).
+
+    소유 경계는 근접 판정이라 ±0.5s 무디다 — 궤적 가속도 피크가 킥.
+    관측 부족이면 t0 그대로.
+    """
+    t = np.asarray(t, float)
+    b = np.asarray(ball_xy, float).reshape(-1, 2)
+    m = np.isfinite(b).all(1) & (np.abs(t - t0) <= window)
+    if m.sum() < 4:
+        return float(t0)
+    ts, bs = t[m], b[m]
+    v = np.diff(bs, axis=0) / np.clip(np.diff(ts), 1e-6, None)[:, None]
+    a = np.linalg.norm(np.diff(v, axis=0), axis=1) \
+        / np.clip(np.diff(ts)[1:], 1e-6, None)
+    if not len(a):
+        return float(t0)
+    return float(ts[int(np.argmax(a)) + 1])
+
+
+def extract_passes(spans, t=None, ball_xy=None, states=None,
+                   max_gap=3.0, unobs_frac=0.5):
+    """소유 구간열 → 패스/턴오버/미관측 전이 (P08-2).
+
+    같은 팀 다른 선수 = 패스, 팀 변경 = 턴오버. 두 구간 사이가
+    max_gap 초과이거나 미관측 비율이 크면 "미관측 전이" 로 분리 집계
+    — 없는 패스를 만들지 않는다 (P08 원칙). t/ball_xy 가 있으면 킥
+    시점을 궤적 급변으로 스냅.
+    """
+    passes, turnovers, unobserved = [], [], 0
+    t_arr = None if t is None else np.asarray(t, float)
+    for a, b in zip(spans, spans[1:]):
+        gap = b["t0"] - a["t1"]
+        blind = False
+        if states is not None and t_arr is not None and gap > 0.2:
+            m = (t_arr > a["t1"]) & (t_arr < b["t0"])
+            if m.sum():
+                un = sum(1 for s in np.asarray(states, object)[m]
+                         if s == "unobserved")
+                blind = un / m.sum() > unobs_frac
+        if gap > max_gap or (blind and gap > 1.0):
+            unobserved += 1
+            continue
+        tk = a["t1"]
+        if t_arr is not None and ball_xy is not None:
+            tk = kick_instant(t_arr, ball_xy, a["t1"])
+        ev = {"t": round(float(tk), 2), "from_tid": a["tid"],
+              "to_tid": b["tid"], "team": a["team"]}
+        if b["team"] == a["team"]:
+            if b["tid"] != a["tid"] and b["tid"] is not None:
+                passes.append(ev)
+        else:
+            ev["to_team"] = b["team"]
+            turnovers.append(ev)
+    return {"passes": passes, "turnovers": turnovers,
+            "unobserved_transitions": unobserved}
+
+
+def pass_matrix(passes, numbers=None):
+    """패스 목록 → {(from, to): count} — 패스맵 화살표 데이터.
+
+    numbers: {tid: 등번호 문자열} 있으면 라벨 치환.
+    """
+    lab = (lambda tid: numbers.get(tid, str(tid))) if numbers \
+        else (lambda tid: str(tid))
+    out: dict = {}
+    for p in passes:
+        k = (lab(p["from_tid"]), lab(p["to_tid"]))
+        out[k] = out.get(k, 0) + 1
+    return out
