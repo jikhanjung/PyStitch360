@@ -1,8 +1,15 @@
-# PyStitch360
+# TouchlineAnalyst
 
-듀얼 GoPro로 촬영한 축구 경기를 초광폭 원통(cylindrical) 파노라마 영상으로
-스티칭하는 GUI 툴. 경기장 전체가 한 화면에 들어오는 ~5,900px 폭 파노라마와,
-공을 자동 추적하는 가상 PTZ 1080p 출력을 지원한다.
+듀얼 GoPro 축구 촬영을 스티칭·분석하는 툴 모음 (구 PyStitch360).
+경기장 전체가 한 화면에 들어오는 ~5,900px 파노라마, 공 자동 추적 가상
+PTZ 1080p, 검출·이벤트·하이라이트 분석, 멀티캠(AX700 등) 동기화까지.
+
+| 실행 | 역할 |
+|---|---|
+| `python pitchstitch.py` | **PitchStitch** — 스티칭 전용 (torch 불필요) |
+| `python pitchwatch.py [pano.mp4 \| 경기.match.json]` | **PitchWatch** — 경기 분석·검수·멀티캠 |
+| `python main.py --headless <L디렉터리> <R디렉터리>` | 무인 일괄 (스티칭→분석→OCR→호각) |
+| `python main.py` | 통합 GUI (두 기능 모두) |
 
 ```
 [좌 GoPro 챕터들]──┐   오디오 자동 동기화     원통 워핑(remap 캐싱)
@@ -44,7 +51,7 @@ pip install ultralytics            # 선택: 가상 PTZ 기능
 ## 사용
 
 ```bash
-python main.py
+python pitchstitch.py     # 스티칭 / 또는 python main.py (통합)
 ```
 
 1. **영상·동기화 탭**: 좌/우 영상의 첫 챕터(GOPR*.MP4) 선택 → 챕터 자동 연결.
