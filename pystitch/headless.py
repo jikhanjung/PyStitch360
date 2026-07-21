@@ -469,24 +469,68 @@ def _ocr(pano: Path, args, cache=None):
     _log(f"[ocr] 제안 {len(out)}건 → {pano.stem}.events.json \"ocr_numbers\"")
 
 
+class _StageTimer:
+    """단계별 소요를 <pano>.timing.json 에 기록 — 파이프라인 성능 비교용.
+
+    스킵된 단계는 기록하지 않는다. 같은 pano 재실행 시 실행된 단계만
+    갱신 (P09 전/후 비교는 stage 별 최신값으로).
+    """
+
+    def __init__(self, pano: Path):
+        self.path = pano.with_suffix(".timing.json")
+        try:
+            self.doc = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self.doc = {"version": 1, "runs": {}}
+
+    def stage(self, name):
+        timer = self
+
+        class _Ctx:
+            def __enter__(self):
+                self.t0 = time.time()
+                return self
+
+            def __exit__(self, exc_type, *_a):
+                timer.doc["runs"][name] = {
+                    "start": time.strftime(
+                        "%Y-%m-%d %H:%M:%S", time.localtime(self.t0)),
+                    "sec": round(time.time() - self.t0, 1),
+                    "ok": exc_type is None,
+                }
+                timer.path.write_text(
+                    json.dumps(timer.doc, ensure_ascii=False, indent=1),
+                    encoding="utf-8")
+                return False              # 예외는 그대로 전파
+
+        return _Ctx()
+
+
 def process_pair(pair, out_dir: Path, lens, lens_name, args) -> Path:
     left_chain, right_chain, cost = pair
     pano = out_dir / f"{_pair_name(left_chain)}.mp4"
     _log(f"=== {pano.stem}: L {left_chain[0].name} 외 {len(left_chain)-1}개 "
          f"↔ R {right_chain[0].name} 외 {len(right_chain)-1}개 "
          f"(크기차 {cost:.1%})")
+    tm = _StageTimer(pano)
     if pano.exists() and not args.force:
         _log(f"[stitch] {pano.name} 있음 — 건너뜀")
     else:
-        _stitch(pair, pano, lens, lens_name, args)
+        with tm.stage("stitch"):
+            _stitch(pair, pano, lens, lens_name, args)
     ana = pano.with_suffix(".analysis.json")
     cache = None
     if ana.exists() and not args.force:
         _log(f"[analyze] {ana.name} 있음 — 건너뜀")
     else:
-        cache = _analyze(pano, args)
+        with tm.stage("analyze"):
+            cache = _analyze(pano, args)
     try:
-        _whistle(pano, args)
+        if not pano.with_suffix(".whistle.json").exists() or args.force:
+            with tm.stage("whistle"):
+                _whistle(pano, args)
+        else:
+            _whistle(pano, args)          # 내부 스킵 로그만
     except Exception as e:  # noqa: BLE001 — 호각은 부가 산출물, 파이프라인 유지
         _log(f"[whistle] 실패 (계속 진행): {e}")
     if args.no_ocr:
@@ -494,7 +538,9 @@ def process_pair(pair, out_dir: Path, lens, lens_name, args) -> Path:
     if "ocr_numbers" in load_events_doc(pano) and not args.force:
         _log("[ocr] ocr_numbers 있음 — 건너뜀")
     else:
-        _ocr(pano, args, cache=cache)
+        with tm.stage("ocr_cached" if cache is not None and cache.n
+                      else "ocr_seek"):
+            _ocr(pano, args, cache=cache)
     return pano
 
 
