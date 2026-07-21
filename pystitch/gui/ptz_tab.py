@@ -1661,6 +1661,12 @@ class PtzTab(QWidget):
         ov = QVBoxLayout(self.pane)
         ov.setContentsMargins(8, 8, 8, 8)
         ov_row = QHBoxLayout()
+        self._lbl_title = QLabel("")
+        self._lbl_title.setStyleSheet(
+            "QLabel { color: white; background: rgba(20,20,20,150);"
+            " padding: 2px 10px; border-radius: 4px; font-weight: bold; }")
+        self._lbl_title.hide()
+        ov_row.addWidget(self._lbl_title)
         ov_row.addStretch(1)
         for cb in (self.check_players, self.check_ball, self.check_crop,
                    self.check_radar, self.check_radar_smooth):
@@ -2015,6 +2021,44 @@ class PtzTab(QWidget):
                  f"2..{n + 1}=앵글)" if n else
                  f"[match] {h['label']}: 동기화된 앵글 없음")
 
+    def _update_titles(self):
+        """페인 좌상단 영상 제목 + 현 시점 매칭 앵글 유무 (P07)."""
+        if self.pano_path is None:
+            self._lbl_title.hide()
+            return
+        t = self.slider.value() / self.fps
+        main = self.pano_path.stem
+        covered = []
+        if self.mc is not None and self.mc.alts:
+            for a in self.mc.alts:
+                span = a.get("cover_span")
+                if span and span[0] <= t <= span[1]:
+                    covered.append(Path(a["video"]).stem)
+            if self.mc.alt_on_main:       # 메인이 alt — 제목 교체
+                i = self.mc._shown_alt()
+                if i is not None:
+                    main = Path(self.mc.alts[i]["video"]).stem
+                    a = self.mc.alts[i]
+                    span = a.get("cover_span")
+                    out = span and not (span[0] <= t <= span[1])
+                    self._lbl_title.setText(
+                        f"{main}" + (" · 이 시점 영상 없음" if out else ""))
+                    self._lbl_title.show()
+                    self.mc.pane_alt.set_title(self.pano_path.stem)
+                    return
+        suffix = f" · 앵글: {', '.join(covered)}" if covered else " · 앵글 없음"
+        self._lbl_title.setText(main + suffix)
+        self._lbl_title.show()
+        if self.mc is not None and self.mc.alts:
+            i = self.mc._shown_alt()
+            if i is not None:
+                name = Path(self.mc.alts[i]["video"]).stem
+                a = self.mc.alts[i]
+                span = a.get("cover_span")
+                out = span and not (span[0] <= t <= span[1])
+                self.mc.pane_alt.set_title(
+                    name + (" · 이 시점 영상 없음" if out else ""))
+
     def _rebuild_mc_bar(self):
         """페인 오버레이의 카메라/모드 바 재구성."""
         while self._mc_row.count():
@@ -2051,6 +2095,13 @@ class PtzTab(QWidget):
             b.clicked.connect(lambda _, idx=i: self._mc_select(idx))
             self._mc_row.addWidget(b)
             self._mc_btns.append(b)
+        b = QPushButton("✎ 앵글 편집")
+        b.setStyleSheet(style)
+        b.setToolTip("표시 중인 앵글을 단독 영상으로 열기 — 경기장 "
+                     "캘리브레이션(rotcam 랜드마크)·검수용. 경기 컨텍스트는 "
+                     "해제되며 최근 경기에서 다시 열 수 있음")
+        b.clicked.connect(self._mc_edit_alt)
+        self._mc_row.addWidget(b)
         self._mc_cam_enable()
 
     def _mc_cam_enable(self):
@@ -2058,6 +2109,23 @@ class PtzTab(QWidget):
         both = self.mc is not None and self.mc.mode == "split"
         for b in getattr(self, "_mc_btns", []):
             b.setEnabled(not both)
+
+    def _mc_edit_alt(self):
+        """표시 중인 alt 를 단독으로 열기 — AX700 캘리브레이션 경로 (P07).
+
+        alt 페인은 읽기 전용이라 랜드마크를 찍을 수 없다 — 단독으로
+        열면 기존 캘리브레이션 UI 전부 사용 가능. 랜드마크는 그 영상의
+        .ptz.json 에 저장되어 rotcam_ref_from_ptz.py 가 읽는다.
+        """
+        if self.mc is None or not self.mc.alts:
+            return
+        i = self.mc._shown_alt()
+        if i is None:
+            i = 0
+        video = self.mc.alts[i]["video"]
+        self.log(f"[match] 앵글 단독 편집: {Path(video).name} "
+                 "(경기 컨텍스트 해제 — 파일 메뉴 > 최근 경기로 복귀)")
+        self.open_path(video)
 
     def _mc_select(self, idx: int):
         """카메라 선택 (모드 안의 배치): 0=파노라마, 1..=alt."""
@@ -2071,6 +2139,7 @@ class PtzTab(QWidget):
             b.setChecked(i == idx)
         # focus 가 alt 인 PiP 는 파노라마를 안쪽에 즉시 공급
         self.mc.primary_tick(getattr(self, "_cur_frame", None))
+        self._update_titles()
         self._redraw()
 
     def _mc_mode(self, mode: str):
@@ -2081,6 +2150,7 @@ class PtzTab(QWidget):
             b.setChecked(k == mode)
         self._mc_cam_enable()
         self.mc.primary_tick(getattr(self, "_cur_frame", None))
+        self._update_titles()
         self._redraw()
 
     def _set_angle_lanes(self):
@@ -2099,6 +2169,7 @@ class PtzTab(QWidget):
             if dur <= 0:
                 continue
             t0, t1 = alt_coverage(a["clock"], dur)
+            a["cover_span"] = (t0, t1)    # 타이틀 앵글 유무 판정용 (초)
             whistles = []
             try:                              # 그 카메라의 호각 → primary 초
                 _tr, ev = load_whistle_track(a["video"])
@@ -2623,6 +2694,8 @@ class PtzTab(QWidget):
         if self.mc is not None:
             self.mc.update(f / self.fps, playing=True)
             self.mc.primary_tick(frame, playing=True)
+        if f % 15 == 0:
+            self._update_titles()
         self._play_sync = True      # 워커 발 갱신 표시 — 사용자 시크와 구분
         try:
             self.slider.setValue(f)  # _show_frame 은 재생 중 가드로 무시됨
@@ -3058,6 +3131,7 @@ class PtzTab(QWidget):
         if self.mc is not None:
             self.mc.update(f / self.fps, playing=False)
             self.mc.primary_tick(frame)
+        self._update_titles()
         self._redraw()
 
     def _redraw(self):

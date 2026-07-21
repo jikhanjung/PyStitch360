@@ -88,6 +88,19 @@ class AltPane(FramePane):
         self.setStyleSheet(
             "background-color: #101010; color: #808080;"
             "border: 1px solid #505050;")
+        from PyQt6.QtWidgets import QLabel
+        self.lbl = QLabel("", self)           # 좌상단 제목 칩 (P07)
+        self.lbl.setStyleSheet(
+            "QLabel { color: white; background: rgba(20,20,20,170);"
+            " padding: 1px 8px; border-radius: 4px; }")
+        self.lbl.move(6, 6)
+        self.lbl.hide()
+
+    def set_title(self, text: str):
+        self.lbl.setText(text)
+        self.lbl.adjustSize()
+        self.lbl.setVisible(bool(text))
+        self.lbl.raise_()
 
     # PiP 전용 마우스 처리 — 분할 모드에선 스플리터가 담당하므로 무시
     def mousePressEvent(self, ev):
