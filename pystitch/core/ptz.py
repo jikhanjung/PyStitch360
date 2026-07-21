@@ -148,7 +148,7 @@ def detect_raw(model, frame, det_w=2944, conf=0.2):
 def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
                   weights=None, far_boost=True, far_band_frac=0.58,
                   cancel=None, progress=None, checkpoint_path=None,
-                  checkpoint_every=1500, log=print):
+                  checkpoint_every=1500, crop_hook=None, log=print):
     """1패스: 프레임 샘플마다 공/선수 검출. 반환 dict 는 JSON 직렬화 가능.
 
     field_top_frac 위(원경 트랙·관중석)의 공/선수는 장외로 버린다.
@@ -289,6 +289,8 @@ def analyze_video(path, detect_every=3, det_w=None, field_top_frac=0.26,
             balls.append(kept[0] if kept else None)
             ball_cands.append(kept)
             players.append(prow)
+            if crop_hook is not None:     # P09: 디코드 1회 다중 소비 —
+                crop_hook(frame, len(frames_idx) - 1, i, prow)   # OCR/포즈 크롭
             done_new = i - resume_base
             if len(frames_idx) % 30 == 0 and progress is not None:
                 el = time.perf_counter() - t0

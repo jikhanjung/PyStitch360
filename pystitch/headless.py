@@ -394,9 +394,15 @@ def _analyze(pano: Path, args):
             _log(f"[analyze] {i}/{total} ({i/total*100:.1f}%) "
                  f"{fps:.1f}fps 남은 ~{rem:.0f}분")
 
+    from .core.ocr import OnlineCropCache
+    cap = cv2.VideoCapture(str(pano))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cap.release()
+    cache = OnlineCropCache(fps, min_h=args.min_h, per_track=args.per_track)
     d = analyze_video(str(pano), weights=args.weights,
                       detect_every=args.detect_every,
-                      checkpoint_path=str(ckpt), progress=progress, log=_log)
+                      checkpoint_path=str(ckpt), progress=progress,
+                      crop_hook=cache.hook, log=_log)
     if d is None:
         raise RuntimeError("분석 취소/실패")
     tmp = Path(str(out) + ".tmp")
@@ -404,7 +410,9 @@ def _analyze(pano: Path, args):
     tmp.replace(out)
     n_ball = sum(1 for b in d["balls"] if b is not None)
     _log(f"[analyze] 샘플 {len(d['frames'])}개, 공 {n_ball}개, "
-         f"선수 검출 {sum(len(p) for p in d['players'])} → {out.name}")
+         f"선수 검출 {sum(len(p) for p in d['players'])} → {out.name} "
+         f"(OCR 크롭 캐시 {cache.n}장)")
+    return cache
 
 
 def _whistle(pano: Path, args):
@@ -426,7 +434,7 @@ def _whistle(pano: Path, args):
          f"({time.perf_counter() - t0:.0f}s)")
 
 
-def _ocr(pano: Path, args):
+def _ocr(pano: Path, args, cache=None):
     ana = json.loads(pano.with_suffix(".analysis.json").read_text())
     teams = classify_teams(ana)
     picked = collect_ocr_candidates(
@@ -442,8 +450,17 @@ def _ocr(pano: Path, args):
             gpu = bool(torch.cuda.is_available())
         except ImportError:
             pass
-    out = run_jersey_ocr(str(pano), ana, picked, min_conf=args.min_conf,
-                         min_votes=args.min_votes, gpu=gpu, log=_log)
+    if cache is not None and cache.n:
+        # P09: 분석 패스가 모아둔 크롭 — 영상 재디코드 없이 OCR
+        from .core.ocr import run_jersey_ocr_cached
+        cp = cache.picked(lambda t: teams.get(t, 2), lambda t: t)
+        _log(f"[ocr] 캐시 경로: 크롭 {len(cp)}장 (재디코드 없음)")
+        out = run_jersey_ocr_cached(cp, min_conf=args.min_conf,
+                                    min_votes=args.min_votes, gpu=gpu,
+                                    log=_log)
+    else:
+        out = run_jersey_ocr(str(pano), ana, picked, min_conf=args.min_conf,
+                             min_votes=args.min_votes, gpu=gpu, log=_log)
     for k in sorted(out, key=lambda k: -out[k]["score"]):
         v = out[k]
         _log(f"[ocr]   #{k:>7s} → {v['num']:>2s}번 "
@@ -463,10 +480,11 @@ def process_pair(pair, out_dir: Path, lens, lens_name, args) -> Path:
     else:
         _stitch(pair, pano, lens, lens_name, args)
     ana = pano.with_suffix(".analysis.json")
+    cache = None
     if ana.exists() and not args.force:
         _log(f"[analyze] {ana.name} 있음 — 건너뜀")
     else:
-        _analyze(pano, args)
+        cache = _analyze(pano, args)
     try:
         _whistle(pano, args)
     except Exception as e:  # noqa: BLE001 — 호각은 부가 산출물, 파이프라인 유지
@@ -476,7 +494,7 @@ def process_pair(pair, out_dir: Path, lens, lens_name, args) -> Path:
     if "ocr_numbers" in load_events_doc(pano) and not args.force:
         _log("[ocr] ocr_numbers 있음 — 건너뜀")
     else:
-        _ocr(pano, args)
+        _ocr(pano, args, cache=cache)
     return pano
 
 
