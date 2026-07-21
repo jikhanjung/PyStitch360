@@ -1277,7 +1277,7 @@ class HighlightExportDialog(QDialog):
     """하이라이트 일괄 내보내기 — 구간 체크 목록·출력 폴더·코덱/CRF/미니맵."""
 
     def __init__(self, parent, highlights, fps, encoders, crf, radar_on,
-                 default_dir, clock_on=None, alt_label=None):
+                 default_dir, clock_on=None, alt_label=None, alt_span=None):
         super().__init__(parent)
         self.setWindowTitle("하이라이트 일괄 내보내기")
         self.fps = fps
@@ -1287,11 +1287,18 @@ class HighlightExportDialog(QDialog):
         any_accept = any(h.get("state") == "accept" for h in highlights)
         for h in highlights:
             dur = h["t1"] - h["t0"]
+            badge = ""                        # 앵글 뱃지: alt 가 구간을 덮는가
+            if alt_label and alt_span:
+                s0, s1 = alt_span
+                if h["t0"] >= s0 and h["t1"] <= s1:
+                    badge = f"  [{alt_label}]"
+                elif h["t1"] > s0 and h["t0"] < s1:
+                    badge = f"  [{alt_label} 일부]"
             it = QListWidgetItem(
                 f"{ExportDialog._hms(h['t0'])} ~ {ExportDialog._hms(h['t1'])}"
                 f"  ({dur:.0f}초)  {h.get('label', '')}"
                 f"  점수 {h.get('score', 0):.1f}"
-                + ("  [수락]" if h.get("state") == "accept" else ""))
+                + ("  [수락]" if h.get("state") == "accept" else "") + badge)
             it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             # 수락 항목이 하나라도 있으면 수락만 체크, 없으면 전부 체크
             it.setCheckState(Qt.CheckState.Checked
@@ -4329,6 +4336,13 @@ class PtzTab(QWidget):
                        "offset": float(sync["offset"]),
                        "drift": float(sync.get("drift", 1.0)),
                        "label": label}
+                acap = cv2.VideoCapture(sync["other"])
+                if acap.isOpened():        # 커버 구간 (앵글 뱃지용)
+                    adur = (acap.get(cv2.CAP_PROP_FRAME_COUNT)
+                            / (acap.get(cv2.CAP_PROP_FPS) or 30.0))
+                    alt["span"] = (alt["offset"],
+                                   alt["offset"] + alt["drift"] * adur)
+                acap.release()
         except Exception as e:  # noqa: BLE001
             self.log(f"[hl] 동기화 정보 무시: {e}")
         dlg = HighlightExportDialog(
@@ -4338,7 +4352,8 @@ class PtzTab(QWidget):
             str(self.pano_path.parent),
             clock_on=(st.value("ptz_export_clock", "true") == "true"
                       if clock_avail else None),
-            alt_label=alt["label"] if alt else None)
+            alt_label=alt["label"] if alt else None,
+            alt_span=alt.get("span") if alt else None)
         if not dlg.exec():
             return
         cfg = dlg.config()
