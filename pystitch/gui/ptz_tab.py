@@ -135,6 +135,7 @@ class TimelineView(QWidget):
         # 멀티캠 앵글 레인 (P07): [{label, span:(f0,f1), whistles:[(t0,t1,db)]}]
         # whistles 는 primary 초 단위 (시계 모델 변환 후)
         self.angles = []
+        self.possession = []         # [(f0, f1, team)] 소유 리본 (P08)
         self.role_palette = {}       # {역할: BGR} 실측/지정 팀 색 (바 색)
         self._press = None
         self._resize = None          # 레인 경계 드래그 상태
@@ -160,6 +161,11 @@ class TimelineView(QWidget):
     def set_pauses(self, pauses):
         """경기 중단 구간 [(f0, f1)] — 회색 세로 밴드 (시계 정지)."""
         self.pauses = list(pauses)
+        self.update()
+
+    def set_possession(self, spans):
+        """소유 리본 [(f0, f1, team)] — 눈금자 바로 아래 팀 색 밴드 (P08)."""
+        self.possession = list(spans or [])
         self.update()
 
     def set_angles(self, angles):
@@ -491,6 +497,16 @@ class TimelineView(QWidget):
                            QColor(150, 150, 160, 45))
                 p.setPen(QColor(170, 170, 180))
                 p.drawText(max(x0_, self.GUTTER) + 3, self.RULER + 11, "II")
+        # 소유 리본 (P08): 눈금자 바로 아래 팀 색 4px 밴드
+        if self.possession and self.total > 1:
+            for f0, f1, team in self.possession:
+                x0_, x1_ = self._x(f0), self._x(f1)
+                if x1_ < self.GUTTER or x0_ > W:
+                    continue
+                c = self.role_palette.get(team)
+                col = QColor(c[2], c[1], c[0]) if c else                     QColor(80, 160, 255) if team == 0 else QColor(255, 120, 80)
+                p.fillRect(max(x0_, self.GUTTER), self.RULER + 1,
+                           max(2, x1_ - max(x0_, self.GUTTER)), 4, col)
         # 멀티캠 앵글 레인 (P07): 커버리지 밴드 + 그 카메라 호각 마커
         # (primary 시간축 변환) — primary 호각 레인과 정렬 = 동기화 육안 검증
         if self.angles and self.total > 1:
@@ -4007,6 +4023,9 @@ class PtzTab(QWidget):
                               st["avg_mps"], st["max_mps"],
                               st["time_s"] / dur))
         dist_rows.sort(key=lambda r: (r[0], -r[2]))
+        self.trackbar.set_possession(
+            [(int(sp["t0"] * self.fps), int(sp["t1"] * self.fps),
+              sp["team"]) for sp in m["spans"]])
         dlg = StatsDialog(self, m, team_names=tuple(self.team_names),
                           numbers=nums, passmaps=maps,
                           dist_rows=dist_rows)
