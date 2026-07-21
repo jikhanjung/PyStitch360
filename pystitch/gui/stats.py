@@ -20,7 +20,7 @@ class StatsDialog(QDialog):
     """점유율/패스 요약 — 비모달, 검수 화면과 나란히 띄운다."""
 
     def __init__(self, parent, metrics, team_names=("팀1", "팀2"),
-                 numbers=None, passmaps=None):
+                 numbers=None, passmaps=None, dist_rows=None):
         super().__init__(parent)
         self.setWindowTitle("경기 지표 (점유율·패스)")
         self.setModal(False)
@@ -61,6 +61,18 @@ class StatsDialog(QDialog):
             f"소유 구간 {len(metrics['spans'])}개 / 샘플 "
             f"{metrics['n_samples']}개. 원경 공백은 멀티캠 융합(P06-4)이 "
             f"개선 경로."))
+        if dist_rows:
+            v.addWidget(QLabel("<b>뛴 거리</b> (관측 비율 60% 미만은 실제보다 "
+                               "적게 잡힌다 — 같은 행의 비율 참고)"))
+            t3 = QTableWidget(len(dist_rows), 6)
+            t3.setHorizontalHeaderLabels(
+                ["팀", "번호/ID", "거리(m)", "평균(m/s)", "최고(m/s)", "관측"])
+            for r, (tm, num, dm, avg, mx, obs) in enumerate(dist_rows):
+                _row(t3, r, tm, num, f"{dm:.0f}", f"{avg:.1f}",
+                     f"{mx:.1f}", f"{obs:.0%}")
+            t3.resizeColumnsToContents()
+            t3.setMinimumHeight(160)
+            v.addWidget(t3, 1)
         if passmaps:
             import cv2
             from PyQt6.QtGui import QImage, QPixmap

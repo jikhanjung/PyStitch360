@@ -3989,8 +3989,27 @@ class PtzTab(QWidget):
             if pos:
                 maps.append(render_passmap(tp, pos, numbers=nums,
                                            title=self.team_names[team]))
+        # 뛴 거리 표 (P08-3): 기존 리포트 계산 재사용 + 관측 비율 병기
+        from ..core.report import movement_stats, player_field_tracks
+        dur = max(self.total / self.fps, 1e-6)
+        dist_rows = []
+        tracks = player_field_tracks(self.analysis, self._field_calib,
+                                     self.merges)
+        for rep, tr in tracks.items():
+            role = self._role_of(rep)
+            if role not in (0, 1, 3, 4):
+                continue
+            st = movement_stats(tr)
+            if st["time_s"] < 60:
+                continue
+            dist_rows.append((self.team_names[0 if role in (0, 3) else 1],
+                              nums.get(rep, str(rep)), st["dist_m"],
+                              st["avg_mps"], st["max_mps"],
+                              st["time_s"] / dur))
+        dist_rows.sort(key=lambda r: (r[0], -r[2]))
         dlg = StatsDialog(self, m, team_names=tuple(self.team_names),
-                          numbers=nums, passmaps=maps)
+                          numbers=nums, passmaps=maps,
+                          dist_rows=dist_rows)
         dlg.show()
         self._stats_dlg = dlg             # GC 방지
 
