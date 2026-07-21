@@ -1433,6 +1433,10 @@ class PtzTab(QWidget):
         self.rosters: dict[int, list] = {}     # {팀: ["7 이름", ...]} 명단
         self.hidden_players: set[int] = set()  # 숨긴 대표 tid (관중·오인식)
         self.field_points: dict[str, list] = {}   # {랜드마크키: [x, y]}
+        # 랜드마크를 찍은 프레임 {키: frame} — 팬 카메라(AX700)용: 프레임
+        # 간 이송(rotcam)으로 기준 프레임에 합쳐 캘리브레이션한다.
+        # 파노라마(고정 뷰)에선 정보로만 존재.
+        self.field_point_frames: dict[str, int] = {}
         self.line_points: list[list] = []  # 흰 선 검출 샘플 [x, y] (사이드라인)
         self.field_size = [105.0, 68.0]   # 경기장 길이×폭 (m)
         self._field_calib = None          # fit_field_calibration 결과
@@ -2384,6 +2388,9 @@ class PtzTab(QWidget):
             self.field_points = {k: [float(v[0]), float(v[1])]
                                  for k, v in
                                  (doc.get("field_points") or {}).items()}
+            self.field_point_frames = {
+                k: int(f) for k, f in
+                (doc.get("field_point_frames") or {}).items()}
             self.line_points = [list(p) for p in doc.get("line_points", [])]
             self.extra_players = {int(si): [list(p) for p in rows]
                                   for si, rows in
@@ -2474,6 +2481,8 @@ class PtzTab(QWidget):
                                    "promotes": self.promotes,
                                    "roles": self.roles,
                                    "field_points": self.field_points,
+                                   "field_point_frames":
+                                       self.field_point_frames,
                                    "field_size": self.field_size,
                                    "line_points": self.line_points,
                                    "extra_players": self.extra_players,
@@ -3047,6 +3056,7 @@ class PtzTab(QWidget):
         if self._lm_drag is not None:        # 랜드마크 이동 — 라이브 재피팅
             self.field_points[self._lm_drag] = \
                 [round(fx * self.pano_w, 1), round(fy * self.pano_h, 1)]
+            self.field_point_frames[self._lm_drag] = int(self.slider.value())
             self._refit_field()
             self._refresh_field_list()
             self._redraw()
@@ -3350,12 +3360,18 @@ class PtzTab(QWidget):
                            max(2, int(5 * sc)), (0, 255, 0), -1)
             for k, pt in self.field_points.items():
                 q = (int(pt[0] * sc), int(pt[1] * sc))
-                cv2.drawMarker(frame, q, (255, 255, 0),
+                # 다른 프레임에서 찍은 점은 회색 — 팬 카메라에선 지금
+                # 화면의 그 위치에 있지 않다 (rotcam 이송으로 합쳐짐)
+                kf = self.field_point_frames.get(k)
+                stale = kf is not None and abs(kf - f) > self.fps
+                col = (150, 150, 150) if stale else (255, 255, 0)
+                cv2.drawMarker(frame, q, col,
                                cv2.MARKER_TILTED_CROSS,
                                max(14, int(36 * sc)), max(2, int(6 * sc)))
-                cv2.putText(frame, LANDMARK_TAGS[k],
+                cv2.putText(frame, LANDMARK_TAGS[k]
+                            + (f"@{kf}" if stale else ""),
                             (q[0] + 12, q[1] - 12), cv2.FONT_HERSHEY_SIMPLEX,
-                            max(0.5, 1.0 * sc), (255, 255, 0),
+                            max(0.5, 1.0 * sc), col,
                             max(1, int(3 * sc)))
         self.pane.set_frame(frame)
 
@@ -4761,6 +4777,7 @@ class PtzTab(QWidget):
             self._pcache_id = None
         if scope in ("field", "all"):
             self.field_points = {}
+            self.field_point_frames = {}
             self.line_points = []
         if self.analysis is not None:
             self._teams = classify_teams(self.analysis, roles=self.roles,
@@ -5255,6 +5272,7 @@ class PtzTab(QWidget):
 
     def _field_set_point(self, key, x, y):
         self.field_points[key] = [round(float(x), 1), round(float(y), 1)]
+        self.field_point_frames[key] = int(self.slider.value())
         self._refit_field(log_result=True)
         self._save_keyframes()
         self._refresh_field_list()

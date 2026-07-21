@@ -196,3 +196,24 @@ def test_auto_anchor_fails_without_lines():
     img = np.full((H, W, 3), (40, 90, 40), np.uint8)
     state = {"R": R_gt, "f": F_TRUE, "K": make_K(F_TRUE, W, H)}
     assert auto_anchor(img, state, CAM) is None
+
+
+def test_chain_homography_static_and_transfer(tmp_path):
+    """정지 합성 영상 → 체인 H ≈ 항등, transfer_points 왕복."""
+    import cv2
+
+    from pystitch.core.rotcam import chain_homography, transfer_points
+
+    rng = np.random.default_rng(3)
+    base = (rng.random((240, 420, 3)) * 255).astype(np.uint8)
+    vp = tmp_path / "static.mp4"
+    vw = cv2.VideoWriter(str(vp), cv2.VideoWriter_fourcc(*"mp4v"),
+                         30.0, (420, 240))
+    for _ in range(40):
+        vw.write(base)
+    vw.release()
+    H = chain_homography(vp, 0, 35, det_w=420, every_s=0.5)
+    assert H is not None
+    pts = np.array([[100.0, 60.0], [300.0, 200.0]])
+    moved = transfer_points(H, pts)
+    assert np.abs(moved - pts).max() < 2.0, moved

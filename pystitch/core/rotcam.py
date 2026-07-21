@@ -483,3 +483,68 @@ def auto_anchor(frame_bgr, state, cam_pos, length=105.0, width=68.0,
         res = {"res_w": got["res_w"], "n_pts": int(m.sum())}
     return {"R": cur["R"], "f": cur["f"], "K": make_K(cur["f"], w, h),
             **res}
+
+
+def chain_homography(video_path, f0, f1, det_w=1920, every_s=0.5):
+    """프레임 f0 → f1 픽셀 이송 호모그래피 (원본 좌표계).
+
+    순수 회전 카메라라 H 가 픽셀을 시차 없이 정확히 옮긴다 — 다른
+    프레임에서 찍은 랜드마크를 기준 프레임으로 합치는 다중 프레임
+    캘리브레이션의 기반 (f/K 불필요, H 합성만). every_s 간격 중간
+    프레임을 거쳐 누적. 실패(매칭 부족) 시 None.
+    """
+    if f0 == f1:
+        return np.eye(3)
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return None
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    step = max(1, int(every_s * fps)) * (1 if f1 > f0 else -1)
+
+    def grab(i):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ok, fr = cap.read()
+        if not ok:
+            return None
+        sc = 1.0
+        if det_w and fr.shape[1] > det_w:
+            sc = det_w / fr.shape[1]
+            fr = cv2.resize(fr, (det_w, int(fr.shape[0] * sc)),
+                            interpolation=cv2.INTER_AREA)
+        return cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY), sc
+
+    got = grab(f0)
+    if got is None:
+        cap.release()
+        return None
+    prev, scale = got
+    H = np.eye(3)
+    idx = f0
+    while idx != f1:
+        nxt = f1 if abs(f1 - idx) <= abs(step) else idx + step
+        got = grab(nxt)
+        if got is None:
+            cap.release()
+            return None
+        cur, _ = got
+        pa, pb = match_frames(prev, cur)
+        if len(pa) < 25:
+            cap.release()
+            return None
+        Hi, mask = cv2.findHomography(pa, pb, cv2.RANSAC, 3.0)
+        if Hi is None or mask is None or mask.sum() < 25:
+            cap.release()
+            return None
+        H = Hi @ H
+        prev, idx = cur, nxt
+    cap.release()
+    # det_w 좌표계 H → 원본 좌표계: S⁻¹ H S
+    S = np.diag([scale, scale, 1.0])
+    return np.linalg.inv(S) @ H @ S
+
+
+def transfer_points(H, pts):
+    """H 로 픽셀 점 (N,2) 이송."""
+    p = np.asarray(pts, np.float64).reshape(-1, 2)
+    q = (H @ np.hstack([p, np.ones((len(p), 1))]).T).T
+    return q[:, :2] / q[:, 2:3]
