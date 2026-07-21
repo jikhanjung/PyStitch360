@@ -72,6 +72,8 @@ class PitchWatchWindow(QMainWindow):
                     lambda: self.ptz.edit_match_info())
         a.addAction("선수 히트맵/활동량 리포트",
                     lambda: self.ptz.generate_report())
+        a.addAction("경기 지표 (점유율·패스)...",
+                    lambda: self.ptz.show_match_stats())
         a.addSeparator()
         a.addAction("공/키프레임 편집 초기화",
                     lambda: self.ptz.reset_edits("ball"))

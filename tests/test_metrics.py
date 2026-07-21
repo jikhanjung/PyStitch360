@@ -100,3 +100,39 @@ def test_pass_unobserved_transition():
               {"t0": 9.0, "t1": 10.0, "team": 1, "tid": 22}]
     r2 = extract_passes(spans2, t, None, ["observed"] * len(t))
     assert r2["unobserved_transitions"] == 1 and not r2["turnovers"]
+
+
+def test_match_metrics_end_to_end():
+    """합성 analysis + 항등 캘리브레이션으로 지표 일괄 산출."""
+    from pystitch.core.metrics import match_metrics
+
+    class _IdCalib:                       # pano_to_field 대체 불가 —
+        pass                              # 실제 calib 인터페이스 필요
+
+    # pano_to_field 를 흉내내기 위해 실제 fit 대신 monkeypatch
+    import pystitch.core.metrics as M
+    orig = None
+    try:
+        from pystitch.core import field as F
+        orig = F.pano_to_field
+        F.pano_to_field = lambda c, pts: np.asarray(pts, float)
+        ana = {"frames": list(range(0, 300, 3)), "fps": 30.0,
+               "balls": [], "players": []}
+        for i, f in enumerate(ana["frames"]):
+            t = f / 30.0
+            if t < 5:                     # 팀0 #7 소유
+                ana["balls"].append([10.0, 5.0, 1.0])
+            else:                         # 팀1 #22 소유 (턴오버)
+                ana["balls"].append([-20.0, -8.0, 1.0])
+            ana["players"].append([[10.0, 5.0, 2.0, 2.0, 7],
+                                   [-20.0, -8.0, 2.0, 2.0, 22]])
+        roles = {7: 0, 22: 1}
+        r = match_metrics(ana, object(), roles.get, lambda t: t)
+        assert r is not None
+        assert len(r["spans"]) == 2
+        assert len(r["turnovers"]) == 1 and not r["passes"]
+        assert abs(r["summary"]["share0"] - 0.5) < 0.05
+        assert match_metrics(ana, None, roles.get, lambda t: t) is None
+    finally:
+        if orig is not None:
+            F.pano_to_field = orig

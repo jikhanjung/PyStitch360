@@ -122,6 +122,8 @@ class MainWindow(QMainWindow):
                     lambda: self.ptz_tab.edit_match_info())
         a.addAction("선수 히트맵/활동량 리포트",
                     lambda: self.ptz_tab.generate_report())
+        a.addAction("경기 지표 (점유율·패스)...",
+                    lambda: self.ptz_tab.show_match_stats())
         a.addSeparator()
         a.addAction("공/키프레임 편집 초기화",
                     lambda: self.ptz_tab.reset_edits("ball"))

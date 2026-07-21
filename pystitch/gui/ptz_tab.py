@@ -3959,6 +3959,32 @@ class PtzTab(QWidget):
         self._refresh_team_label()
         self._refresh_player_list()
 
+    def show_match_stats(self):
+        """분석 메뉴: 경기 지표 통계 창 (P08-3) — 계산은 core.metrics."""
+        if self.analysis is None:
+            QMessageBox.information(self, "경기 지표", "먼저 분석이 필요합니다.")
+            return
+        if self._field_calib is None:
+            QMessageBox.information(
+                self, "경기 지표",
+                "경기장 캘리브레이션이 필요합니다 — 영상 우클릭 메뉴에서 "
+                "랜드마크를 지정하세요 (지표는 필드 좌표 기준).")
+            return
+        from ..core.metrics import match_metrics
+        with self._busy("경기 지표 계산"):
+            m = match_metrics(self.analysis, self._field_calib,
+                              self._role_of, self._rep,
+                              pauses=(self.match_info or {}).get("pauses"))
+        if m is None or m["summary"] is None:
+            QMessageBox.information(self, "경기 지표", "계산 실패 — 로그 확인")
+            return
+        from .stats import StatsDialog
+        nums = {r: n for r, n in self.player_nums.items() if n}
+        dlg = StatsDialog(self, m, team_names=tuple(self.team_names),
+                          numbers=nums)
+        dlg.show()
+        self._stats_dlg = dlg             # GC 방지
+
     def _rep(self, tid):
         """트랙릿의 병합 대표 tid (병합 없으면 자기 자신)."""
         return self.merges.get(int(tid), int(tid))

@@ -189,3 +189,51 @@ def pass_matrix(passes, numbers=None):
         k = (lab(p["from_tid"]), lab(p["to_tid"]))
         out[k] = out.get(k, 0) + 1
     return out
+
+
+def match_metrics(analysis, calib, role_of, rep_of, pauses=None):
+    """분석+캘리브레이션 → 경기 지표 일괄 (P08-3 통계 화면 데이터).
+
+    role_of/rep_of: PtzTab 관례 (역할 0/3=팀0, 1/4=팀1, 그 외 제외).
+    반환 {"summary", "spans", "passes", "turnovers",
+          "unobserved_transitions", "n_samples"} 또는 None (캘리브레이션
+    없음 — 필드 좌표가 없으면 지표를 만들지 않는다).
+    """
+    if calib is None or analysis is None:
+        return None
+    from .field import pano_to_field
+    frames = analysis["frames"]
+    fps = float(analysis["fps"])
+    t = np.asarray(frames, float) / fps
+    ball_f = np.full((len(t), 2), np.nan)
+    states, tids = [], []
+    team_of_role = {0: 0, 3: 0, 1: 1, 4: 1}
+    for si, (b, prow) in enumerate(zip(analysis["balls"],
+                                       analysis["players"])):
+        if b is not None:
+            xy = pano_to_field(calib, [(b[0], b[1])])[0]
+            if np.all(np.isfinite(xy)):
+                ball_f[si] = xy
+        pts, teams_, reps = [], [], []
+        for p in prow:
+            if len(p) < 5 or p[4] < 0:
+                continue
+            role = role_of(int(p[4]))
+            if role not in team_of_role:
+                continue
+            fx = pano_to_field(calib, [(p[0], p[1] + p[3] / 2.0)])[0]
+            if not np.all(np.isfinite(fx)):
+                continue
+            pts.append(fx)
+            teams_.append(team_of_role[role])
+            reps.append(rep_of(int(p[4])))
+        st, idx = possession_samples(
+            ball_f[si] if np.all(np.isfinite(ball_f[si])) else None,
+            pts or np.zeros((0, 2)), teams_ or [])
+        states.append(st)
+        tids.append(reps[idx] if idx is not None and idx < len(reps)
+                    else None)
+    spans = possession_spans(t, states, tids)
+    ev = extract_passes(spans, t, ball_f, states)
+    return {"summary": possession_summary(t, states, pauses),
+            "spans": spans, "n_samples": len(t), **ev}
