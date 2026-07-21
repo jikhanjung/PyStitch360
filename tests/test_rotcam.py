@@ -148,3 +148,51 @@ def test_track_step_rejects_garbage():
     p = rng.uniform(0, W, (60, 2))
     q = rng.uniform(0, W, (60, 2))                          # 무상관 → 기각
     assert track_step(state, p, q) is None
+
+
+def test_auto_anchor_recovers_perturbed_pose():
+    """필드 마킹 자동 앵커 (P06-3 자동화): 합성 흰 라인 렌더 →
+    자세를 흔든 뒤 auto_anchor 가 GT 로 되돌리는지."""
+    import cv2
+
+    from pystitch.core.rotcam import auto_anchor, template_polylines
+
+    R_gt, t_gt, K_gt = gt_state(yaw_deg=6.0)
+    # GT 자세로 템플릿을 투영해 흰 라인 이미지를 렌더 (초록 바탕)
+    img = np.full((H, W, 3), (40, 90, 40), np.uint8)
+    fld, _tans, _fams = template_polylines(step=0.25)
+    proj = field_to_pixel(K_gt, R_gt, t_gt, fld)
+    for u, v in proj[np.isfinite(proj).all(1)]:
+        if 0 <= u < W and 0 <= v < H:
+            cv2.circle(img, (int(u), int(v)), 2, (235, 235, 235), -1)
+    # 섭동: 팬 0.35° + 틸트 0.2° + f +1% — 주기 앵커의 실제 임무
+    # 규모 (앵커 간 드리프트, 043 실측 랜덤워크 스케일)
+    c, s = np.cos(np.deg2rad(0.35)), np.sin(np.deg2rad(0.35))
+    Rz = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    c2, s2 = np.cos(np.deg2rad(0.2)), np.sin(np.deg2rad(0.2))
+    Rx = np.array([[1.0, 0.0, 0.0], [0.0, c2, -s2], [0.0, s2, c2]])
+    f_bad = F_TRUE * 1.01
+    state = {"R": Rx @ (R_gt @ Rz), "f": f_bad, "K": make_K(f_bad, W, H)}
+    got = auto_anchor(img, state, CAM)
+    assert got is not None, "auto_anchor 가 대응을 못 찾음"
+    assert got["n_pts"] >= 100
+    # 회전 오차 (deg)
+    dR = got["R"] @ R_gt.T
+    ang = np.rad2deg(np.arccos(np.clip((np.trace(dR) - 1) / 2, -1, 1)))
+    assert ang < 0.1, f"회전 오차 {ang:.3f}°"
+    assert abs(got["f"] - F_TRUE) / F_TRUE < 0.01, got["f"]
+    # 지면 투영 정확도: 원측 페널티 마크 부근 점
+    p = field_to_pixel(got["K"], got["R"], -got["R"] @ CAM,
+                       [(41.5, 0.0)])
+    p_gt = field_to_pixel(K_gt, R_gt, t_gt, [(41.5, 0.0)])
+    assert np.linalg.norm(p - p_gt) < 4.0, np.linalg.norm(p - p_gt)
+
+
+def test_auto_anchor_fails_without_lines():
+    """라인 없는 화면(관중석 팬 등) → None (품질 플래그 경로)."""
+    from pystitch.core.rotcam import auto_anchor
+
+    R_gt, _t, _K = gt_state()
+    img = np.full((H, W, 3), (40, 90, 40), np.uint8)
+    state = {"R": R_gt, "f": F_TRUE, "K": make_K(F_TRUE, W, H)}
+    assert auto_anchor(img, state, CAM) is None

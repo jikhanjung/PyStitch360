@@ -17,6 +17,8 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
+from .field import CENTER_CIRCLE_R, PEN_DEPTH, PEN_HALF_W
+
 
 def make_K(f, w, h):
     return np.array([[f, 0.0, w / 2.0],
@@ -221,3 +223,263 @@ def track_step(prev_state, pts_prev, pts_cur, min_matches=25,
     return {"f": float(f2), "K": K2,
             "R": R_rel @ prev_state["R"],
             "ortho_res": res, "n_inliers": int(mask.sum())}
+
+
+# ---------------------------------------------------------------- 자동 앵커
+# 필드 지형지물(흰 라인·센터서클·박스)로 (R, f) 를 자동 재정렬한다.
+# 체인 추적이 근사 자세를 항상 제공하므로 전역 인식이 아니라 국소 정렬:
+# 근사 자세로 템플릿 라인을 투영 → 각 투영점의 법선 방향으로 흰 선
+# 중심을 탐색(화이트니스 가중 중심) → (픽셀, 필드) 대응으로
+# anchor_rotation 반복. 수동 랜드마크의 자동화 (P06-3).
+
+def template_polylines(length=105.0, width=68.0, step=0.5):
+    """필드 마킹 샘플 (M,2) + 단위 접선 (M,2) + 패밀리 (M,).
+
+    패밀리 인덱스는 _marking_lines 의 직선 순서와 일치, 센터서클 = 9.
+    라벨을 샘플에 붙여 두는 이유: 탐색으로 찾은 흰 선 중심의 소속
+    직선은 "시드 샘플의 패밀리" 가 필드 재스냅보다 훨씬 강건하다
+    (원측은 역투영 증폭으로 수 m 흘러 이웃 라인에 오스냅된다 — 실측
+    23% 오라벨).
+    """
+    hl, hw = length / 2.0, width / 2.0
+    polys = []
+
+    def seg(a, b, fam):
+        a, b = np.asarray(a, float), np.asarray(b, float)
+        n = max(2, int(np.linalg.norm(b - a) / step))
+        t = np.linspace(0.0, 1.0, n)[:, None]
+        polys.append((a[None] + t * (b - a)[None],
+                      np.tile((b - a) / np.linalg.norm(b - a), (n, 1)),
+                      np.full(n, fam, np.int64)))
+
+    seg((-hl, -hw), (hl, -hw), 0)         # 근측 터치라인 (y=-hw)
+    seg((-hl, hw), (hl, hw), 1)           # 원측 터치라인 (y=+hw)
+    seg((-hl, -hw), (-hl, hw), 2)         # 골라인 L
+    seg((hl, -hw), (hl, hw), 3)           # 골라인 R
+    seg((0.0, -hw), (0.0, hw), 4)         # 하프라인
+    for sx, vfam in ((-1.0, 5), (1.0, 6)):        # 페널티박스 3변
+        seg((sx * (hl - PEN_DEPTH), -PEN_HALF_W),
+            (sx * (hl - PEN_DEPTH), PEN_HALF_W), vfam)
+        seg((sx * hl, -PEN_HALF_W), (sx * (hl - PEN_DEPTH), -PEN_HALF_W), 7)
+        seg((sx * hl, PEN_HALF_W), (sx * (hl - PEN_DEPTH), PEN_HALF_W), 8)
+    th = np.linspace(0.0, 2 * np.pi,
+                     max(8, int(2 * np.pi * CENTER_CIRCLE_R / step)))
+    circ = np.stack([CENTER_CIRCLE_R * np.cos(th),
+                     CENTER_CIRCLE_R * np.sin(th)], axis=1)
+    tan = np.stack([-np.sin(th), np.cos(th)], axis=1)
+    polys.append((circ, tan, np.full(len(th), 9, np.int64)))
+    pts = np.vstack([p for p, _t, _f in polys])
+    tans = np.vstack([t for _p, t, _f in polys])
+    fams = np.concatenate([f for _p, _t, f in polys])
+    return pts, tans, fams
+
+
+def whiteness(frame_bgr):
+    """흰 선 응답 맵 [0,1] — 밝고 무채색 (V·(1-S), field 검출과 동일 발상)."""
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    s = hsv[..., 1].astype(np.float32) / 255.0
+    v = hsv[..., 2].astype(np.float32) / 255.0
+    return v * (1.0 - s)
+
+
+def _line_centers(wmap, proj, normals, rad=14, min_contrast=0.10):
+    """투영점별 법선 1D 탐색 → 흰 선 중심 픽셀 (없으면 NaN)."""
+    h, w = wmap.shape
+    off = np.arange(-rad, rad + 1, dtype=np.float64)
+    out = np.full_like(proj, np.nan)
+    for i, ((u, v), nrm) in enumerate(zip(proj, normals)):
+        if not np.isfinite(u):
+            continue
+        us = u + off * nrm[0]
+        vs = v + off * nrm[1]
+        m = (us >= 0) & (us < w - 1) & (vs >= 0) & (vs < h - 1)
+        if m.sum() < len(off) * 0.7:
+            continue
+        prof = wmap[vs[m].astype(int), us[m].astype(int)]
+        base = np.percentile(prof, 20)
+        peak = prof.max()
+        if peak - base < min_contrast:
+            continue                       # 대비 없음 (잔디/가림)
+        wgt = np.clip(prof - base, 0.0, None) ** 2
+        j = np.sum(wgt * np.arange(len(prof))) / np.sum(wgt)
+        out[i] = (us[m][0] + (us[m][-1] - us[m][0]) * j / (len(prof) - 1),
+                  vs[m][0] + (vs[m][-1] - vs[m][0]) * j / (len(prof) - 1))
+    return out
+
+
+def _snap_to_marking(pts, length=105.0, width=68.0):
+    """필드 점 (N,2) → (스냅 점 (N,2), 거리 (N,), 패밀리 인덱스 (N,)).
+
+    직사각형 경계·하프라인·페널티박스 3변×2·센터서클. 패밀리는
+    _marking_lines 의 직선 인덱스와 일치 (센터서클 = len(lines)).
+    """
+    p = np.asarray(pts, np.float64).reshape(-1, 2)
+    hl, hw = length / 2.0, width / 2.0
+    cands = []
+
+    def add(x, y):
+        cands.append(np.stack([x, y], axis=1))
+
+    X, Y = p[:, 0], p[:, 1]
+    add(np.clip(X, -hl, hl), np.full_like(Y, -hw))       # 0 근측 터치라인
+    add(np.clip(X, -hl, hl), np.full_like(Y, hw))        # 1 원측 터치라인
+    add(np.full_like(X, -hl), np.clip(Y, -hw, hw))       # 2 골라인 L
+    add(np.full_like(X, hl), np.clip(Y, -hw, hw))        # 3 골라인 R
+    add(np.full_like(X, 0.0), np.clip(Y, -hw, hw))       # 4 하프라인
+    bl, br = -(hl - PEN_DEPTH), hl - PEN_DEPTH
+    add(np.full_like(X, bl), np.clip(Y, -PEN_HALF_W, PEN_HALF_W))  # 5 박스 L
+    add(np.full_like(X, br), np.clip(Y, -PEN_HALF_W, PEN_HALF_W))  # 6 박스 R
+    gx = np.where(X < 0, np.clip(X, -hl, bl), np.clip(X, br, hl))
+    add(gx, np.full_like(Y, -PEN_HALF_W))                # 7 박스 근측 변
+    add(gx, np.full_like(Y, PEN_HALF_W))                 # 8 박스 원측 변
+    r = np.linalg.norm(p, axis=1)
+    safe = np.where(r > 1e-9, r, 1.0)
+    add(X / safe * CENTER_CIRCLE_R, Y / safe * CENTER_CIRCLE_R)  # 9 센터서클
+    C = np.stack(cands, axis=0)                          # (패밀리, N, 2)
+    d = np.linalg.norm(C - p[None], axis=2)
+    j = np.argmin(d, axis=0)
+    idx = np.arange(len(p))
+    return C[j, idx], d[j, idx], j
+
+
+def _marking_lines(length=105.0, width=68.0):
+    """_snap_to_marking 패밀리 0..8 의 동차 직선 (a, b, c): ax+by+c=0."""
+    hl, hw = length / 2.0, width / 2.0
+    b = hl - PEN_DEPTH
+    return np.array([
+        [0.0, 1.0, hw],       # y = -hw
+        [0.0, 1.0, -hw],      # y = +hw
+        [1.0, 0.0, hl],       # x = -hl
+        [1.0, 0.0, -hl],      # x = +hl
+        [1.0, 0.0, 0.0],      # x = 0
+        [1.0, 0.0, b],        # x = -(hl-깊이)
+        [1.0, 0.0, -b],       # x = +(hl-깊이)
+        [0.0, 1.0, PEN_HALF_W],
+        [0.0, 1.0, -PEN_HALF_W],
+    ])
+
+
+def _refine_pose_p2l(px_pts, fam, state, cam, img_size, length=105.0,
+                     width=68.0, iters=12):
+    """point-to-line 가우스-뉴턴: (rvec, f) 4 파라미터 직접 정밀화.
+
+    미지수는 R(3)+f(1)뿐 (cam_pos 고정) — 호모그래피 8-DOF DLT 는
+    과잉이라 근측 라인 3~4 패밀리로도 미정이 된다. 잔차 = 픽셀을
+    필드로 역투영한 점의 소속 라인까지 부호 거리(직선) / 반경
+    편차(센터서클), 1/지면거리 가중(≈각도 오차) + Huber.
+    """
+    lines = _marking_lines(length, width)
+    px = np.asarray(px_pts, np.float64)
+    fam = np.asarray(fam)
+    w, h = img_size
+    cam = np.asarray(cam, np.float64)
+    rvec0, _ = cv2.Rodrigues(np.asarray(state["R"], np.float64))
+    th = np.concatenate([rvec0.ravel(), [state["f"]]])
+
+    def residuals(t):
+        K = make_K(t[3], w, h)
+        R, _ = cv2.Rodrigues(t[:3])
+        fp = pixel_to_field(K, R, cam, px)
+        r = np.full(len(px), np.nan)
+        straight = fam < len(lines)
+        ls = lines[fam[straight]]
+        n = np.linalg.norm(ls[:, :2], axis=1)
+        r[straight] = (np.sum(ls[:, :2] * fp[straight], axis=1)
+                       + ls[:, 2]) / n
+        circ = fam == len(lines)
+        r[circ] = np.linalg.norm(fp[circ], axis=1) - CENTER_CIRCLE_R
+        gd = np.linalg.norm(fp - cam[None, :2], axis=1)
+        wgt = 1.0 / np.clip(gd, 8.0, None)
+        r = r * wgt
+        r[~np.isfinite(r)] = 0.0
+        # Huber (0.02 ≈ 20m 거리에서 0.4m)
+        c = 0.02
+        a = np.abs(r)
+        with np.errstate(invalid="ignore"):
+            r = np.where(a <= c, r, np.sign(r) * np.sqrt(c * (2 * a - c)))
+        # f 사전 제약: 제한된 시야에선 (f, R) 준퇴화 — 검출 노이즈만으로
+        # f 가 폭주한다 (실측 1400→1766). 체인의 줌비 추적은 신뢰 가능
+        # (043: 80스텝 f<2%) → 초기 f 에 σ≈3% 앵커. 데이터가 관측
+        # 가능한 방향은 그대로 데이터가 지배한다.
+        return np.append(r, (t[3] / state["f"] - 1.0) * 0.2)
+
+    eps = np.array([1e-4, 1e-4, 1e-4, 0.5])
+    lam = 1e-3
+    r0 = residuals(th)
+    for _ in range(iters):
+        J = np.stack([(residuals(th + e * np.eye(4)[i]) - r0) / e
+                      for i, e in enumerate(eps)], axis=1)
+        A = J.T @ J + lam * np.eye(4)
+        g = J.T @ r0
+        try:
+            d = np.linalg.solve(A, -g)
+        except np.linalg.LinAlgError:
+            return None
+        r1 = residuals(th + d)
+        if np.sum(r1 ** 2) < np.sum(r0 ** 2):
+            th, r0 = th + d, r1
+            lam = max(lam * 0.5, 1e-6)
+            if np.linalg.norm(d[:3]) < 1e-6:
+                break
+        else:
+            lam *= 4.0
+    R, _ = cv2.Rodrigues(th[:3])
+    rms = float(np.sqrt(np.mean(r0 ** 2)))
+    return {"R": R, "f": float(th[3]), "K": make_K(th[3], w, h),
+            "res_w": rms}
+
+
+def auto_anchor(frame_bgr, state, cam_pos, length=105.0, width=68.0,
+                rads=(16, 10, 8), min_pts=40, f_span=0.06):
+    """근사 자세 → 필드 마킹 자동 정렬로 (R, f) 재추정.
+
+    state = {"R", "f", "K"}. 반환 {"R", "f", "K", "res_deg", "n_pts"}
+    또는 None (대응 부족 — 급팬/가림 구간은 호출부가 다음 기회에).
+
+    용도는 체인 추적의 **주기 드리프트 보정** (앵커 간 ≤0.5° 급) —
+    큰 섭동의 전역 복원은 단일 뷰 라인 기하로는 불량조건이라 임무가
+    아니다 (기준 캘리브레이션이 담당). 탐색 반경 rads 축소 스케줄,
+    첫 반경 16px ≈ f1400 에서 ~0.65°. 반경이 작아야 원측의 라인
+    밀집(터치라인↔박스 ~21px)에서 이웃 라인을 줍지 않는다.
+    """
+    wmap = whiteness(frame_bgr)
+    h, w = wmap.shape
+    fld, tans, fams = template_polylines(length, width)
+    cam = np.asarray(cam_pos, np.float64)
+    cur = {"R": np.asarray(state["R"], float), "f": float(state["f"])}
+    res = None
+    for rad in rads:
+        K = make_K(cur["f"], w, h)
+        t = -cur["R"] @ cam
+        proj = field_to_pixel(K, cur["R"], t, fld)
+        # 접선의 이미지 방향 → 법선 (탐색 방향)
+        proj2 = field_to_pixel(K, cur["R"], t, fld + 0.5 * tans)
+        d = proj2 - proj
+        nrm = np.stack([-d[:, 1], d[:, 0]], axis=1)
+        ln = np.linalg.norm(nrm, axis=1, keepdims=True)
+        with np.errstate(invalid="ignore"):
+            nrm = np.where(ln > 1e-9, nrm / ln, np.nan)
+        # 수평선 부근(80m+)만 제외 — 원측 터치라인(~79m)은 수평 정보의
+        # 주공급원이라 유지 (반경이 작아 이웃 라인 오염 없음)
+        gd = np.linalg.norm(fld - cam[None, :2], axis=1)
+        inside = (np.isfinite(proj).all(1) & np.isfinite(nrm).all(1)
+                  & (gd < 80.0)
+                  & (proj[:, 0] >= rad) & (proj[:, 0] < w - rad)
+                  & (proj[:, 1] >= rad) & (proj[:, 1] < h - rad))
+        px = _line_centers(wmap, np.where(inside[:, None], proj, np.nan),
+                           np.where(inside[:, None], nrm, np.nan), rad=rad)
+        m = np.isfinite(px).all(1)
+        if m.sum() < min_pts:
+            return None
+        # point-to-line 가우스-뉴턴 — 라벨은 탐색 시드 샘플의 패밀리
+        # (필드 재스냅 라벨은 원측 역투영 증폭으로 오라벨 — 실측 23%).
+        # 점 대 점 ICP 는 접선 성분이 보정을 되끌어 정체한다 (실측).
+        got = _refine_pose_p2l(px[m], fams[m],
+                               {"R": cur["R"], "f": cur["f"]}, cam,
+                               (w, h), length, width)
+        if got is None:
+            return None
+        cur = {"R": got["R"], "f": got["f"]}
+        res = {"res_w": got["res_w"], "n_pts": int(m.sum())}
+    return {"R": cur["R"], "f": cur["f"], "K": make_K(cur["f"], w, h),
+            **res}
