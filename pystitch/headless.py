@@ -407,6 +407,25 @@ def _analyze(pano: Path, args):
          f"선수 검출 {sum(len(p) for p in d['players'])} → {out.name}")
 
 
+def _whistle(pano: Path, args):
+    """호각 트랙 추출 (.whistle.json) — 타임라인 호각 레인 + 멀티캠
+    동기화(sync_cams)의 전제. 오디오만 읽으므로 파노라마당 수 분."""
+    wp = pano.with_suffix(".whistle.json")
+    if wp.exists() and not args.force:
+        _log(f"[whistle] {wp.name} 있음 — 건너뜀")
+        return
+    from .core.audio import (
+        extract_audio, save_whistle_track, whistle_events, whistle_track,
+    )
+    t0 = time.perf_counter()
+    x = extract_audio(str(pano))
+    track = whistle_track(x)
+    ev = whistle_events(track)
+    save_whistle_track(pano, track, ev)
+    _log(f"[whistle] 이벤트 {len(ev)}개 → {wp.name} "
+         f"({time.perf_counter() - t0:.0f}s)")
+
+
 def _ocr(pano: Path, args):
     ana = json.loads(pano.with_suffix(".analysis.json").read_text())
     teams = classify_teams(ana)
@@ -448,6 +467,10 @@ def process_pair(pair, out_dir: Path, lens, lens_name, args) -> Path:
         _log(f"[analyze] {ana.name} 있음 — 건너뜀")
     else:
         _analyze(pano, args)
+    try:
+        _whistle(pano, args)
+    except Exception as e:  # noqa: BLE001 — 호각은 부가 산출물, 파이프라인 유지
+        _log(f"[whistle] 실패 (계속 진행): {e}")
     if args.no_ocr:
         return pano
     if "ocr_numbers" in load_events_doc(pano) and not args.force:
