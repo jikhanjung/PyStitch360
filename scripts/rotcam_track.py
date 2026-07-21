@@ -16,8 +16,9 @@
     "points": [{"px": [u, v], "field": [X, Y]}, ...]}   # 4개 이상
    field 좌표는 원점 센터마크, X=길이 방향(m), Y=폭 방향(m).
 
-v1 은 주기 앵커(흰 라인 재정렬) 없이 체인 품질만 기록 — 043 합성
-검증에서 확인한 드리프트(20스텝 앵커 권장)는 짧은 구간 사용 전제.
+추적 모드는 --anchor-every N 스텝마다 필드 마킹 자동 앵커
+(rotcam.auto_anchor, devlog 049)로 체인 드리프트를 제거한다 —
+실패(급팬·가림)는 그 스텝만 건너뛴다.
 """
 import argparse
 import json
@@ -31,21 +32,23 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pystitch.core.rotcam import (  # noqa: E402
-    calibrate_reference, decompose_H, make_K, match_frames, track_step,
+    auto_anchor, calibrate_reference, decompose_H, make_K, match_frames,
+    track_step,
 )
 
 
-def _grab(cap, f_idx, det_w):
+def _grab(cap, f_idx, det_w, color=False):
     cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
     ok, frame = cap.read()
     if not ok:
-        return None, 1.0
+        return (None, None, 1.0) if color else (None, 1.0)
     scale = 1.0
     if det_w and frame.shape[1] > det_w:
         scale = det_w / frame.shape[1]
         frame = cv2.resize(frame, (det_w, int(frame.shape[0] * scale)),
                            interpolation=cv2.INTER_AREA)
-    return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), scale
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return (gray, frame, scale) if color else (gray, scale)
 
 
 def probe(cap, fps, args):
@@ -124,12 +127,13 @@ def track(cap, fps, args):
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     step = max(1, int(args.every * fps))
     frames, rvecs, fs, oks, ress = [], [], [], [], []
+    anchors = 0
     prev = ref_img
     t0 = time.perf_counter()
     idx = ref_f
     while idx + step < total:
         idx += step
-        cur, _ = _grab(cap, idx, args.det_w)
+        cur, cur_bgr, _ = _grab(cap, idx, args.det_w, color=True)
         if cur is None:
             break
         pa, pb = match_frames(prev, cur)
@@ -137,6 +141,13 @@ def track(cap, fps, args):
         ok = new is not None
         if ok:
             state = {"R": new["R"], "f": new["f"], "K": new["K"]}
+        # 주기 자동 앵커 (P06-3 자동화): 필드 마킹으로 드리프트 제거.
+        # 실패(급팬·가림·라인 부족)는 그냥 넘어감 — 다음 기회에.
+        if args.anchor_every and len(frames) % args.anchor_every == 0:
+            got = auto_anchor(cur_bgr, state, cal["cam_pos"])
+            if got is not None:
+                state = {"R": got["R"], "f": got["f"], "K": got["K"]}
+                anchors += 1
         rv, _ = cv2.Rodrigues(state["R"])
         frames.append(idx)
         rvecs.append([round(float(v), 6) for v in rv.ravel()])
@@ -149,6 +160,7 @@ def track(cap, fps, args):
             print(f"  {idx}/{total} ({idx / total:.0%}) "
                   f"{len(frames) / el:.1f}스텝/s, 기각 "
                   f"{oks.count(False)}/{len(oks)}", flush=True)
+    print(f"자동 앵커 성공 {anchors}회")
     out = {"version": 1, "video": Path(args.video).name,
            "det_w": args.det_w, "every_s": args.every,
            "ref": {"frame": ref_f, "f": round(float(cal["f"]), 2),
@@ -173,6 +185,8 @@ def main():
                     help="스텝 간격(초) — 043 합성검증은 0.5s 기준")
     ap.add_argument("--det-w", type=int, default=1920,
                     help="SIFT 해상도 폭 (4K 원본 축소)")
+    ap.add_argument("--anchor-every", type=int, default=20,
+                    help="N 스텝마다 필드 마킹 자동 앵커 (0=끄기)")
     ap.add_argument("--f-guess", type=float, default=1.0,
                     help="프로브용 f/폭 가정치 (분해 정규화에만 사용)")
     args = ap.parse_args()
