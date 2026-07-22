@@ -1711,6 +1711,9 @@ class PtzTab(QWidget):
                               interactive=True)
         # 레이더는 위젯 오버레이 — 영상 줌/팬과 무관하게 고정 위치/크기
         self._radar_lbl = QLabel(self.pane)
+        # 부모(pane) 스타일시트의 background-color 상속 차단 — 이게
+        # 남으면 반투명 픽스맵 뒤에 불투명 판이 깔린다
+        self._radar_lbl.setStyleSheet("background: transparent;")
         self._radar_lbl.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self._radar_lbl.hide()
