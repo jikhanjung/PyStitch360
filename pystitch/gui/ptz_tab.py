@@ -2257,6 +2257,7 @@ class PtzTab(QWidget):
             self._native_cap.release()
             self._native_cap = None
         self.cap = cap
+        self.pane.reset_view()            # 새 영상 = 전체 보기 (줌/팬 리셋)
         self.pano_path = Path(path)
         self._remember_dir(str(self.pano_path.parent))
         self.fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
