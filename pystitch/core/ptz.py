@@ -872,31 +872,51 @@ def link_ball_tracks(analysis, ball_conf=0.25, max_jump_per_frame=120.0):
             "p_cnt": p_cnt, "p_tx": p_tx, "p_ty": p_ty, "p_span": p_span}
 
 
-def player_aggregates(analysis, exclude_tids=None):
+def player_aggregates(analysis, exclude_tids=None, base=None):
     """샘플별 선수 통계 (공 부재 시 크롭 목표/줌) — 숨김 제외 지원.
 
     exclude_tids (숨긴 관중·오인식 대표+멤버) 를 빼고 집계 — 숨겨도
-    크롭이 그쪽을 보던 문제의 수정 지점.
+    크롭이 그쪽을 보던 문제의 수정 지점. base=(p_cnt,p_tx,p_ty,p_span)
+    (linked 캐시)가 있으면 **제외 대상이 등장하는 샘플만** 재계산 —
+    전체 재집계 6.8s → 수백 ms (숨김 때마다 계획 재계산이 느리다는
+    사용자 보고의 수정).
     """
     n = len(analysis["frames"])
-    ex = exclude_tids or ()
-    p_cnt = np.zeros(n, int)
-    p_tx = np.full(n, np.nan)
-    p_ty = np.full(n, np.nan)
-    p_span = np.zeros(n)
-    for i in range(n):
-        rows = analysis["players"][i]
+    ex = set(exclude_tids or ())
+
+    def _one(rows):
         if ex:
             rows = [r for r in rows
                     if len(r) < 5 or int(r[4]) not in ex]
         pl = np.asarray(rows, dtype=float)
         pl = pl[:, :2] if pl.ndim == 2 else pl.reshape(-1, 2)
-        p_cnt[i] = len(pl)
-        if len(pl) >= 3:
+        cnt = len(pl)
+        if cnt >= 3:
             med = np.median(pl[:, 0])
-            keep = pl[np.abs(pl[:, 0] - med) < analysis.get("pano_w", 5906) * 0.25]
-            p_tx[i], p_ty[i] = keep[:, 0].mean(), keep[:, 1].mean()
-            p_span[i] = np.percentile(pl[:, 0], 90) - np.percentile(pl[:, 0], 10)
+            keep = pl[np.abs(pl[:, 0] - med)
+                      < analysis.get("pano_w", 5906) * 0.25]
+            tx = keep[:, 0].mean() if len(keep) else np.nan
+            ty = keep[:, 1].mean() if len(keep) else np.nan
+            span = (np.percentile(pl[:, 0], 90)
+                    - np.percentile(pl[:, 0], 10))
+            return cnt, tx, ty, span
+        return cnt, np.nan, np.nan, 0.0
+
+    if ex and base is not None:
+        p_cnt = np.array(base[0], int)
+        p_tx = np.array(base[1], float)
+        p_ty = np.array(base[2], float)
+        p_span = np.array(base[3], float)
+        for i, rows in enumerate(analysis["players"]):
+            if any(len(r) >= 5 and int(r[4]) in ex for r in rows):
+                p_cnt[i], p_tx[i], p_ty[i], p_span[i] = _one(rows)
+        return p_cnt, p_tx, p_ty, p_span
+    p_cnt = np.zeros(n, int)
+    p_tx = np.full(n, np.nan)
+    p_ty = np.full(n, np.nan)
+    p_span = np.zeros(n)
+    for i, rows in enumerate(analysis["players"]):
+        p_cnt[i], p_tx[i], p_ty[i], p_span[i] = _one(rows)
     return p_cnt, p_tx, p_ty, p_span
 
 
@@ -1125,9 +1145,11 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
     prev = (pano_w / 2, pano_h * 0.55)
     field_top = analysis.get("field_top_frac", 0.26) * pano_h
     if exclude_tids:
-        # 숨긴 선수(관중·오인식) 제외 재집계 — 캐시된 통계는 전체 기준
+        # 숨긴 선수(관중·오인식) 제외 — 등장 샘플만 부분 재집계
         p_cnt, p_tx, p_ty, p_span = player_aggregates(
-            analysis, exclude_tids=set(exclude_tids))
+            analysis, exclude_tids=set(exclude_tids),
+            base=(linked["p_cnt"], linked["p_tx"],
+                  linked["p_ty"], linked["p_span"]))
     else:
         p_cnt, p_tx = linked["p_cnt"], linked["p_tx"]
         p_ty, p_span = linked["p_ty"], linked["p_span"]

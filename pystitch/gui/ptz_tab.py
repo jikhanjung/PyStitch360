@@ -4347,6 +4347,15 @@ class PtzTab(QWidget):
             (n for n in used if n not in roster_nums),
             key=lambda n: (not n.isdigit(),
                            int(n) if n.isdigit() else 0, n))]
+        # OCR 제안이 있으면 무엇보다 위 — 검수 중 가장 유력한 선택지
+        # (사용자 요청: 선택이 한 번에 되게)
+        ocr = self._ocr_nums.get(self._rep(int(tid)))
+        if ocr and ocr.get("num") and ocr["num"] != cur:
+            sub.addAction(
+                f"   ★ OCR 제안: {ocr['num']}번  "
+                f"(지분 {float(ocr.get('share', 0)):.0%})",
+                lambda _=False, n=str(ocr["num"]):
+                self._set_player_num(tid, team, n))
         for num, label in entries:
             mark = " ✓" if cur == num else (
                 f"  (#{used[num]})" if num in used
@@ -4354,13 +4363,6 @@ class PtzTab(QWidget):
             sub.addAction("      " + label + mark,
                           lambda _=False, n=num:
                           self._set_player_num(tid, team, n))
-        ocr = self._ocr_nums.get(self._rep(int(tid)))
-        if ocr and ocr.get("num") and ocr["num"] != cur:
-            sub.addAction(
-                f"      OCR 제안: {ocr['num']}번  "
-                f"(지분 {float(ocr.get('share', 0)):.0%})",
-                lambda _=False, n=str(ocr["num"]):
-                self._set_player_num(tid, team, n))
         if cur:
             sub.addAction(f"      등번호 해제 ({cur}번)",
                           lambda: self._clear_player_num(tid))
