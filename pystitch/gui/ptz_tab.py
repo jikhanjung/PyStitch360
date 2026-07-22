@@ -1488,6 +1488,7 @@ class PtzTab(QWidget):
         self.plan_out = (1920, 1080)
         self.match: dict | None = None    # 멀티캠 경기 문서 (P07, match.json)
         self.match_half = 0
+        self.match_cam = 0                # 활성 카메라 (0=primary, P07 v2)
         self.mc = None                    # MulticamViewer — 경기 열 때 생성
         self._opening_match = False
         self._build_ui()
@@ -1999,31 +2000,51 @@ class PtzTab(QWidget):
             self.open_path(path)
 
     # ------------------------------------------------------ 멀티캠 (P07)
-    def open_match(self, doc: dict, half: int = 0, quiet: bool = False):
-        """match.json 문서 열기 — half 의 primary 를 열고 alt 뷰어 구성."""
+    def open_match(self, doc: dict, half: int = 0, cam: int = 0,
+                   quiet: bool = False, seek_s: float | None = None):
+        """match.json 문서 열기 — cam(활성 카메라)을 열고 나머지를 앵글로.
+
+        P07 v2 활성 카메라 컨텍스트: cam=0 은 파노라마, 1.. 은 alt.
+        어느 쪽이든 그 영상의 사이드카 일체(분석·타임라인·캘리브레이션)
+        가 컨텍스트가 되고, 다른 멤버들은 활성 기준 상대 시계로 앵글.
+        """
+        from ..core.match import half_cameras, relative_clock
         from .multicam import MulticamViewer
         half = max(0, min(half, len(doc["halves"]) - 1))
         h = doc["halves"][half]
+        cams = half_cameras(h)
+        cam = max(0, min(cam, len(cams) - 1))
+        target = cams[cam]["video"]
         self._opening_match = True
         try:
-            self.open_path(h["primary"], quiet=quiet)
+            self.open_path(target, quiet=quiet)
         finally:
             self._opening_match = False
         if self.pano_path is None \
-                or str(self.pano_path) != str(Path(h["primary"])):
-            return                            # primary 열기 실패
-        self.match, self.match_half = doc, half
+                or str(self.pano_path) != str(Path(target)):
+            return                            # 열기 실패
+        self.match, self.match_half, self.match_cam = doc, half, cam
         if self.mc is None:
             self.mc = MulticamViewer(self.pane, self._pane_split, self.log)
-        self.mc.set_half(h.get("alts", []), redraw=self._redraw)
+        others = []
+        for j, c in enumerate(cams):
+            if j == cam:
+                continue
+            others.append({"video": c["video"],
+                           "clock": relative_clock(cams, cam, j),
+                           "cam": j})
+        self.mc.set_half(others, redraw=self._redraw)
         self._rebuild_mc_bar()
         self._set_angle_lanes()
-        n = len(h.get("alts", []))
-        self.log(f"[match] {doc.get('title') or '경기'} — {h['label']}: "
-                 f"{Path(h['primary']).name} + 앵글 {n}개 "
-                 f"(커서를 영상 위에 두고 1={h['label']} 파노라마, "
-                 f"2..{n + 1}=앵글)" if n else
-                 f"[match] {h['label']}: 동기화된 앵글 없음")
+        if seek_s is not None:
+            self.slider.setValue(
+                int(max(0, min(seek_s * self.fps, self.total - 1))))
+        if not quiet:
+            names = " / ".join(f"{j + 1} {Path(c['video']).stem}"
+                               for j, c in enumerate(cams))
+            self.log(f"[match] {doc.get('title') or '경기'} — {h['label']} "
+                     f"[활성: {Path(target).stem}]  카메라: {names} "
+                     "(전환 모드 숫자키 = 컨텍스트 전환)")
 
     def _update_titles(self):
         """페인 좌상단 영상 제목 + 현 시점 매칭 앵글 유무 (P07)."""
@@ -2070,8 +2091,7 @@ class PtzTab(QWidget):
             if it.widget() is not None:
                 it.widget().deleteLater()
         self._mc_row.addStretch(1)
-        alts = (self.match["halves"][self.match_half].get("alts", [])
-                if self.match else [])
+        alts = self.mc.alts if (self.match and self.mc) else []
         if not alts:
             return
         style = ("QPushButton { color: white; background: rgba(20,20,20,150);"
@@ -2089,8 +2109,9 @@ class PtzTab(QWidget):
             self._mc_mode_btns[key] = b
         self._mc_row.addSpacing(12)
         self._mc_btns = []
-        names = ["1 파노라마"] + [f"{i + 2} {Path(a['video']).stem}"
-                                  for i, a in enumerate(alts)]
+        names = [f"1 {self.pano_path.stem if self.pano_path else '활성'}"] \
+            + [f"{i + 2} {Path(a['video']).stem}"
+               for i, a in enumerate(alts)]
         for i, name in enumerate(names):
             b = QPushButton(name)
             b.setCheckable(True)
@@ -2132,11 +2153,27 @@ class PtzTab(QWidget):
         self.open_path(video)
 
     def _mc_select(self, idx: int):
-        """카메라 선택 (모드 안의 배치): 0=파노라마, 1..=alt."""
+        """카메라 선택: 0=활성(현재 열린 영상), 1..=다른 앵글.
+
+        PiP = 흘끗 보기(읽기 전용), 전환 = 컨텍스트 스위치 — 그 영상을
+        실제로 열어 타임라인·오버레이·편집이 전부 그 카메라 기준이 된다
+        (P07 v2, 사용자 방향 2026-07-22). 시간은 시계 모델로 이어진다.
+        """
         if self.mc is None or self.match is None:
             return
-        alts = self.match["halves"][self.match_half].get("alts", [])
+        alts = self.mc.alts
         if idx > len(alts) or self.mc.mode == "split":
+            return
+        if self.mc.mode == "swap" and idx > 0:
+            from ..core.match import to_alt_time
+            a = alts[idx - 1]
+            t_here = self.slider.value() / self.fps
+            t_there = to_alt_time(a["clock"], t_here)
+            self.open_match(self.match, half=self.match_half,
+                            cam=a.get("cam", idx), quiet=True,
+                            seek_s=max(0.0, t_there))
+            self.log(f"[match] 컨텍스트 전환 → {Path(a['video']).stem} "
+                     f"(t {t_here:.0f}s → {max(0.0, t_there):.0f}s)")
             return
         self.mc.set_focus(idx)
         for i, b in enumerate(getattr(self, "_mc_btns", [])):

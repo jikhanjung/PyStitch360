@@ -123,3 +123,29 @@ def match_from_sync_sidecars(primaries: list[str | Path],
                          "stage": sync.get("stage", "whistle")})
         halves.append({"label": lab, "primary": str(p), "alts": alts})
     return {"version": MATCH_VERSION, "title": title, "halves": halves}
+
+
+def half_cameras(half: dict) -> list[dict]:
+    """하프 멤버를 통일 목록으로: [{video, clock}] — [0] = primary.
+
+    clock 은 "primary 시각 = offset + drift × 멤버 시각" (primary 는 항등).
+    """
+    cams = [{"video": half["primary"],
+             "clock": {"offset": 0.0, "drift": 1.0}}]
+    cams += [dict(a) for a in half.get("alts", [])]
+    return cams
+
+
+def relative_clock(cams: list[dict], active: int, other: int) -> dict:
+    """active 카메라 시각 기준으로 other 를 읽는 시계 모델.
+
+    저장 규약은 전부 primary 기준 (t_p = off_i + drift_i · t_i) —
+    활성 카메라 컨텍스트(P07 v2)에선 t_active = off' + drift' · t_other
+    로 변환해야 한다:
+      t_p = off_a + d_a·t_a = off_o + d_o·t_o
+      → t_a = (off_o − off_a)/d_a + (d_o/d_a)·t_o
+    """
+    ca, co = cams[active]["clock"], cams[other]["clock"]
+    da = co.get("drift", 1.0) / ca.get("drift", 1.0)
+    return {"offset": (co["offset"] - ca["offset"]) / ca.get("drift", 1.0),
+            "drift": da}
