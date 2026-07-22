@@ -4303,10 +4303,61 @@ class PtzTab(QWidget):
         rep = self._rep(tid)
         return self.player_nums.get(rep, self.player_nums.get(int(tid)))
 
+    def _cooccur_samples(self, rep_a, rep_b):
+        """두 대표(병합 그룹)가 같은 샘플에 동시 등장하는 수 — 같은 팀
+        같은 번호 두 명은 물리적으로 불가하다는 제약의 판정 근거."""
+        ga = {t for t in self._pspans if self._rep(t) == rep_a}
+        gb = {t for t in self._pspans if self._rep(t) == rep_b}
+        n = 0
+        for prow in self.analysis["players"]:
+            ia = ib = False
+            for p in prow:
+                if len(p) >= 5 and p[4] >= 0:
+                    t = int(p[4])
+                    ia = ia or t in ga
+                    ib = ib or t in gb
+                if ia and ib:
+                    n += 1
+                    break
+        return n
+
     def _set_player_num(self, tid, team, num):
-        """등번호 지정 — 번호는 팀 소속을 함의하므로 역할도 맞춘다."""
+        """등번호 지정 — 번호는 팀 소속을 함의하므로 역할도 맞춘다.
+
+        같은 팀에 같은 번호가 이미 있으면: 동시 등장(같은 프레임)이면
+        물리적으로 다른 사람이므로 거부, 동시 등장이 없으면 같은
+        사람일 가능성이 높으므로 병합을 제안한다.
+        """
         rep = self._rep(tid)
-        self.player_nums[rep] = str(num)
+        num = str(num)
+        other = next((self._rep(t) for t, n in self.player_nums.items()
+                      if n == num and self._rep(t) != rep
+                      and self._role_of(t) in (team, team + 3)), None)
+        if other is not None and self.analysis is not None:
+            co = self._cooccur_samples(rep, other)
+            if co > 2:                        # 검출 지터 여유
+                QMessageBox.warning(
+                    self, "등번호 충돌",
+                    f"{self.team_names[team]} {num}번은 이미 #{other} 에 "
+                    f"지정돼 있고, 두 트랙릿이 같은 프레임에 {co}회 동시 "
+                    "등장합니다 — 같은 팀 같은 번호가 두 명일 수는 "
+                    "없습니다.
+한쪽 번호나 팀 분류를 확인하세요.")
+                return
+            r = QMessageBox.question(
+                self, "같은 번호 — 같은 사람?",
+                f"{self.team_names[team]} {num}번은 이미 #{other} 에 "
+                "지정돼 있습니다. 두 트랙릿은 동시 등장이 없어 같은 "
+                f"사람으로 보입니다 — #{rep} 을 #{other} 그룹에 "
+                "병합할까요?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No)
+            if r == QMessageBox.StandardButton.Yes:
+                self.merges[rep] = other
+                self._merges_changed()
+                self.log(f"[ptz] #{rep} → #{other} 병합 (등번호 {num} 동일)")
+                return
+        self.player_nums[rep] = num
         if self._role_of(rep) not in (team, team + 3):   # GK 는 유지
             self.roles[rep] = team
         self._roles_changed()
