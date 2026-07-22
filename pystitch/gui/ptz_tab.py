@@ -462,13 +462,21 @@ class TimelineView(QWidget):
                 p.setPen(QColor(255, 255, 255))
                 p.drawRect(r[0] - 1, r[1] - 1, r[2] + 1, r[3] + 1)
         for i, rg in enumerate(self.ignores):
-            # 반투명 전체 높이 밴드 — 트랙(서브행)이 아니라 "무시 범위"
-            # 임을 구분 (서브행 도입 후 솔리드 블록은 두꺼운 트랙처럼 보임)
-            r = (self._x(rg[0]), y + 2,
-                 max(2, self._x(rg[1]) - self._x(rg[0])), lh - 4)
-            p.fillRect(*r, QColor(220, 70, 60, 90))
-            p.setPen(QColor(220, 70, 60))
-            p.drawRect(r[0], r[1], r[2], r[3])
+            if len(rg) >= 4:
+                # 위치 있는 무시 = "그 물체 하나가 공 아님" — 트랙과 같은
+                # 굵기의 빨간 바 (레인 하단). 동시간 매치볼 위를 덮지 않는다
+                bh2 = max(3, int(pitch) - 1)
+                r = (self._x(rg[0]), y + lh - 2 - bh2,
+                     max(2, self._x(rg[1]) - self._x(rg[0])), bh2)
+                p.fillRect(*r, QColor(220, 70, 60, 200))
+            else:
+                # 구형 시간 전체 무시 — 실제로 그 시간대 전체를 기각하므로
+                # 전체 높이 반투명 밴드 유지
+                r = (self._x(rg[0]), y + 2,
+                     max(2, self._x(rg[1]) - self._x(rg[0])), lh - 4)
+                p.fillRect(*r, QColor(220, 70, 60, 90))
+                p.setPen(QColor(220, 70, 60))
+                p.drawRect(r[0], r[1], r[2], r[3])
             if self.selected == ("ignore", i):
                 p.setPen(QColor(255, 255, 255))
                 p.drawRect(r[0] - 1, r[1] - 1, r[2] + 1, r[3] + 1)
