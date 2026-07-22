@@ -1123,7 +1123,20 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
             zw[i] = min(zw_far + (out_w * near_widen - zw_far) * depth_t, max_crop_w)
         elif p_cnt[i] >= 3:
             tx[i], ty[i] = p_tx[i], p_ty[i]
-            zw[i] = min(max(p_span[i] + 2 * zoom_margin, out_w), max_crop_w)
+            # 공 없이 선수만 있을 때: 무리가 원경(위쪽)에 몰려 있으면
+            # 화면 하한(out_w)을 고집하지 말고 적극 줌인 — 원경 무리는
+            # 픽셀 스팬이 작아 1:1 크롭에선 콩알이 된다. 깊이에 따라
+            # 하한을 out_w/줌 ↔ out_w 로 보간 (far_zoom 과 별개 최소
+            # 1.35 배 보장, 사용자 설정이 더 크면 그쪽).
+            depth_t = min(max((ty[i] - field_top)
+                              / max(pano_h - field_top, 1), 0.0), 1.0)
+            # 원경 판정 램프: 깊이 0.35 까지는 최대 줌인, 0.75 부터는
+            # 기존 하한(out_w) — 근경 무리의 동작은 바뀌지 않는다
+            t2 = min(max((depth_t - 0.35) / 0.40, 0.0), 1.0)
+            fb_zoom = max(far_zoom, 1.35)
+            floor_w = out_w / fb_zoom + (out_w - out_w / fb_zoom) * t2
+            zw[i] = min(max(p_span[i] + 2 * zoom_margin, floor_w),
+                        max_crop_w)
         else:
             tx[i], ty[i] = prev
             zw[i] = max_crop_w   # 정보 부족 — 최대한 넓게

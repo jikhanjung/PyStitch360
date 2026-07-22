@@ -267,3 +267,28 @@ def test_build_plan_excludes_hidden_players():
     f = 450
     assert p0["cx"][f] > p1["cx"][f] + 300, (p0["cx"][f], p1["cx"][f])
     assert p1["cx"][f] < 1500                 # 진짜 선수 쪽으로
+
+
+def test_plan_zooms_into_far_cluster_without_ball():
+    """공 없음 + 원경 무리 → out_w 하한 아래로 줌인 (근경 무리는 유지)."""
+    from pystitch.core.ptz import build_plan, link_ball_tracks
+    n = 200
+
+    def make(cy):
+        ana = {"frames": list(range(0, n * 3, 3)), "fps": 30.0,
+               "pano_w": 5900, "pano_h": 1700, "total_frames": 600,
+               "field_top_frac": 0.26,
+               "balls": [None] * n, "ball_cands": [[] for _ in range(n)],
+               "players": [[[2900.0 + dx, cy, 20.0, 50.0, k]
+                            for k, dx in enumerate((-250, 0, 250, 120))]
+                           for _ in range(n)]}
+        return ana
+
+    far = make(560.0)                     # field_top(442) 근처 = 원경
+    near = make(1500.0)
+    p_far = build_plan(far, 5900, 1700, linked=link_ball_tracks(far),
+                       log=None)
+    p_near = build_plan(near, 5900, 1700, linked=link_ball_tracks(near),
+                        log=None)
+    assert p_far["crop_w"][300] < 1920 * 0.92, p_far["crop_w"][300]
+    assert p_near["crop_w"][300] >= 1900, p_near["crop_w"][300]
