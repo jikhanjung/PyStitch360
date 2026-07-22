@@ -261,31 +261,46 @@ class TimelineView(QWidget):
         self._clamp_view()
         self._emit_view()
 
-    def set_players(self, players):
-        """{tid: (f0, f1, role)} → 레인별 서브행 배치 (그리디 간트).
+    def set_players(self, players, numbers=None):
+        """{tid: (f0, f1, role)} → 레인별 서브행 배치.
 
-        서브행 수는 동시 트랙릿 수만큼 — 상한을 두면 초과분이 기존 행
-        위에 덮여 숨는다 (구버전 3행 상한의 문제). 행 두께는 레인
-        높이/행 수로 정해지므로 레인 경계 드래그로 키우면 두꺼워진다.
+        번호가 부여된(=신원 확인된) 트랙릿은 **번호별 전용 행**으로 맨
+        위에 — 같은 번호(같은 사람)의 조각들이 한 줄에 이어져 보이고,
+        번호를 새로 부여하면 그 트랙릿이 위로 올라간다 (사용자 방향).
+        무번호 트랙릿은 그 아래 그리디 간트. 상한 없음 — 행 두께는
+        레인 높이/행 수, 레인 경계 드래그로 조절.
+        numbers = {tid: 번호 문자열} (병합 대표 기준으로 풀어서 전달).
         """
+        numbers = numbers or {}
         by_lane: dict[int, list] = {}
         for tid, (f0, f1, role) in players.items():
             by_lane.setdefault(self._lane_of_role(role), []).append(
                 (f0, f1, tid, role))
         out = []
         self._lane_rows = {}
+        self._pnum = dict(numbers)
         for lane, items in by_lane.items():
-            ends = []                          # 서브행별 마지막 끝 프레임
+            def _numkey(n):
+                return (not n.isdigit(), int(n) if n.isdigit() else 0, n)
+            nums_here = sorted({numbers[t] for _f0, _f1, t, _r in items
+                                if numbers.get(t)}, key=_numkey)
+            row_of = {n: i for i, n in enumerate(nums_here)}
+            ends = []                          # 무번호 서브행별 끝 프레임
             for f0, f1, tid, role in sorted(items):
-                for si, e in enumerate(ends):
-                    if e <= f0:
-                        ends[si] = f1
-                        break
+                n = numbers.get(tid)
+                if n is not None and n in row_of:
+                    si = row_of[n]
                 else:
-                    si = len(ends)
-                    ends.append(f1)
+                    for k, e in enumerate(ends):
+                        if e <= f0:
+                            ends[k] = f1
+                            si = len(nums_here) + k
+                            break
+                    else:
+                        si = len(nums_here) + len(ends)
+                        ends.append(f1)
                 out.append((tid, f0, f1, role, si))
-            self._lane_rows[lane] = max(1, len(ends))
+            self._lane_rows[lane] = max(1, len(nums_here) + len(ends))
         self._players = out
         self.update()
 
@@ -474,6 +489,13 @@ class TimelineView(QWidget):
                 role, TEAM_COLORS[min(role, len(TEAM_COLORS) - 1)])
             r = (self._x(f0), ry, max(2, self._x(f1) - self._x(f0)), bh)
             p.fillRect(*r, QColor(rr, g, b))
+            num = getattr(self, "_pnum", {}).get(tid)
+            if num and not fold:               # 신원 확인 — 테두리 강조
+                p.setPen(QColor(255, 255, 255, 180))
+                p.drawRect(r[0], r[1], r[2], max(1, r[3] - 1))
+                if bh >= 10 and r[2] >= 22:    # 높이 되면 번호 표시
+                    p.drawText(QRect(r[0] + 3, r[1], r[2] - 4, bh),
+                               Qt.AlignmentFlag.AlignVCenter, num)
             if self.selected == ("player", tid):
                 p.setPen(QColor(255, 255, 255))
                 p.drawRect(r[0] - 1, r[1] - 1, r[2] + 1, r[3] + 1)
@@ -4574,7 +4596,9 @@ class PtzTab(QWidget):
         self.player_list.setUpdatesEnabled(True)
         self.player_list.blockSignals(False)
         self.trackbar.set_players(
-            {t: (spans[t][0], spans[t][1], self._role_of(t)) for t in spans})
+            {t: (spans[t][0], spans[t][1], self._role_of(t)) for t in spans},
+            numbers={t: self.player_nums[self._rep(t)] for t in spans
+                     if self._rep(t) in self.player_nums})
 
     def _goto_player(self):
         row = self.player_list.currentRow()
