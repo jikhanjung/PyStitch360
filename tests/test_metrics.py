@@ -292,3 +292,26 @@ def test_plan_zooms_into_far_cluster_without_ball():
                         log=None)
     assert p_far["crop_w"][300] < 1920 * 0.92, p_far["crop_w"][300]
     assert p_near["crop_w"][300] >= 1900, p_near["crop_w"][300]
+
+
+def test_same_spot_picks_exact_track_not_blend():
+    """동시 트랙 2개 (큰 정적 + 작은 정적): 작은 쪽 무시가 큰 쪽을
+    끌어들이지 않는다 (pano_5316 40:26 회귀)."""
+    from pystitch.core.ptz import link_ball_tracks, same_spot_spans
+    n = 400
+    ana = {"frames": list(range(0, n * 3, 3)), "fps": 30.0,
+           "pano_w": 4000, "pano_h": 1200, "total_frames": 1200,
+           "balls": [None] * n, "ball_cands": [], "players": [[]] * n}
+    for i in range(n):
+        cands = [[500.0, 600.0, 0.9]]         # 큰 정적 트랙 (전 구간)
+        if 100 <= i < 133:                    # 작은 정적 트랙 (겹침, 200px 거리)
+            cands.append([700.0, 575.0, 0.8])
+        ana["ball_cands"].append(cands)
+    linked = link_ball_tracks(ana)
+    idx = linked["idx"]
+    small = min(linked["tracks"], key=lambda t: len(t["i"]))
+    f0, f1 = int(idx[small["i"][0]]), int(idx[small["i"][-1]])
+    spans = same_spot_spans(linked, f0, f1)
+    assert spans, "기준 자신은 포함돼야"
+    for sp in spans:
+        assert abs(sp[2] - 700.0) < 60, f"큰 트랙 자리가 섞임: {sp}"

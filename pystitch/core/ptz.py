@@ -711,12 +711,23 @@ def same_spot_spans(linked, f0, f1, radius=60.0, static_r80=40.0):
     쪼개져 반복 검출된다. 기준 트랙의 중앙 위치에서 radius 이내이고
     자체 요동(r80)이 static_r80 이하인 트랙을 모두 모아, 한 번의 무시로
     일괄 처리할 수 있게 한다. 반환: [(시작, 끝) 프레임, ...] (기준 포함).
+
+    기준 트랙 선정: (f0, f1) 과 **정확히 일치**하는 트랙 우선, 없으면
+    겹치는 것 중 가장 짧은(특정적인) 것 하나 — 겹치는 트랙 전부를
+    합쳐 중앙을 내면 동시 트랙(공 2개) 상황에서 큰 트랙의 자리가
+    이겨서 엉뚱한 트랙까지 같이 무시된다 (pano_5316 40:26 실사례).
     """
     idx, tracks = linked["idx"], linked["tracks"]
-    ref = [t for t in tracks if idx[t["i"][0]] <= f1 and f0 <= idx[t["i"][-1]]]
-    if not ref:
+    cover = [t for t in tracks
+             if idx[t["i"][0]] <= f1 and f0 <= idx[t["i"][-1]]]
+    if not cover:
         return []
-    ref_med = np.median(np.vstack([t["pts"] for t in ref]), axis=0)
+    exact = [t for t in cover
+             if int(idx[t["i"][0]]) == int(f0)
+             and int(idx[t["i"][-1]]) == int(f1)]
+    pick = exact[0] if exact else min(
+        cover, key=lambda t: idx[t["i"][-1]] - idx[t["i"][0]])
+    ref_med = np.median(pick["pts"], axis=0)
     out = []
     for t in tracks:
         med = np.median(t["pts"], axis=0)

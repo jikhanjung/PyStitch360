@@ -3608,7 +3608,15 @@ class PtzTab(QWidget):
                                     max(0.5, 1.1 * sc), color,
                                     max(1, int(3 * sc)))
             ball_g = None
-            bb = self.analysis["balls"][si]
+            # 레이더 공 = 수락 트랙 기준 — 원시 검출을 쓰면 무시한
+            # 오인식 공이 미니맵에 계속 공으로 남는다
+            if self._accepted_ball is not None \
+                    and si < len(self._accepted_ball):
+                ab = self._accepted_ball[si]
+                bb = (None if ab is None or not np.all(np.isfinite(ab))
+                      else (float(ab[0]), float(ab[1])))
+            else:
+                bb = self.analysis["balls"][si]
             if self._field_calib is not None:
                 # 캘리브레이션 완료: 경기장 절대 좌표로 표시
                 feet = [(pp[0], pp[1] + pp[3] / 2.0,
