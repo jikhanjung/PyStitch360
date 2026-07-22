@@ -86,6 +86,10 @@ def save_match(path: str | Path, doc: dict) -> Path:
     base = path.parent
     out = {"version": MATCH_VERSION, "title": doc.get("title", path.stem),
            "halves": []}
+    if doc.get("teams"):                  # 경기 레벨 팀 정체성 (이름+색)
+        out["teams"] = [{"name": t.get("name", ""),
+                         "color": [int(v) for v in t.get("color", (128,) * 3)]}
+                        for t in doc["teams"][:2]]
     for h in doc["halves"]:
         oh = {"label": h.get("label", ""),
               "primary": _portable(h["primary"], base),
@@ -149,3 +153,43 @@ def relative_clock(cams: list[dict], active: int, other: int) -> dict:
     da = co.get("drift", 1.0) / ca.get("drift", 1.0)
     return {"offset": (co["offset"] - ca["offset"]) / ca.get("drift", 1.0),
             "drift": da}
+
+
+def _color_emb(bgr):
+    """유니폼 색 비교 임베딩 — 원형 hue 안전 (tracklets 와 동일 발상)."""
+    import cv2
+    import numpy as np
+    hsv = cv2.cvtColor(np.uint8([[list(bgr)]]), cv2.COLOR_BGR2HSV)[0][0]
+    a = float(hsv[0]) / 90.0 * np.pi
+    return np.array([hsv[1] * np.cos(a), hsv[1] * np.sin(a),
+                     float(hsv[2])])
+
+
+def decide_team_mapping(identity, colors, nums=((), ()),
+                        color_margin=1.35):
+    """경기 팀 정체성(A) 대비 현 영상(B) 팀 매핑: "same"|"flip"|"ask".
+
+    카메라·조명이 다르면 색이 다르게 보인다 (사용자 지적) — 판정 우선
+    순위: ① 등번호 겹침 (같은 경기 같은 선수라 카메라 무관),
+    ② 색 거리 (마진 color_margin 배 이상 확실할 때만), ③ "ask"
+    (호출부가 사용자에게 확인).
+    identity: match.json "teams" [{name, color, nums?}, ...],
+    colors: 현 영상 팀0/팀1 측정 BGR, nums: 현 영상 팀별 등번호 집합.
+    """
+    import numpy as np
+    a0 = set(identity[0].get("nums") or [])
+    a1 = set(identity[1].get("nums") or [])
+    b0, b1 = set(nums[0] or []), set(nums[1] or [])
+    o_same = len(a0 & b0) + len(a1 & b1)
+    o_flip = len(a0 & b1) + len(a1 & b0)
+    if o_same != o_flip:                  # ① 등번호가 결정적
+        return "same" if o_same > o_flip else "flip"
+    T0, T1 = _color_emb(identity[0]["color"]), _color_emb(identity[1]["color"])
+    e0, e1 = _color_emb(colors[0]), _color_emb(colors[1])
+    d_same = float(np.linalg.norm(T0 - e0) + np.linalg.norm(T1 - e1))
+    d_flip = float(np.linalg.norm(T0 - e1) + np.linalg.norm(T1 - e0))
+    if d_same * color_margin < d_flip:    # ② 색 — 확실할 때만
+        return "same"
+    if d_flip * color_margin < d_same:
+        return "flip"
+    return "ask"                          # ③ 사용자 확인

@@ -93,3 +93,24 @@ def test_relative_clock():
         t_a = to_alt_time(cams[1]["clock"], t_p)
         r_ab = relative_clock(cams, 1, 2)
         assert abs(to_primary_time(r_ab, t_b) - t_a) < 1e-6
+
+
+def test_decide_team_mapping():
+    from pystitch.core.match import decide_team_mapping
+    ident = [{"name": "홈", "color": [200, 40, 40], "nums": ["7", "10"]},
+             {"name": "원정", "color": [40, 40, 200], "nums": ["9", "22"]}]
+    # ① 등번호 결정적 — 색이 반대로 보여도 번호가 이긴다
+    assert decide_team_mapping(
+        ident, ([40, 40, 200], [200, 40, 40]),
+        nums=(["10"], ["22"])) == "same"
+    assert decide_team_mapping(
+        ident, ([200, 40, 40], [40, 40, 200]),
+        nums=(["22"], ["7", "10"])) == "flip"
+    # ② 번호 없음 + 색 확실 → 색으로
+    assert decide_team_mapping(
+        ident, ([190, 45, 45], [45, 45, 190])) == "same"
+    assert decide_team_mapping(
+        ident, ([45, 45, 190], [190, 45, 45])) == "flip"
+    # ③ 번호 없음 + 색 애매 (둘 다 중간색) → ask
+    assert decide_team_mapping(
+        ident, ([120, 120, 120], [125, 125, 125])) == "ask"

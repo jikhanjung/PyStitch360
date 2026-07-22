@@ -2030,7 +2030,8 @@ class PtzTab(QWidget):
 
     # ------------------------------------------------------ 멀티캠 (P07)
     def open_match(self, doc: dict, half: int = 0, cam: int = 0,
-                   quiet: bool = False, seek_s: float | None = None):
+                   quiet: bool = False, seek_s: float | None = None,
+                   path: str | None = None):
         """match.json 문서 열기 — cam(활성 카메라)을 열고 나머지를 앵글로.
 
         P07 v2 활성 카메라 컨텍스트: cam=0 은 파노라마, 1.. 은 alt.
@@ -2053,6 +2054,8 @@ class PtzTab(QWidget):
                 or str(self.pano_path) != str(Path(target)):
             return                            # 열기 실패
         self.match, self.match_half, self.match_cam = doc, half, cam
+        if path is not None:
+            self.match_path = path
         if self.mc is None:
             self.mc = MulticamViewer(self.pane, self._pane_split, self.log)
         others = []
@@ -2065,6 +2068,7 @@ class PtzTab(QWidget):
         self.mc.set_half(others, redraw=self._redraw)
         self._rebuild_mc_bar()
         self._set_angle_lanes()
+        self._sync_match_teams(quiet=quiet)
         if seek_s is not None:
             self.slider.setValue(
                 int(max(0, min(seek_s * self.fps, self.total - 1))))
@@ -2112,6 +2116,124 @@ class PtzTab(QWidget):
                 out = span and not (span[0] <= t <= span[1])
                 self.mc.pane_alt.set_title(
                     name + (" · 이 시점 영상 없음" if out else ""))
+
+    def _sync_match_teams(self, quiet=False):
+        """같은 경기의 멤버 영상 간 팀 번호/이름/색 정렬 (사용자 방향).
+
+        영상마다 classify_teams 군집 순서가 제멋대로라 전반의 팀1이
+        후반의 팀2 가 될 수 있다. 경기 레벨 팀 정체성(match.json
+        "teams": 이름+색+등번호)과 현 영상을 대조 — 판정은
+        decide_team_mapping (① 등번호 겹침: 카메라 간 색 차이 면역,
+        ② 색: 마진 확실할 때만, ③ 애매하면 사용자 확인 대화).
+        역할(0/1) 사이드카는 불변, 표시 계층(team_names)만 정렬.
+        """
+        if self.match is None:
+            return
+        c0 = self._role_colors.get(0)
+        c1 = self._role_colors.get(1)
+        if c0 is None or c1 is None:
+            return                        # 측정 색 없음 (분석/역할 전)
+        nums0 = sorted({n for t, n in self.player_nums.items()
+                        if self._role_of(t) in (0, 3)})
+        nums1 = sorted({n for t, n in self.player_nums.items()
+                        if self._role_of(t) in (1, 4)})
+        teams = self.match.get("teams")
+        if not teams:                     # 첫 영상 — 정체성 등록
+            self.match["teams"] = [
+                {"name": self.team_names[0],
+                 "color": [int(v) for v in c0], "nums": nums0},
+                {"name": self.team_names[1],
+                 "color": [int(v) for v in c1], "nums": nums1}]
+            self._save_match_doc()
+            self.log("[match] 팀 정체성 등록 (이름·색·등번호) — 다른 "
+                     "영상/하프에서 자동 정렬됩니다")
+            return
+        from ..core.match import decide_team_mapping
+        verdict = decide_team_mapping(teams, (c0, c1), (nums0, nums1))
+        if verdict == "ask":
+            if quiet:
+                self.log("[match] 팀 매칭 애매 (색 차이 큼·등번호 없음) — "
+                         "분석 메뉴 대신 화면에서 확인 필요")
+                return
+            verdict = self._ask_team_mapping(teams, (c0, c1),
+                                             (nums0, nums1))
+            if verdict is None:
+                return                    # 사용자가 보류
+        order = (0, 1) if verdict == "same" else (1, 0)
+        want_names = [teams[order[0]]["name"], teams[order[1]]["name"]]
+        # 확정된 매핑으로 정체성의 등번호 보강 (다음 영상 판정 재료)
+        for side, ns in ((order[0], nums0), (order[1], nums1)):
+            merged = sorted(set(teams[side].get("nums") or []) | set(ns))
+            if merged != teams[side].get("nums"):
+                teams[side]["nums"] = merged
+                self._save_match_doc()
+        if want_names != list(self.team_names):
+            self.team_names = want_names
+            self._apply_team_names()
+            self._save_keyframes()
+            self.log(f"[match] 팀 라벨 정렬: 팀1={want_names[0]} / "
+                     f"팀2={want_names[1]}"
+                     + (" (반전 감지)" if order == (1, 0) else ""))
+
+    def _save_match_doc(self):
+        mp = getattr(self, "match_path", None)
+        if mp and self.match:
+            from ..core.match import save_match
+            try:
+                save_match(mp, self.match)
+            except OSError as e:
+                self.log(f"[match] 저장 실패: {e}")
+
+    def _ask_team_mapping(self, teams, colors, nums):
+        """A 영상 팀 정체성 ↔ 현 영상 팀 대응 확인 대화 (스와치+등번호).
+
+        색이 카메라마다 다르게 보일 수 있어 자동 판정이 애매할 때만
+        뜬다. 반환 "same"/"flip"/None(보류).
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle("팀 매칭 확인")
+        v = QVBoxLayout(dlg)
+
+        def sw(bgr):
+            lbl = QLabel()
+            px = QPixmap(28, 28)
+            px.fill(QColor(int(bgr[2]), int(bgr[1]), int(bgr[0])))
+            lbl.setPixmap(px)
+            return lbl
+
+        v.addWidget(QLabel("카메라가 달라 색이 다르게 보일 수 있습니다 — "
+                           "이 영상의 <b>팀1</b>이 경기의 어느 팀인지 "
+                           "확인해 주세요."))
+        row = QHBoxLayout()
+        row.addWidget(QLabel("이 영상 팀1:"))
+        row.addWidget(sw(colors[0]))
+        row.addWidget(QLabel("등번호 " + (", ".join(nums[0]) or "—")))
+        row.addStretch(1)
+        row.addWidget(QLabel("팀2:"))
+        row.addWidget(sw(colors[1]))
+        row.addWidget(QLabel(", ".join(nums[1]) or "—"))
+        v.addLayout(row)
+        result = []
+        for verdict, side in (("same", 0), ("flip", 1)):
+            t = teams[side]
+            b = QPushButton()
+            h = QHBoxLayout(b)
+            h.setContentsMargins(10, 6, 10, 6)
+            h.addWidget(sw(t["color"]))
+            h.addWidget(QLabel(
+                f"팀1 = <b>{t['name']}</b>"
+                + (f"  (등번호 {', '.join(t.get('nums') or [])})"
+                   if t.get("nums") else "")))
+            h.addStretch(1)
+            b.setMinimumHeight(44)
+            b.clicked.connect(lambda _, vd=verdict:
+                              (result.append(vd), dlg.accept()))
+            v.addWidget(b)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+        dlg.exec()
+        return result[0] if result else None
 
     def _rebuild_mc_bar(self):
         """페인 오버레이의 카메라/모드 바 재구성."""

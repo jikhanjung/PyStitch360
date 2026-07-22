@@ -138,7 +138,7 @@ class PitchWatchWindow(QMainWindow):
             self.ptz.log(f"[match] 열기 실패: {e}")
             return
         self._match_path = str(path)
-        self.ptz.open_match(doc, half=half)
+        self.ptz.open_match(doc, half=half, path=str(path))
         if self.ptz.match is None:
             return
         title = doc.get("title") or Path(path).stem
