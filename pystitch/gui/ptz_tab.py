@@ -2195,12 +2195,17 @@ class PtzTab(QWidget):
         self._redraw()
 
     def _set_angle_lanes(self):
-        """alt 카메라별 타임라인 레인: 커버리지 + 호각(시계 변환)."""
+        """다른 카메라별 타임라인 레인: 커버리지 + 호각 트랙.
+
+        활성 카메라 기준 상대 시계(mc.alts — P07 v2)로 변환하므로 어느
+        카메라에 앉아 있어도 맞는다: AX700 활성이면 파노라마가 레인으로.
+        현재 영상 범위 밖 구간은 그리기에서 클리핑 (짧은 활성 영상이면
+        긴 상대 영상도 그만큼만 보인다).
+        """
         from ..core.audio import load_whistle_track
         from ..core.match import alt_coverage, to_primary_time
         angles = []
-        alts = (self.match["halves"][self.match_half].get("alts", [])
-                if self.match else [])
+        alts = self.mc.alts if (self.match and self.mc) else []
         for a in alts:
             cap = cv2.VideoCapture(a["video"])
             dur = (cap.get(cv2.CAP_PROP_FRAME_COUNT)
