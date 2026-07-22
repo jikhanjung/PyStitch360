@@ -109,6 +109,14 @@ class TimelineView(QWidget):
             self.lane_h += [self.LANE_H] * (len(self.lanes) - len(self.lane_h))
         except Exception:  # noqa: BLE001
             self.lane_h = [self.LANE_H] * len(self.lanes)
+        # 접힌 레인 (우클릭 메뉴): 서브행 없이 얇은 한 줄 —
+        # _apply_height 가 참조하므로 그 전에 초기화
+        try:
+            self.collapsed = {int(v) for v in
+                              QSettings("PyStitch360", "PyStitch360")
+                              .value("ptz_timeline_collapsed", []) or []}
+        except (TypeError, ValueError):
+            self.collapsed = set()
         self._apply_height()
         self.setMouseTracking(True)
         self.setToolTip("레이블 쪽에서 레인 경계 드래그 = 높이 조절 "
@@ -216,6 +224,7 @@ class TimelineView(QWidget):
             return
         x = int(ev.pos().x())
         f = int(min(max(self._f(max(x, self.GUTTER)), 0), self.total - 1))
+        self._menu_lane = self._lane_at(int(ev.pos().y()))
         self.range_menu.emit(f, ev.globalPos())
 
     # --------------------------------------------------------------- 데이터
@@ -315,27 +324,45 @@ class TimelineView(QWidget):
     def _f(self, x):
         return (x - self.GUTTER) / self._eff_ppf() + self.t0
 
+    COLLAPSED_H = 12
+
+    def _eff_h(self, i):
+        return self.COLLAPSED_H if i in self.collapsed else self.lane_h[i]
+
+    def toggle_collapse(self, lane):
+        if lane in self.collapsed:
+            self.collapsed.discard(lane)
+        else:
+            self.collapsed.add(lane)
+        QSettings("PyStitch360", "PyStitch360").setValue(
+            "ptz_timeline_collapsed", [int(v) for v in self.collapsed])
+        self._apply_height()
+        self.update()
+
     def _apply_height(self):
-        self.setFixedHeight(self.RULER + sum(self.lane_h))
+        self.setFixedHeight(self.RULER + sum(self._eff_h(i)
+                                             for i in range(len(self.lane_h))))
 
     def _lane_rect(self, lane):
-        return self.RULER + sum(self.lane_h[:lane]), self.lane_h[lane]
+        y = self.RULER + sum(self._eff_h(i) for i in range(lane))
+        return y, self._eff_h(lane)
 
     def _lane_at(self, y):
         acc = self.RULER
-        for i, h in enumerate(self.lane_h):
+        for i in range(len(self.lane_h)):
+            h = self._eff_h(i)
             if acc <= y < acc + h:
                 return i
             acc += h
         return -1
 
     def _boundary_at(self, y, tol=4):
-        """y 가 레인 경계(하단선) 근처면 그 레인 인덱스."""
+        """y 가 레인 경계(하단선) 근처면 그 레인 인덱스 (접힌 레인 제외)."""
         acc = self.RULER
-        for i, h in enumerate(self.lane_h):
-            acc += h
+        for i in range(len(self.lane_h)):
+            acc += self._eff_h(i)
             if abs(y - acc) <= tol:
-                return i
+                return None if i in self.collapsed else i
         return None
 
     RESIZE_GAIN = 0.35           # 드래그 감쇠 — 많이 움직여도 조금만 조정
@@ -405,11 +432,13 @@ class TimelineView(QWidget):
                 p.drawRect(r[0] - 1, r[1] - 1, r[2] + 1, r[3] + 1)
         # 레인 1: 공 — 수락 트랙 (동시 트랙은 서브행 분리), 무시, 승격
         y, lh = self._lane_rect(1)
-        nrows = getattr(self, "_ball_nrows", 1)
+        nrows = 1 if 1 in self.collapsed else getattr(self, "_ball_nrows", 1)
         pitch = (lh - 4) / max(nrows, 1)
         rows = getattr(self, "_ball_rows", [])
         for i, (f0, f1) in enumerate(self.spans):
-            ry = y + 2 + (rows[i] if i < len(rows) else 0) * pitch
+            row = 0 if 1 in self.collapsed else \
+                (rows[i] if i < len(rows) else 0)
+            ry = y + 2 + row * pitch
             rh = max(3, int(pitch) - 1)
             r = (self._x(f0), int(ry),
                  max(2, self._x(f1) - self._x(f0)), rh)
@@ -431,13 +460,16 @@ class TimelineView(QWidget):
         for pr in self.promotes:
             x = self._x(pr[0])
             p.fillRect(x - 1, y + 2, 3, lh - 4, QColor(200, 0, 255))
-        # 선수 레인: 팀/역할 색 바 — 서브행 수는 동시 트랙릿 수 (은폐 없음)
+        # 선수 레인: 팀/역할 색 바 — 서브행 수는 동시 트랙릿 수 (은폐 없음,
+        # 접힌 레인은 얇은 한 줄로 겹쳐 그림)
         for tid, f0, f1, role, si in self._players:
             lane = self._lane_of_role(role)
             y, lh = self._lane_rect(lane)
-            pitch = (lh - 4) / max(self._lane_rows.get(lane, 3), 1)
+            fold = lane in self.collapsed
+            pitch = (lh - 4) / (1 if fold
+                                else max(self._lane_rows.get(lane, 3), 1))
             bh = max(1, int(pitch) - (1 if pitch >= 3 else 0))
-            ry = y + 2 + int(si * pitch)
+            ry = y + 2 + int((0 if fold else si) * pitch)
             b, g, rr = self.role_palette.get(
                 role, TEAM_COLORS[min(role, len(TEAM_COLORS) - 1)])
             r = (self._x(f0), ry, max(2, self._x(f1) - self._x(f0)), bh)
@@ -607,9 +639,10 @@ class TimelineView(QWidget):
             # 서브행 우선 매칭 — 동시 트랙(겹친 시간대)에서 클릭한 행의
             # 트랙을 정확히 잡고, 행 밖 클릭은 시간 겹침으로 폴백
             ly, lh = self._lane_rect(1)
-            nrows = getattr(self, "_ball_nrows", 1)
+            nrows = 1 if 1 in self.collapsed else getattr(self, "_ball_nrows", 1)
             pitch = (lh - 4) / max(nrows, 1)
-            rows = getattr(self, "_ball_rows", [])
+            rows = ([0] * len(self.spans) if 1 in self.collapsed
+                    else getattr(self, "_ball_rows", []))
             hit_row = int((y - ly - 2) / max(pitch, 1e-9))
             fallback = None
             for i, (f0, f1) in enumerate(self.spans):
@@ -621,12 +654,15 @@ class TimelineView(QWidget):
             return fallback
         if lane in (3, 4, 5):
             ly, lh = self._lane_rect(int(lane))
-            pitch = (lh - 4) / max(self._lane_rows.get(lane, 3), 1)
+            rows_n = 1 if lane in self.collapsed \
+                else self._lane_rows.get(lane, 3)
+            pitch = (lh - 4) / max(rows_n, 1)
             bh = max(1, int(pitch))
             for tid, f0, f1, role, si in self._players:
                 if self._lane_of_role(role) != lane:
                     continue
-                ry = ly + 2 + int(si * pitch)
+                ry = ly + 2 + int((0 if lane in self.collapsed else si)
+                                  * pitch)
                 if f0 <= f <= f1 and ry - 1 <= y <= ry + bh:
                     return ("player", tid)
         if lane == 7:
@@ -5096,6 +5132,16 @@ class PtzTab(QWidget):
 
     def _timeline_menu(self, f, gpos):
         menu = QMenu(self)
+        lane = getattr(self.trackbar, "_menu_lane", -1)
+        if 0 <= lane < len(self.trackbar.LANES):
+            name = self.trackbar.lanes[lane]
+            folded = lane in self.trackbar.collapsed
+            menu.addAction(("펼치기: " if folded else "접기: ")
+                           + f"\"{name}\" 레인"
+                           + ("" if folded else " (얇은 한 줄로)"),
+                           lambda _=False, ln=lane:
+                           self.trackbar.toggle_collapse(ln))
+            menu.addSeparator()
         menu.addAction(f"내보내기 시작 지점 (I) — {self._hms(f/self.fps)}",
                        lambda: self._set_export_mark("in", f))
         menu.addAction(f"내보내기 끝 지점 (O) — {self._hms(f/self.fps)}",
@@ -5829,11 +5875,21 @@ class PtzTab(QWidget):
         self._pcache_id = None           # 선수 목록 캐시 무효화
         self._refresh_player_list()
         self._redraw()
-        menu = QMenu(self)               # 바로 역할 지정
-        for rr in (3, 4, 5, 0, 1):
+        # 바로 사람 지정 메뉴 — 팀 선택 아래 번호까지 한 번에 (사용자
+        # 요청: 재검출 → 팀+번호 지정이 한 흐름). 기존 선수 우클릭
+        # 메뉴와 동일 구조 (_add_num_items 재사용).
+        menu = QMenu(self)
+        for r in (0, 1):
+            menu.addAction(self._role_name(r),
+                           lambda _=False, rr=r, t=tid:
+                           self._set_role(t, rr))
+            self._add_num_items(menu, tid, r)
+        menu.addSeparator()
+        for rr in (3, 4, 5, 6):
             menu.addAction(f"{self._role_name(rr)} 지정",
                            lambda _=False, r_=rr, t=tid:
                            self._set_role(t, r_))
+        menu.addSeparator()
         menu.addAction("역할 없이 두기", lambda: None)
         menu.exec(gpos)
 
