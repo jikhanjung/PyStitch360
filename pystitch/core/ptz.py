@@ -1428,3 +1428,55 @@ def analysis_summary(analysis_path, analysis, log=print):
         except OSError as e:
             log(f"[cache] 요약 캐시 저장 실패: {e}")
     return {"spans": spans, "colors": colors, "foot_med": foot_med}
+
+
+def link_ball_tracks_cached(analysis_path, analysis, ball_conf=0.25,
+                            max_jump_per_frame=120.0, log=print):
+    """link_ball_tracks 디스크 캐시 (.link.cache.npz) — GUI 열기 가속.
+
+    트랙 연결은 분석에만 의존하는 순수 파생물인데 열 때마다 수십 초를
+    재계산했다 ("트랙 로드가 오래 걸림"). 분석 파일 (size, mtime) +
+    파라미터 키. numpy 구조라 npz 가 자연스럽고 빠르다.
+    """
+    from pathlib import Path as _P
+    p = _P(str(analysis_path))
+    cp = p.with_suffix(".link.cache.npz")   # <pano>.analysis.link.cache.npz
+    try:
+        st = p.stat()
+        key = np.array([st.st_size, int(st.st_mtime),
+                        int(ball_conf * 1000), int(max_jump_per_frame)])
+    except OSError:
+        key = None
+    if key is not None and cp.exists():
+        try:
+            z = np.load(cp, allow_pickle=False)
+            if np.array_equal(z["key"], key):
+                nt = int(z["n_tracks"])
+                tracks = [{"i": z[f"t{i}_i"],
+                           "pts": z[f"t{i}_pts"],
+                           "x": list(z[f"t{i}_pts"][:, 0]),
+                           "y": list(z[f"t{i}_pts"][:, 1])}
+                          for i in range(nt)]
+                return {"idx": z["idx"], "tracks": tracks,
+                        "fps": float(z["fps"]),
+                        "p_cnt": z["p_cnt"], "p_tx": z["p_tx"],
+                        "p_ty": z["p_ty"], "p_span": z["p_span"]}
+        except Exception as e:  # noqa: BLE001 — 캐시는 버려도 되는 파일
+            log(f"[cache] 링크 캐시 무시: {e}")
+    linked = link_ball_tracks(analysis, ball_conf, max_jump_per_frame)
+    if key is not None:
+        try:
+            arrs = {"key": key, "idx": np.asarray(linked["idx"]),
+                    "fps": np.float64(linked["fps"]),
+                    "n_tracks": np.int64(len(linked["tracks"])),
+                    "p_cnt": np.asarray(linked["p_cnt"]),
+                    "p_tx": np.asarray(linked["p_tx"]),
+                    "p_ty": np.asarray(linked["p_ty"]),
+                    "p_span": np.asarray(linked["p_span"])}
+            for i, t in enumerate(linked["tracks"]):
+                arrs[f"t{i}_i"] = np.asarray(t["i"])
+                arrs[f"t{i}_pts"] = np.asarray(t["pts"])
+            np.savez_compressed(cp, **arrs)
+        except OSError as e:
+            log(f"[cache] 링크 캐시 저장 실패: {e}")
+    return linked

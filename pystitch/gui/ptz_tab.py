@@ -418,9 +418,13 @@ class TimelineView(QWidget):
                 p.setPen(QColor(255, 255, 255))
                 p.drawRect(r[0] - 1, r[1] - 1, r[2] + 1, r[3] + 1)
         for i, rg in enumerate(self.ignores):
-            r = (self._x(rg[0]), y + 4,
-                 max(2, self._x(rg[1]) - self._x(rg[0])), lh - 8)
-            p.fillRect(*r, QColor(220, 70, 60))
+            # 반투명 전체 높이 밴드 — 트랙(서브행)이 아니라 "무시 범위"
+            # 임을 구분 (서브행 도입 후 솔리드 블록은 두꺼운 트랙처럼 보임)
+            r = (self._x(rg[0]), y + 2,
+                 max(2, self._x(rg[1]) - self._x(rg[0])), lh - 4)
+            p.fillRect(*r, QColor(220, 70, 60, 90))
+            p.setPen(QColor(220, 70, 60))
+            p.drawRect(r[0], r[1], r[2], r[3])
             if self.selected == ("ignore", i):
                 p.setPen(QColor(255, 255, 255))
                 p.drawRect(r[0] - 1, r[1] - 1, r[2] + 1, r[3] + 1)
@@ -750,16 +754,26 @@ class AnalyzeWorker(QThread):
 
 
 class LinkWorker(QThread):
-    """트랙 연결(느린 단계) 백그라운드 계산 — 분석에만 의존하므로 1회면 됨."""
+    """트랙 연결(느린 단계) 백그라운드 계산 — 분석에만 의존하므로 1회면 됨.
+
+    analysis_path 가 있으면 디스크 캐시(.link.cache.npz) 경유 —
+    재열기·헤드리스 예열 시 수십 초 → 즉시.
+    """
 
     done = pyqtSignal(dict)
 
-    def __init__(self, analysis):
+    def __init__(self, analysis, analysis_path=None):
         super().__init__()
         self.analysis = analysis
+        self.analysis_path = analysis_path
 
     def run(self):
-        linked = link_ball_tracks(self.analysis)
+        from ..core.ptz import link_ball_tracks_cached
+        if self.analysis_path:
+            linked = link_ball_tracks_cached(self.analysis_path,
+                                             self.analysis)
+        else:
+            linked = link_ball_tracks(self.analysis)
         linked["teams"] = classify_teams(self.analysis)
         self.done.emit(linked)
 
@@ -3925,7 +3939,9 @@ class PtzTab(QWidget):
         """트랙 연결(느린 단계)을 백그라운드로 1회 계산."""
         if self.analysis is None:
             return
-        w = LinkWorker(self.analysis)
+        ap = (self.pano_path.with_suffix(".analysis.json")
+              if self.pano_path else None)
+        w = LinkWorker(self.analysis, analysis_path=ap)
         w.done.connect(self._link_done)
         self._link_worker = w
         self.log("[ptz] 트랙 연결 계산 중... (완료 후 클릭 반응이 빨라짐)")

@@ -215,3 +215,25 @@ def test_match_metrics_t_range(tmp_path):
         assert cut["n_samples"] < full["n_samples"]
     finally:
         F.pano_to_field = orig
+
+
+def test_link_cache_roundtrip(tmp_path):
+    import json
+    import numpy as np
+    from pystitch.core.ptz import link_ball_tracks, link_ball_tracks_cached
+    ana = {"frames": list(range(0, 300, 3)), "fps": 30.0,
+           "pano_w": 2000, "pano_h": 800,
+           "balls": [[100.0 + i * 5, 400.0, 0.9] for i in range(100)],
+           "ball_cands": [[[100.0 + i * 5, 400.0, 0.9]] for i in range(100)],
+           "players": [[] for _ in range(100)]}
+    ap = tmp_path / "p.analysis.json"
+    ap.write_text(json.dumps(ana))
+    fresh = link_ball_tracks(ana)
+    l1 = link_ball_tracks_cached(ap, ana)
+    assert (tmp_path / "p.analysis.link.cache.npz").exists()
+    l2 = link_ball_tracks_cached(ap, ana)     # 캐시 적중
+    assert len(l1["tracks"]) == len(fresh["tracks"]) == len(l2["tracks"])
+    for a, b in zip(l1["tracks"], l2["tracks"]):
+        assert np.allclose(a["pts"], b["pts"])
+        assert np.array_equal(a["i"], b["i"])
+    assert np.array_equal(l1["idx"], l2["idx"])
