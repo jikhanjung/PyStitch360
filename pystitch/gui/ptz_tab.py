@@ -4075,6 +4075,7 @@ class PtzTab(QWidget):
                 "경기장 캘리브레이션이 필요합니다 — 영상 우클릭 메뉴에서 "
                 "랜드마크를 지정하세요 (지표는 필드 좌표 기준).")
             return
+        self._auto_merge_if_needed(reason=" (지표 계산 전)")
         from ..core.metrics import match_metrics
         r = self._norm_export_range()
         t_range = (r[0] / self.fps, r[1] / self.fps) if r else None
@@ -4589,6 +4590,7 @@ class PtzTab(QWidget):
                                     "경기장 캘리브레이션이 필요합니다 "
                                     "(히트맵은 필드 좌표 기준).")
             return
+        self._auto_merge_if_needed(reason=" (리포트 생성 전)")
         from ..core.report import generate_report
         out_dir = self.pano_path.with_name(self.pano_path.stem + "_report")
         spans, _ = self._player_cache()
@@ -5095,6 +5097,40 @@ class PtzTab(QWidget):
         self._redraw()
 
     # ------------------------------------------------------ 트랙릿 병합
+    def _apply_merge_suggestions(self):
+        """병합 제안 계산·적용 (공용) — 반환 (링크 수, 그룹 전/후)."""
+        from ..core.tracklets import (
+            merge_map, suggest_links, tracklet_summaries,
+        )
+        spans, _ = self._player_cache()
+        n_before = len({self._rep(t) for t in spans})
+        summ = tracklet_summaries(self.analysis, self._field_calib)
+        roles_eff = {t: self._role_of(t) for t in summ}
+        nums_eff = {t: self._num_of(t) for t in summ}
+        links = suggest_links(summ, roles_eff, nums=nums_eff)
+        all_links = ([(a, b) for a, b, _ in links]
+                     + list(self.merges.items()))
+        self.merges = merge_map(all_links,
+                                {t: spans[t][2] for t in spans})
+        self._merges_changed()
+        n_after = len({self._rep(t) for t in spans})
+        return len(links), n_before, n_after
+
+    def _auto_merge_if_needed(self, reason=""):
+        """병합이 하나도 없으면 제안을 자동 적용 (사용자 방향, 2026-07-22).
+
+        제안은 보수적 게이트(시공간×색×역할×등번호)라 자동 적용해도
+        비파괴 — 선수 목록에서 그룹 해체/분리로 언제든 되돌린다.
+        수동/기존 병합이 있으면 검수 존중 — 건드리지 않는다.
+        """
+        if (self.analysis is None or self._field_calib is None
+                or self.merges):
+            return
+        with self._busy("트랙릿 자동 병합 (첫 실행)"):
+            n_links, nb, na = self._apply_merge_suggestions()
+        self.log(f"[merge] 자동 병합{reason}: 링크 {n_links}개, "
+                 f"그룹 {nb}→{na}개 — 선수 목록에서 검수/해체 가능")
+
     def suggest_tracklet_merges(self):
         """분석 메뉴: 트랙릿 병합 제안 (시공간 × 유니폼색 × 역할).
 
@@ -5109,24 +5145,10 @@ class PtzTab(QWidget):
                                     "경기장 캘리브레이션이 필요합니다 "
                                     "(시공간 근접 판단에 필드 좌표 사용).")
             return
-        from ..core.tracklets import (
-            merge_map, suggest_links, tracklet_summaries,
-        )
-        spans, _ = self._player_cache()
-        n_before = len({self._rep(t) for t in spans})
         with self._busy("트랙릿 병합 제안 (시공간 × 유니폼색 × 역할)"):
-            summ = tracklet_summaries(self.analysis, self._field_calib)
-            roles_eff = {t: self._role_of(t) for t in summ}
-            nums_eff = {t: self._num_of(t) for t in summ}
-            links = suggest_links(summ, roles_eff, nums=nums_eff)
-            all_links = ([(a, b) for a, b, _ in links]
-                         + list(self.merges.items()))
-            self.merges = merge_map(all_links,
-                                    {t: spans[t][2] for t in spans})
-        self._merges_changed()
-        n_after = len({self._rep(t) for t in spans})
-        self.log(f"[merge] 링크 {len(links)}개 제안 — 트랙릿 {len(spans)}개"
-                 f" → 그룹 {n_before}→{n_after}개 "
+            n_links, n_before, n_after = self._apply_merge_suggestions()
+        self.log(f"[merge] 링크 {n_links}개 제안 — "
+                 f"그룹 {n_before}→{n_after}개 "
                  f"(선수 목록 우클릭으로 해제/분리/추가)")
 
     def _merges_changed(self):
