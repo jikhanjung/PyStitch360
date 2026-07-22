@@ -6115,6 +6115,19 @@ class PtzTab(QWidget):
                         # 같은 자리 반복 정적 트랙 일괄 수집 (낙엽·마킹).
                         # 위치 포함 4-요소 — 같은 시간대의 진짜 공 트랙은 보호
                         spans = same_spot_spans(self._linked, f0, f1) or spans
+                    elif self._accepted_ball is not None:
+                        # linked 전이라도 위치를 붙인다 — "이 트랙이 공이
+                        # 아님"이지 시간대 전체 무시가 아니므로
+                        si0 = int(np.searchsorted(self.analysis["frames"], f0))
+                        si1 = int(np.searchsorted(self.analysis["frames"], f1))
+                        pts = self._accepted_ball[si0:si1 + 1]
+                        pts = pts[np.isfinite(pts).all(axis=1)] \
+                            if len(pts) else pts
+                        if len(pts):
+                            mx, my = np.median(pts, axis=0)
+                            spans = [(int(f0), int(f1),
+                                      round(float(mx), 1),
+                                      round(float(my), 1))]
                     added = 0
                     for sp in spans:
                         lo, hi = sp[0], sp[1]

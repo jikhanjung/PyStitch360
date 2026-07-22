@@ -728,8 +728,14 @@ def same_spot_spans(linked, f0, f1, radius=60.0, static_r80=40.0):
     pick = exact[0] if exact else min(
         cover, key=lambda t: idx[t["i"][-1]] - idx[t["i"][0]])
     ref_med = np.median(pick["pts"], axis=0)
-    out = []
+    # 기준 자신은 항상 위치와 함께 포함 — "이 트랙은 공이 아님" 이지
+    # "이 시간대엔 공이 없음" 이 아니다: 동시간의 다른 트랙(진짜
+    # 매치볼)은 살아남아야 하므로 시간만의 범위는 절대 만들지 않는다.
+    out = [(int(idx[pick["i"][0]]), int(idx[pick["i"][-1]]),
+            round(float(ref_med[0]), 1), round(float(ref_med[1]), 1))]
     for t in tracks:
+        if t is pick:
+            continue
         med = np.median(t["pts"], axis=0)
         if np.hypot(*(med - ref_med)) > radius:
             continue

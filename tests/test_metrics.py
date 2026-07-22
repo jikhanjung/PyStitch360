@@ -314,4 +314,12 @@ def test_same_spot_picks_exact_track_not_blend():
     spans = same_spot_spans(linked, f0, f1)
     assert spans, "기준 자신은 포함돼야"
     for sp in spans:
+        assert len(sp) == 4, "위치 없는 시간 범위 금지"
         assert abs(sp[2] - 700.0) < 60, f"큰 트랙 자리가 섞임: {sp}"
+    # 무시 적용 후 동시간의 다른 트랙(진짜 공)은 살아남는다
+    from pystitch.core.ptz import accept_ball_tracks
+    _i, _b, kept = accept_ball_tracks(
+        ana, ignore_ranges=spans, linked=linked,
+        decoy_static_px=0.0)              # 자동 정적 필터 끄고 무시만 검증
+    assert any(s0 <= f0 <= s1 for s0, s1 in kept), \
+        f"동시간 다른 트랙이 같이 죽음: {kept}"
