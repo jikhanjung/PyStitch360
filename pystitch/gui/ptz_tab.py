@@ -4341,8 +4341,7 @@ class PtzTab(QWidget):
                     f"{self.team_names[team]} {num}번은 이미 #{other} 에 "
                     f"지정돼 있고, 두 트랙릿이 같은 프레임에 {co}회 동시 "
                     "등장합니다 — 같은 팀 같은 번호가 두 명일 수는 "
-                    "없습니다.
-한쪽 번호나 팀 분류를 확인하세요.")
+                    "없습니다.\n한쪽 번호나 팀 분류를 확인하세요.")
                 return
             r = QMessageBox.question(
                 self, "같은 번호 — 같은 사람?",
