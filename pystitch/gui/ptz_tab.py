@@ -223,6 +223,24 @@ class TimelineView(QWidget):
         self.total = max(1, int(total))
         self.spans, self.ignores = list(spans), list(ignores)
         self.kfs = list(kfs)
+        # 공 트랙 서브행 (선수 레인과 동일 그리디 간트) — 동시 트랙
+        # (경기 공 + 옆 구장/워밍업 공)이 한 줄에 겹쳐 가려지던 문제
+        ends: list = []
+        self._ball_rows = []
+        for i in sorted(range(len(self.spans)),
+                        key=lambda j: self.spans[j][0]):
+            f0, f1 = self.spans[i]
+            for si, e in enumerate(ends):
+                if e <= f0:
+                    ends[si] = f1
+                    break
+            else:
+                si = len(ends)
+                ends.append(f1)
+            while len(self._ball_rows) <= i:
+                self._ball_rows.append(0)
+            self._ball_rows[i] = si
+        self._ball_nrows = max(1, len(ends))
         if promotes is not None:
             self.promotes = list(promotes)
         self._clamp_view()
@@ -385,10 +403,16 @@ class TimelineView(QWidget):
             if self.selected == ("kf", i):
                 p.setPen(QColor(255, 255, 255))
                 p.drawRect(r[0] - 1, r[1] - 1, r[2] + 1, r[3] + 1)
-        # 레인 1: 공 — 수락 트랙, 무시, 승격
+        # 레인 1: 공 — 수락 트랙 (동시 트랙은 서브행 분리), 무시, 승격
         y, lh = self._lane_rect(1)
+        nrows = getattr(self, "_ball_nrows", 1)
+        pitch = (lh - 4) / max(nrows, 1)
+        rows = getattr(self, "_ball_rows", [])
         for i, (f0, f1) in enumerate(self.spans):
-            r = (self._x(f0), y + 4, max(2, self._x(f1) - self._x(f0)), lh - 8)
+            ry = y + 2 + (rows[i] if i < len(rows) else 0) * pitch
+            rh = max(3, int(pitch) - 1)
+            r = (self._x(f0), int(ry),
+                 max(2, self._x(f1) - self._x(f0)), rh)
             p.fillRect(*r, QColor(70, 200, 90))
             if self.selected == ("ball", i):
                 p.setPen(QColor(255, 255, 255))
@@ -576,10 +600,21 @@ class TimelineView(QWidget):
             for i, rg in enumerate(self.ignores):
                 if rg[0] <= f <= rg[1]:
                     return ("ignore", i)
+            # 서브행 우선 매칭 — 동시 트랙(겹친 시간대)에서 클릭한 행의
+            # 트랙을 정확히 잡고, 행 밖 클릭은 시간 겹침으로 폴백
+            ly, lh = self._lane_rect(1)
+            nrows = getattr(self, "_ball_nrows", 1)
+            pitch = (lh - 4) / max(nrows, 1)
+            rows = getattr(self, "_ball_rows", [])
+            hit_row = int((y - ly - 2) / max(pitch, 1e-9))
+            fallback = None
             for i, (f0, f1) in enumerate(self.spans):
                 if f0 <= f <= f1:
-                    return ("ball", i)
-            return None
+                    if (rows[i] if i < len(rows) else 0) == hit_row:
+                        return ("ball", i)
+                    if fallback is None:
+                        fallback = ("ball", i)
+            return fallback
         if lane in (3, 4, 5):
             ly, lh = self._lane_rect(int(lane))
             pitch = (lh - 4) / max(self._lane_rows.get(lane, 3), 1)
