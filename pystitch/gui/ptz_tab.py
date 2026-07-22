@@ -828,19 +828,22 @@ class LinkWorker(QThread):
 
     done = pyqtSignal(dict)
 
-    def __init__(self, analysis, analysis_path=None):
+    def __init__(self, analysis, analysis_path=None, video_path=None):
         super().__init__()
         self.analysis = analysis
         self.analysis_path = analysis_path
+        self.video_path = video_path
 
     def run(self):
-        from ..core.ptz import link_ball_tracks_cached
+        from ..core.ptz import link_ball_tracks_cached, measure_top_black
         if self.analysis_path:
             linked = link_ball_tracks_cached(self.analysis_path,
                                              self.analysis)
         else:
             linked = link_ball_tracks(self.analysis)
         linked["teams"] = classify_teams(self.analysis)
+        if self.video_path:                    # 상단 검은 경계 실측
+            linked["top_black"] = measure_top_black(self.video_path)
         self.done.emit(linked)
 
 
@@ -949,14 +952,15 @@ class PlanWorker(QThread):
     done = pyqtSignal(dict, tuple)   # plan, (out_w, out_h)
 
     def __init__(self, analysis, keyframes, ignores, wide, linked=None,
-                 far_zoom=1.0, promotes=None, exclude_tids=None):
+                 far_zoom=1.0, promotes=None, exclude_tids=None,
+                 top_margin=None):
         super().__init__()
         self.args = (analysis, keyframes, ignores, wide, linked, far_zoom,
-                     promotes or [], exclude_tids or set())
+                     promotes or [], exclude_tids or set(), top_margin)
 
     def run(self):
         (analysis, kfs, ignores, wide, linked, far_zoom, promotes,
-         exclude_tids) = self.args
+         exclude_tids, top_margin) = self.args
         try:
             out_w, out_h = (2560, 1080) if wide else (1920, 1080)
             plan = build_plan(analysis, analysis["pano_w"], analysis["pano_h"],
@@ -965,6 +969,8 @@ class PlanWorker(QThread):
                               force_ranges=promotes, linked=linked,
                               exclude_tids=exclude_tids,
                               far_zoom=far_zoom,
+                              **({"top_margin": top_margin}
+                                 if top_margin is not None else {}),
                               sigma_slow=3.0 if wide else 1.2,
                               fast_err_px=800.0 if wide else 400.0, log=None)
             self.done.emit(plan, (out_w, out_h))
@@ -3481,7 +3487,9 @@ class PtzTab(QWidget):
         if self.plan is not None and not picking \
                 and self.check_crop.isChecked() and f < len(self.plan["cx"]):
             ow, oh = self.plan_out
-            top = int(self.plan.get("top_margin", 0))
+            tl = self.plan.get("top_lim")
+            top = (int(tl[f]) if tl is not None and f < len(tl)
+                   else int(self.plan.get("top_margin", 0)))
             commit = self._box_commit
             if self._box_edit is not None:      # 편집 중: 미확정 박스
                 bcx, bcy, bw = self._box_edit["box"]
@@ -4004,7 +4012,8 @@ class PtzTab(QWidget):
                        self.combo_mode.currentIndex() == 1, linked=self._linked,
                        far_zoom=self.spin_far_zoom.value(),
                        promotes=[tuple(p) for p in self.promotes],
-                       exclude_tids=hidden)
+                       exclude_tids=hidden,
+                       top_margin=getattr(self, "_top_black", None))
         w.done.connect(self._plan_done)
         self._plan_worker = w
         w.start()
@@ -4021,7 +4030,8 @@ class PtzTab(QWidget):
             return
         ap = (self.pano_path.with_suffix(".analysis.json")
               if self.pano_path else None)
-        w = LinkWorker(self.analysis, analysis_path=ap)
+        w = LinkWorker(self.analysis, analysis_path=ap,
+                       video_path=self.pano_path)
         w.done.connect(self._link_done)
         self._link_worker = w
         self.log("[ptz] 트랙 연결 계산 중... (완료 후 클릭 반응이 빨라짐)")
@@ -4093,6 +4103,11 @@ class PtzTab(QWidget):
 
     def _link_done(self, linked):
         self._linked = linked
+        tb = linked.pop("top_black", None)
+        if tb is not None:
+            self._top_black = int(tb)
+            self.log(f"[plan] 상단 검은 경계 실측: {tb}px"
+                     + ("" if tb else " — 상단 클램프 해제"))
         self._teams = linked.pop("teams", {}) or {}
         if self.roles and self.analysis is not None:
             self._teams = classify_teams(self.analysis, roles=self.roles,

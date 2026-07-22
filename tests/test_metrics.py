@@ -323,3 +323,30 @@ def test_same_spot_picks_exact_track_not_blend():
         decoy_static_px=0.0)              # 자동 정적 필터 끄고 무시만 검증
     assert any(s0 <= f0 <= s1 for s0, s1 in kept), \
         f"동시간 다른 트랙이 같이 죽음: {kept}"
+
+
+def test_plan_top_relaxes_for_high_ball():
+    """뜬 공이 top_margin 위에 있으면 상단 클램프가 따라 올라간다."""
+    from pystitch.core.ptz import build_plan, link_ball_tracks
+    n = 300
+    ana = {"frames": list(range(0, n * 3, 3)), "fps": 30.0,
+           "pano_w": 5900, "pano_h": 1700, "total_frames": 900,
+           "balls": [], "ball_cands": [], "players": [[]] * n}
+    for i in range(n):
+        if 100 <= i < 160:                    # 높이 뜬 공 (y=90 < 160)
+            b = [2900.0, 90.0, 0.9]
+        elif i < 100 or i >= 220:             # 지상 공
+            b = [2900.0, 1200.0, 0.9]
+        else:
+            b = None                          # 공백 구간
+        ana["balls"].append(b)
+        ana["ball_cands"].append([b] if b else [])
+    linked = link_ball_tracks(ana)
+    plan = build_plan(ana, 5900, 1700, linked=linked, log=None)
+    tl = plan["top_lim"]
+    f_high = 130 * 3
+    f_low = 40 * 3
+    f_blind = 190 * 3
+    assert tl[f_high] < 100, tl[f_high]       # 공 위로 완화
+    assert tl[f_low] == 160.0                 # 지상 공 — 기본 유지
+    assert tl[f_blind] == 160.0               # 공 모름 — 안전 마진 유지

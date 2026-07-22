@@ -1212,11 +1212,24 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
             if kw is not None and not wide:
                 kwc = min(max(float(kw), min_crop_w), max_crop_w)
                 cw = cw + (kwc - cw[j]) * g
+    # 상단 클램프 완화 (높이 뜬 공): top_margin 은 상단 검은 경계 보호가
+    # 목적인데, 공이 실측으로 그 위에 있으면 공을 놓치는 클램프가 된다 —
+    # 공을 아는 구간에서 계획이 원하는 만큼(0 까지) 상한을 따라 올린다.
+    h_arr = np.minimum(np.minimum(cw, pano_w),
+                       pano_h * out_w / out_h) * out_h / out_w
+    known_f = _gaussian1d(
+        np.interp(fr, idx, known.astype(float)), 0.5 * fps) > 0.5
+    top_lim = np.full(total, float(top_margin))
+    want = cy - h_arr / 2
+    m = known_f & (want < top_margin)
+    top_lim[m] = np.clip(want[m], 0.0, top_margin)
     if log:
         log(f"[plan] 공 궤적 {known.mean():.0%} (보간 포함), "
             f"빠른 추종 구간 {(w > 0.5).mean():.0%}, "
-            f"줌아웃(>1.05x) {(cw > out_w * 1.05).mean():.0%}")
-    return {"cx": cx, "cy": cy, "crop_w": cw, "top_margin": top_margin}
+            f"줌아웃(>1.05x) {(cw > out_w * 1.05).mean():.0%}"
+            + (f", 상단 완화 {m.mean():.0%}" if m.any() else ""))
+    return {"cx": cx, "cy": cy, "crop_w": cw, "top_margin": top_margin,
+            "top_lim": top_lim}
 
 
 def build_radar_data(analysis, teams, calib=None, field_size=(105.0, 68.0),
@@ -1382,6 +1395,7 @@ def render_plan(pano_path, out_path, plan, out_w=1920, out_h=1080,
     enc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     cx, cy, cw = plan["cx"], plan["cy"], plan["crop_w"]
     top_margin = int(plan.get("top_margin", 0))
+    top_arr = plan.get("top_lim")
     r_frames = radar["frames"] if radar is not None else None
     r_cache = {"si": -1, "img": None}
     panel_w = (out_w // 5) & ~1
@@ -1402,7 +1416,8 @@ def render_plan(pano_path, out_path, plan, out_w=1920, out_h=1080,
             x0 = int(round(cx[i] - w / 2))
             y0 = int(round(cy[i] - h / 2))
             x0 = max(0, min(x0, pano_w - w))
-            y0 = max(min(top_margin, pano_h - h), min(y0, pano_h - h))
+            tm = int(top_arr[i]) if top_arr is not None else top_margin
+            y0 = max(min(tm, pano_h - h), min(y0, pano_h - h))
             crop = frame[y0:y0 + h, x0:x0 + w]
             if w != out_w:
                 interp = cv2.INTER_AREA if w > out_w else cv2.INTER_CUBIC
@@ -1553,3 +1568,31 @@ def link_ball_tracks_cached(analysis_path, analysis, ball_conf=0.25,
         except OSError as e:
             log(f"[cache] 링크 캐시 저장 실패: {e}")
     return linked
+
+
+def measure_top_black(video_path, samples=5, dark=18, cover=0.90):
+    """파노라마 상단 검은 스티칭 경계 높이 실측 (px).
+
+    top_margin 의 근거는 이 경계뿐 — 고정 160px 대신 실측한다
+    (--auto-el 산출물은 대개 0). 몇 프레임을 샘플해 행의 어두운 픽셀
+    비율이 cover 이상인 최상단 연속 구간의 최대 높이 + 8px 여유.
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return None
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+    worst = 0
+    for k in range(samples):
+        cap.set(cv2.CAP_PROP_POS_FRAMES,
+                int(total * (k + 0.5) / samples))
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        strip = cv2.cvtColor(frame[:240], cv2.COLOR_BGR2GRAY)
+        frac = (strip < dark).mean(axis=1)
+        h = 0
+        while h < len(frac) and frac[h] >= cover:
+            h += 1
+        worst = max(worst, h)
+    cap.release()
+    return worst + (8 if worst else 0)
