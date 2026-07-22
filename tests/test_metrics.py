@@ -237,3 +237,33 @@ def test_link_cache_roundtrip(tmp_path):
         assert np.allclose(a["pts"], b["pts"])
         assert np.array_equal(a["i"], b["i"])
     assert np.array_equal(l1["idx"], l2["idx"])
+
+
+def test_build_plan_excludes_hidden_players():
+    """숨긴 선수(관중·오인식)는 공 부재 구간 크롭 목표에서 제외."""
+    import math
+    from pystitch.core.ptz import build_plan, link_ball_tracks
+    n = 300
+    ana = {"frames": list(range(0, n * 3, 3)), "fps": 30.0,
+           "pano_w": 4000, "pano_h": 1200, "total_frames": 900,
+           "balls": [None] * n, "ball_cands": [[] for _ in range(n)],
+           "players": []}
+    for i in range(n):
+        # 진짜 선수들 왼쪽(700 부근), 오인식 관중 무리 오른쪽(3500)
+        # 관중 무리(4)가 다수라 중앙값 트리밍이 관중 쪽을 남긴다 —
+        # 숨김 제외가 아니면 크롭이 관중을 추종하는 상황 재현
+        ana["players"].append(
+            [[700.0 + 30 * math.sin(i / 9.0), 600.0, 30.0, 90.0, 1],
+             [760.0, 640.0, 30.0, 90.0, 2],
+             [640.0, 620.0, 30.0, 90.0, 3],
+             [3500.0, 900.0, 30.0, 90.0, 901],
+             [3550.0, 880.0, 30.0, 90.0, 902],
+             [3600.0, 870.0, 30.0, 90.0, 904],
+             [3450.0, 910.0, 30.0, 90.0, 903]])
+    linked = link_ball_tracks(ana)
+    p0 = build_plan(ana, 4000, 1200, linked=linked, log=None)
+    p1 = build_plan(ana, 4000, 1200, linked=linked,
+                    exclude_tids={901, 902, 903, 904}, log=None)
+    f = 450
+    assert p0["cx"][f] > p1["cx"][f] + 300, (p0["cx"][f], p1["cx"][f])
+    assert p1["cx"][f] < 1500                 # 진짜 선수 쪽으로

@@ -883,19 +883,21 @@ class PlanWorker(QThread):
     done = pyqtSignal(dict, tuple)   # plan, (out_w, out_h)
 
     def __init__(self, analysis, keyframes, ignores, wide, linked=None,
-                 far_zoom=1.0, promotes=None):
+                 far_zoom=1.0, promotes=None, exclude_tids=None):
         super().__init__()
         self.args = (analysis, keyframes, ignores, wide, linked, far_zoom,
-                     promotes or [])
+                     promotes or [], exclude_tids or set())
 
     def run(self):
-        analysis, kfs, ignores, wide, linked, far_zoom, promotes = self.args
+        (analysis, kfs, ignores, wide, linked, far_zoom, promotes,
+         exclude_tids) = self.args
         try:
             out_w, out_h = (2560, 1080) if wide else (1920, 1080)
             plan = build_plan(analysis, analysis["pano_w"], analysis["pano_h"],
                               out_w=out_w, out_h=out_h, keyframes=kfs,
                               wide=wide, ignore_ranges=ignores,
                               force_ranges=promotes, linked=linked,
+                              exclude_tids=exclude_tids,
                               far_zoom=far_zoom,
                               sigma_slow=3.0 if wide else 1.2,
                               fast_err_px=800.0 if wide else 400.0, log=None)
@@ -3920,11 +3922,15 @@ class PtzTab(QWidget):
         if self._plan_worker is not None and self._plan_worker.isRunning():
             self._plan_timer.start()      # 진행 중이면 잠시 뒤 재시도
             return
+        hidden = {t for t in self._pspans
+                  if self._rep(t) in self.hidden_players} \
+            if self.hidden_players else set()
         w = PlanWorker(self.analysis, [tuple(k) for k in self.keyframes],
                        [tuple(r) for r in self.ignores],
                        self.combo_mode.currentIndex() == 1, linked=self._linked,
                        far_zoom=self.spin_far_zoom.value(),
-                       promotes=[tuple(p) for p in self.promotes])
+                       promotes=[tuple(p) for p in self.promotes],
+                       exclude_tids=hidden)
         w.done.connect(self._plan_done)
         self._plan_worker = w
         w.start()
@@ -4188,6 +4194,7 @@ class PtzTab(QWidget):
         self._save_keyframes()
         self._refresh_team_label()
         self._refresh_player_list()
+        self._plan_dirty()                # 크롭 계획도 재계산 (선수 추종 제외)
         self._redraw()
         self.log(f"[ptz] #{rep} 숨김 (관중·오인식) — 선수 목록 우클릭 "
                  f"\"숨긴 사람 복원\" 또는 역할 초기화로 되돌림")
@@ -5042,6 +5049,7 @@ class PtzTab(QWidget):
             self.merges = {}
             self.player_nums = {}
             self.hidden_players = set()
+            self._plan_dirty()
             self.extra_players = {}
             self.kit_colors = {}
             self._pcache_id = None

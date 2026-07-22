@@ -850,12 +850,29 @@ def link_ball_tracks(analysis, ball_conf=0.25, max_jump_per_frame=120.0):
         del t["x"], t["y"]
 
     # 샘플별 선수 통계 프리컴퓨트 (공 부재 시 목표/줌 계산용 — 캐시 대상)
+    p_cnt, p_tx, p_ty, p_span = player_aggregates(analysis)
+    return {"idx": idx, "tracks": tracks, "fps": fps,
+            "p_cnt": p_cnt, "p_tx": p_tx, "p_ty": p_ty, "p_span": p_span}
+
+
+def player_aggregates(analysis, exclude_tids=None):
+    """샘플별 선수 통계 (공 부재 시 크롭 목표/줌) — 숨김 제외 지원.
+
+    exclude_tids (숨긴 관중·오인식 대표+멤버) 를 빼고 집계 — 숨겨도
+    크롭이 그쪽을 보던 문제의 수정 지점.
+    """
+    n = len(analysis["frames"])
+    ex = exclude_tids or ()
     p_cnt = np.zeros(n, int)
     p_tx = np.full(n, np.nan)
     p_ty = np.full(n, np.nan)
     p_span = np.zeros(n)
     for i in range(n):
-        pl = np.asarray(analysis["players"][i], dtype=float)
+        rows = analysis["players"][i]
+        if ex:
+            rows = [r for r in rows
+                    if len(r) < 5 or int(r[4]) not in ex]
+        pl = np.asarray(rows, dtype=float)
         pl = pl[:, :2] if pl.ndim == 2 else pl.reshape(-1, 2)
         p_cnt[i] = len(pl)
         if len(pl) >= 3:
@@ -863,8 +880,7 @@ def link_ball_tracks(analysis, ball_conf=0.25, max_jump_per_frame=120.0):
             keep = pl[np.abs(pl[:, 0] - med) < analysis.get("pano_w", 5906) * 0.25]
             p_tx[i], p_ty[i] = keep[:, 0].mean(), keep[:, 1].mean()
             p_span[i] = np.percentile(pl[:, 0], 90) - np.percentile(pl[:, 0], 10)
-    return {"idx": idx, "tracks": tracks, "fps": fps,
-            "p_cnt": p_cnt, "p_tx": p_tx, "p_ty": p_ty, "p_span": p_span}
+    return p_cnt, p_tx, p_ty, p_span
 
 
 def _track_iso_frac(analysis, t, iso_px):
@@ -1009,7 +1025,7 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
                decoy_static_px=30.0, decoy_iso_px=700.0, decoy_win_sec=3.0,
                keyframes=None, kf_suppress_sec=1.5, kf_bridge_sec=8.0,
                wide=False, ignore_ranges=None, force_ranges=None,
-               linked=None, log=print):
+               linked=None, exclude_tids=None, log=print):
     """검출 궤적 → 프레임별 (cx, cy, crop_w) 계획.
 
     - 공: conf 게이팅 + 점프 게이팅, gap_fill_sec 까지 선형 보간.
@@ -1091,8 +1107,13 @@ def build_plan(analysis, pano_w, pano_h, out_w=1920, out_h=1080,
     zw = np.full(n, float(out_w))
     prev = (pano_w / 2, pano_h * 0.55)
     field_top = analysis.get("field_top_frac", 0.26) * pano_h
-    p_cnt, p_tx = linked["p_cnt"], linked["p_tx"]
-    p_ty, p_span = linked["p_ty"], linked["p_span"]
+    if exclude_tids:
+        # 숨긴 선수(관중·오인식) 제외 재집계 — 캐시된 통계는 전체 기준
+        p_cnt, p_tx, p_ty, p_span = player_aggregates(
+            analysis, exclude_tids=set(exclude_tids))
+    else:
+        p_cnt, p_tx = linked["p_cnt"], linked["p_tx"]
+        p_ty, p_span = linked["p_ty"], linked["p_span"]
     for i in range(n):                      # 프리컴퓨트 덕에 경량 루프
         if known[i]:
             tx[i], ty[i] = filled[i]
