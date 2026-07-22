@@ -1561,24 +1561,41 @@ class PtzTab(QWidget):
                 del st[k]
         return out, ball_g
 
-    def _draw_radar_overlay(self, frame, pts, ball_g):
-        """우하단 반투명 탑다운 레이더 — 내보내기(draw_radar_panel)와 동일."""
+    def _draw_radar_overlay(self, pts, ball_g):
+        """우하단 반투명 탑다운 레이더 — 위젯 오버레이.
+
+        예전엔 프레임(BGR)에 합성해서 영상 줌/팬을 따라 움직였다 —
+        위젯으로 분리해 화면상 위치/크기가 고정된다 (내보내기 합성
+        경로 draw_radar_panel 은 그대로).
+        """
+        from PyQt6.QtGui import QImage, QPainter, QPixmap
         radar = {"frames": [0], "points": [pts], "balls": [ball_g],
                  "length": float(self.field_size[0]),
                  "width": float(self.field_size[1]),
                  "palette": self._radar_palette}
-        pw = (frame.shape[1] // 6) & ~1
-        if pw < 60:
+        pw = max(160, self.pane.width() // 5) & ~1
+        if self.pane.width() < 320:
+            self._radar_lbl.hide()
             return
         panel = draw_radar_panel(radar, 0, pw)
-        ph, pw_ = panel.shape[:2]
-        H, W = frame.shape[:2]
-        mgn = W // 96
-        if ph + mgn >= H or pw_ + mgn >= W:
-            return
-        roi = frame[H - mgn - ph:H - mgn, W - mgn - pw_:W - mgn]
-        a = self.sld_radar_alpha.value() / 100.0
-        cv2.addWeighted(panel, a, roi, 1.0 - a, 0.0, dst=roi)
+        rgb = cv2.cvtColor(panel, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        qi = QImage(rgb.data, w, h, rgb.strides[0],
+                    QImage.Format.Format_RGB888)
+        pm = QPixmap(w, h)
+        pm.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pm)
+        painter.setOpacity(self.sld_radar_alpha.value() / 100.0)
+        painter.drawImage(0, 0, qi)
+        painter.end()
+        self._radar_lbl.setPixmap(pm)
+        self._radar_lbl.resize(w, h)
+        self._radar_lbl.move(self.pane.width() - w - 10,
+                             self.pane.height() - h - 10)
+        self._radar_lbl.show()
+
+    def _hide_radar(self):
+        self._radar_lbl.hide()
 
     def log(self, msg):
         """메인 윈도우 로그 + 탭 내 로그 미러."""
@@ -1594,6 +1611,13 @@ class PtzTab(QWidget):
         가져도 동작하고, 커서가 딴 데 있으면 이벤트를 그대로 통과시켜
         다른 위젯의 Space 동작(목록 선택 등)을 깨지 않는다.
         """
+        if ev.type() == QEvent.Type.Resize \
+                and obj is getattr(self, "pane", None) \
+                and self._radar_lbl.isVisible():
+            pm = self._radar_lbl.pixmap()
+            if pm is not None:
+                self._radar_lbl.move(self.pane.width() - pm.width() - 10,
+                                     self.pane.height() - pm.height() - 10)
         if ev.type() == QEvent.Type.KeyPress and not ev.isAutoRepeat() \
                 and self.cap is not None:
             k = ev.key()
@@ -1650,6 +1674,11 @@ class PtzTab(QWidget):
         # 영상은 전체 폭 사용, 목록·레이더는 하단 스트립으로
         self.pane = FramePane("클릭 = 오브젝트 조작 / 빈 곳 = 키프레임, 우클릭 = 메뉴",
                               interactive=True)
+        # 레이더는 위젯 오버레이 — 영상 줌/팬과 무관하게 고정 위치/크기
+        self._radar_lbl = QLabel(self.pane)
+        self._radar_lbl.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._radar_lbl.hide()
         self.pane.clicked.connect(self._pane_clicked)
         self.pane.context_requested.connect(self._pane_context)
         self.pane.hover.connect(self._pane_hover)
@@ -3189,6 +3218,8 @@ class PtzTab(QWidget):
 
     def _redraw(self):
         """오버레이만 다시 그림 — 키프레임/무시/계획 변경 시 디코딩 없이 즉시."""
+        if not self.check_radar.isChecked() or self.analysis is None:
+            self._hide_radar()            # 조건 미충족 잔상 방지
         if self.mc is not None and self.mc.alt_on_main:
             sf = self.mc.main_frame()     # focus 카메라(alt) 원본 표시
             if sf is not None:
@@ -3376,7 +3407,9 @@ class PtzTab(QWidget):
                     ball_g = (g[0][0], cy0 + g[0][1]) if g else None
             if self.check_radar.isChecked():
                 pts, ball_sm = self._smooth_radar(radar_pts, ball_g, f)
-                self._draw_radar_overlay(frame, pts, ball_sm)
+                self._draw_radar_overlay(pts, ball_sm)
+            else:
+                self._hide_radar()
         # 경기장 탭: 랜드마크 마커 + (캘리브레이션 후) 예상 경기장 선
         if self._field_tab_active() or self.btn_field_pick.isChecked():
             if self._field_calib is not None:
