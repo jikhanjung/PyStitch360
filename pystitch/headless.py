@@ -408,6 +408,8 @@ def _analyze(pano: Path, args):
     tmp = Path(str(out) + ".tmp")
     tmp.write_text(json.dumps(d))
     tmp.replace(out)
+    from .core.ptz import analysis_summary
+    analysis_summary(out, d, log=_log)    # 요약 캐시 예열 (GUI 열기 가속)
     n_ball = sum(1 for b in d["balls"] if b is not None)
     _log(f"[analyze] 샘플 {len(d['frames'])}개, 공 {n_ball}개, "
          f"선수 검출 {sum(len(p) for p in d['players'])} → {out.name} "

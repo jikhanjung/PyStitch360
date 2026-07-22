@@ -160,3 +160,29 @@ def test_write_match_report(tmp_path):
     md = (tmp_path / "r" / "match.md").read_text(encoding="utf-8")
     assert "60%" in md and "미관측 전이 2건" in md and "5400" in md
     assert files[0].endswith("match.md")
+
+
+def test_analysis_summary_cache(tmp_path):
+    """파생 요약 캐시: 저장·재사용·분석 변경 시 무효화."""
+    import json
+    from pystitch.core.ptz import analysis_summary
+    ana = {"frames": [0, 3, 6], "fps": 30.0, "balls": [None] * 3,
+           "players": [[[10, 20, 4, 8, 7, 45.0, 100.0, 200.0]],
+                       [[12, 21, 4, 8, 7, 45.0, 100.0, 200.0]], []]}
+    ap = tmp_path / "p.analysis.json"
+    ap.write_text(json.dumps(ana))
+    s1 = analysis_summary(ap, ana)
+    assert s1["spans"][7] == [0, 3, 2] and 7 in s1["colors"]
+    cp = tmp_path / "p.analysis.cache.json"
+    assert cp.exists()
+    # 캐시 적중: 파일 내용을 바꿔치기해도 키 동일하면 캐시 반환
+    doc = json.loads(cp.read_text())
+    doc["spans"]["7"] = [0, 3, 99]
+    cp.write_text(json.dumps(doc))
+    assert analysis_summary(ap, ana)["spans"][7][2] == 99
+    # 분석 파일 갱신(mtime/size 변경) → 재계산
+    import os, time
+    ana2 = dict(ana)
+    ap.write_text(json.dumps(ana2) + " ")
+    os.utime(ap, (time.time() + 5, time.time() + 5))
+    assert analysis_summary(ap, ana2)["spans"][7][2] == 2

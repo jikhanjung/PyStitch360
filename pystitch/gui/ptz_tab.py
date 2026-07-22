@@ -37,7 +37,7 @@ from ..core.ptz import (
     accept_ball_tracks, analyze_video, build_plan, build_radar_data,
     classify_teams, draw_radar_panel, gapfill_analysis, gapfill_targets,
     ground_positions, link_ball_tracks, propagate_seed, ptz_available,
-    render_plan, same_spot_spans, tracklet_colors,
+    analysis_summary, render_plan, same_spot_spans, tracklet_colors,
 )
 from .widgets import FramePane
 
@@ -3785,18 +3785,13 @@ class PtzTab(QWidget):
         if self.analysis is None:
             return {}, {}
         if self._pcache_id != id(self.analysis):
-            spans: dict[int, list] = {}
+            # 파생 요약은 디스크 캐시 경유 (.analysis.cache.json) —
+            # 재열기 시 검출 수십만 행 재스캔·대표색 재계산 생략
+            summ = analysis_summary(
+                self.pano_path.with_suffix(".analysis.json")
+                if self.pano_path else "", self.analysis, log=self.log)
+            spans = dict(summ["spans"])
             frames = self.analysis["frames"]
-            for si, prow in enumerate(self.analysis["players"]):
-                f = int(frames[si])
-                for p in prow:
-                    if len(p) >= 5 and p[4] >= 0:
-                        e = spans.get(int(p[4]))
-                        if e is None:
-                            spans[int(p[4])] = [f, f, 1]
-                        else:
-                            e[1] = f
-                            e[2] += 1
             for si, rows in self.extra_players.items():   # 수동 검출 포함
                 if si < len(frames):
                     f = int(frames[si])
@@ -3804,8 +3799,10 @@ class PtzTab(QWidget):
                         spans[int(p[4])] = [f, f, 1]
             self._pspans = spans
             if self._pcolors_id != id(self.analysis):
-                self._pcolors = tracklet_colors(self.analysis)
+                self._pcolors = summ["colors"]
                 self._pcolors_id = id(self.analysis)
+            self._footmed = summ["foot_med"]
+            self._footmed_id = id(self.analysis)
             self._pcache_id = id(self.analysis)
         if self.hidden_players:
             m = self.merges.get                # 지역 바인딩 — 핫 루프

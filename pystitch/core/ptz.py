@@ -1366,3 +1366,65 @@ def render_plan(pano_path, out_path, plan, out_w=1920, out_h=1080,
         enc.wait()
         cap.release()
     return done / max(time.perf_counter() - t0, 1e-9)
+
+
+def analysis_summary(analysis_path, analysis, log=print):
+    """분석 파생 요약 캐시 (.analysis.cache.json) — 로드 시간 절감.
+
+    스팬({tid: [f0, f1, n]})·대표색·발 위치 중앙값은 분석에만 의존하는
+    순수 파생물인데 GUI 가 열 때마다 검출 수십만 행을 재스캔했다 (46GB
+    경기 실측 ~5s). 분석 파일 (size, mtime) 키로 캐시 — 갭필 등으로
+    분석이 다시 써지면 자동 무효화. 실패는 조용히 재계산 (캐시는 항상
+    버려도 되는 파일).
+    """
+    import json as _json
+    from pathlib import Path as _P
+    p = _P(str(analysis_path))
+    cp = p.with_suffix(".cache.json")     # <pano>.analysis.cache.json
+    try:
+        st = p.stat()
+        key = {"size": st.st_size, "mtime": int(st.st_mtime)}
+    except OSError:
+        key = None
+    if key is not None and cp.exists():
+        try:
+            d = _json.loads(cp.read_text())
+            if d.get("key") == key:
+                return {"spans": {int(t): v
+                                  for t, v in d["spans"].items()},
+                        "colors": {int(t): tuple(v)
+                                   for t, v in d["colors"].items()},
+                        "foot_med": {int(t): tuple(v)
+                                     for t, v in d["foot_med"].items()}}
+        except (OSError, ValueError, KeyError) as e:
+            log(f"[cache] 요약 캐시 무시: {e}")
+    frames = analysis["frames"]
+    spans: dict[int, list] = {}
+    feet: dict[int, list] = {}
+    for si, prow in enumerate(analysis["players"]):
+        f = int(frames[si])
+        for pl in prow:
+            if len(pl) >= 5 and pl[4] >= 0:
+                t = int(pl[4])
+                e = spans.get(t)
+                if e is None:
+                    spans[t] = [f, f, 1]
+                else:
+                    e[1] = f
+                    e[2] += 1
+                feet.setdefault(t, []).append((pl[0], pl[1] + pl[3] / 2.0))
+    colors = tracklet_colors(analysis)
+    foot_med = {t: (float(np.median([q[0] for q in v])),
+                    float(np.median([q[1] for q in v])))
+                for t, v in feet.items()}
+    if key is not None:
+        try:
+            cp.write_text(_json.dumps(
+                {"key": key,
+                 "spans": {str(t): v for t, v in spans.items()},
+                 "colors": {str(t): list(v) for t, v in colors.items()},
+                 "foot_med": {str(t): list(v)
+                              for t, v in foot_med.items()}}))
+        except OSError as e:
+            log(f"[cache] 요약 캐시 저장 실패: {e}")
+    return {"spans": spans, "colors": colors, "foot_med": foot_med}
