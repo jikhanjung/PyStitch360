@@ -3808,8 +3808,10 @@ class PtzTab(QWidget):
                 self._pcolors_id = id(self.analysis)
             self._pcache_id = id(self.analysis)
         if self.hidden_players:
+            m = self.merges.get                # 지역 바인딩 — 핫 루프
+            hp = self.hidden_players
             spans = {t: v for t, v in self._pspans.items()
-                     if self._rep(t) not in self.hidden_players}
+                     if m(t, t) not in hp}
             return spans, self._pcolors
         return self._pspans, self._pcolors
 
@@ -4241,6 +4243,10 @@ class PtzTab(QWidget):
         self.player_list.blockSignals(True)
         self.player_list.setUpdatesEnabled(False)
         self.player_list.clear()
+        # 아이템 루프 밖에서 1회 — 루프 안 _tid_bgr() 는 _player_cache 를
+        # 다시 부르고, 숨김 필터가 있으면 매번 전 트랙릿 재스캔이라
+        # O(n²) (4천 트랙릿 실측 24s → 이 호이스팅으로 ~1s)
+        tid_bgr = self._tid_bgr()
         for tid in self._player_rows:
             rep = self._rep(tid)
             k = len(groups.get(tid, ()))
@@ -4254,7 +4260,7 @@ class PtzTab(QWidget):
                 f"{head}  {mark}{self._disp_role(tid, r)}  "
                 f"{int(t0//60):02d}:{t0%60:04.1f}~"
                 f"{int(t1//60):02d}:{t1%60:04.1f}  ({n}회)")
-            c = self._tid_bgr().get(tid)
+            c = tid_bgr.get(tid)
             if c is not None:
                 px = QPixmap(14, 14)
                 px.fill(QColor(c[2], c[1], c[0]))
