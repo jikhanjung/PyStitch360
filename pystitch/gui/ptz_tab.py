@@ -4076,10 +4076,16 @@ class PtzTab(QWidget):
                 "랜드마크를 지정하세요 (지표는 필드 좌표 기준).")
             return
         from ..core.metrics import match_metrics
+        r = self._norm_export_range()
+        t_range = (r[0] / self.fps, r[1] / self.fps) if r else None
+        if t_range:
+            self.log(f"[지표] 구간 한정: {t_range[0]/60:.1f}~"
+                     f"{t_range[1]/60:.1f}분 (IN/OUT 마커)")
         with self._busy("경기 지표 계산"):
             m = match_metrics(self.analysis, self._field_calib,
                               self._role_of, self._rep,
-                              pauses=(self.match_info or {}).get("pauses"))
+                              pauses=(self.match_info or {}).get("pauses"),
+                              t_range=t_range)
         if m is None or m["summary"] is None:
             QMessageBox.information(self, "경기 지표", "계산 실패 — 로그 확인")
             return
@@ -4096,10 +4102,11 @@ class PtzTab(QWidget):
                                            title=self.team_names[team]))
         # 뛴 거리 표 (P08-3): 기존 리포트 계산 재사용 + 관측 비율 병기
         from ..core.report import movement_stats, player_field_tracks
-        dur = max(self.total / self.fps, 1e-6)
+        dur = ((t_range[1] - t_range[0]) if t_range
+               else max(self.total / self.fps, 1e-6))
         dist_rows = []
         tracks = player_field_tracks(self.analysis, self._field_calib,
-                                     self.merges)
+                                     self.merges, t_range=t_range)
         for rep, tr in tracks.items():
             role = self._role_of(rep)
             if role not in (0, 1, 3, 4):
@@ -4586,11 +4593,17 @@ class PtzTab(QWidget):
         out_dir = self.pano_path.with_name(self.pano_path.stem + "_report")
         spans, _ = self._player_cache()
         roles_of = {self._rep(t): self._role_of(t) for t in spans}
+        rr = self._norm_export_range()
+        t_range = (rr[0] / self.fps, rr[1] / self.fps) if rr else None
+        if t_range:
+            self.log(f"[report] 구간 한정: {t_range[0]/60:.1f}~"
+                     f"{t_range[1]/60:.1f}분 (IN/OUT 마커)")
         with self._busy("리포트 생성 (히트맵 + 활동량)"):
             r = generate_report(
                 self.analysis, self._field_calib, roles_of, out_dir,
                 merges=dict(self.merges),
-                team_names=tuple(self.team_names), log=self.log)
+                team_names=tuple(self.team_names), t_range=t_range,
+                log=self.log)
         QMessageBox.information(
             self, "리포트",
             f"{len(r['files'])}개 파일 생성:\n{r['dir']}\n\n"

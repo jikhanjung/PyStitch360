@@ -21,10 +21,12 @@ from .field import field_outline, pano_to_field
 SPRINT_MPS = 11.0                     # 이 이상은 트래커 점프로 간주
 
 
-def player_field_tracks(analysis, calib, merges=None):
+def player_field_tracks(analysis, calib, merges=None, t_range=None):
     """대표 tid별 필드 궤적 {rep: [(t, gx, gy), ...]} (시각 순).
 
     merges({tid: 대표})가 있으면 멤버 검출을 대표로 합친다.
+    t_range=(t0, t1)초 지정 시 그 구간 샘플만 — 한 파노라마에 여러
+    경기가 담긴 영상(pano_5316: 앞 31분 타 경기)에서 경기 구간 한정.
     """
     merges = merges or {}
     fps = analysis["fps"]
@@ -35,6 +37,8 @@ def player_field_tracks(analysis, calib, merges=None):
         if not rows:
             continue
         t = float(frames[si] / fps)
+        if t_range is not None and not (t_range[0] <= t <= t_range[1]):
+            continue
         fxy = pano_to_field(calib, [(p[0], p[1] + p[3] / 2.0) for p in rows])
         for (gx, gy), p in zip(fxy, rows):
             if np.isfinite(gx):
@@ -136,16 +140,18 @@ def render_heatmap(grid, length, width, px_per_m=8.0, title="",
 
 def generate_report(analysis, calib, roles_of, out_dir, merges=None,
                     team_names=("Team1", "Team2"), min_det=150, top_n=30,
-                    log=print):
+                    t_range=None, log=print):
     """팀/선수 히트맵 PNG + players.md 요약 → {dir, files, rows}.
 
     roles_of = {tid: 유효 역할} (병합 대표 기준으로 해석된 값).
     선수 히트맵은 팀 역할(0/1/3/4)·검출 min_det 이상·상위 top_n 만.
+    t_range=(t0, t1)초 — 지정 시 그 구간만 집계 (players.md 에 명시).
     """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     L, W = calib["length"], calib["width"]
-    tracks = player_field_tracks(analysis, calib, merges=merges)
+    tracks = player_field_tracks(analysis, calib, merges=merges,
+                                 t_range=t_range)
     names = [n if n.isascii() and n.strip() else f"T{i + 1}"
              for i, n in enumerate(team_names)]
     files = []
@@ -183,7 +189,10 @@ def generate_report(analysis, calib, roles_of, out_dir, merges=None,
         files.append(p)
         rows.append({"tid": rep, "k": k, "role": role, **st})
     # 요약 markdown
+    rng = ("전체 구간" if t_range is None else
+           f"{t_range[0] / 60:.1f}~{t_range[1] / 60:.1f}분 (IN/OUT 마커)")
     md = [f"# 선수 활동량 리포트", "",
+          f"- 집계 구간: {rng}",
           f"- 트랙릿 병합: {n_merged}개 조각 병합됨",
           f"- 선수 기준: 검출 {min_det}회 이상, 상위 {top_n}명", "",
           "| 선수 | 팀 | 관측 | 검출 | 이동거리 | 평균속도 | 최고속도 |",

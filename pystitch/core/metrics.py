@@ -191,13 +191,14 @@ def pass_matrix(passes, numbers=None):
     return out
 
 
-def match_metrics(analysis, calib, role_of, rep_of, pauses=None):
+def match_metrics(analysis, calib, role_of, rep_of, pauses=None,
+                  t_range=None):
     """분석+캘리브레이션 → 경기 지표 일괄 (P08-3 통계 화면 데이터).
 
     role_of/rep_of: PtzTab 관례 (역할 0/3=팀0, 1/4=팀1, 그 외 제외).
+    t_range=(t0, t1)초 — 지정 시 그 구간 샘플만 (한 영상 여러 경기 대응).
     반환 {"summary", "spans", "passes", "turnovers",
-          "unobserved_transitions", "n_samples"} 또는 None (캘리브레이션
-    없음 — 필드 좌표가 없으면 지표를 만들지 않는다).
+          "unobserved_transitions", "n_samples", "t_range"} 또는 None.
     """
     if calib is None or analysis is None:
         return None
@@ -205,6 +206,14 @@ def match_metrics(analysis, calib, role_of, rep_of, pauses=None):
     frames = analysis["frames"]
     fps = float(analysis["fps"])
     t = np.asarray(frames, float) / fps
+    if t_range is not None:
+        keep = (t >= t_range[0]) & (t <= t_range[1])
+        idx = np.flatnonzero(keep)
+        t = t[keep]
+        analysis = {"frames": [frames[i] for i in idx], "fps": fps,
+                    "balls": [analysis["balls"][i] for i in idx],
+                    "players": [analysis["players"][i] for i in idx]}
+        frames = analysis["frames"]
     ball_f = np.full((len(t), 2), np.nan)
     states, tids = [], []
     team_of_role = {0: 0, 3: 0, 1: 1, 4: 1}
@@ -236,7 +245,8 @@ def match_metrics(analysis, calib, role_of, rep_of, pauses=None):
     spans = possession_spans(t, states, tids)
     ev = extract_passes(spans, t, ball_f, states)
     return {"summary": possession_summary(t, states, pauses),
-            "spans": spans, "n_samples": len(t), **ev}
+            "spans": spans, "n_samples": len(t),
+            "t_range": t_range, **ev}
 
 
 def render_passmap(passes, positions, length=105.0, width=68.0,

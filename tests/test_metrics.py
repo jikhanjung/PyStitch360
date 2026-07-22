@@ -186,3 +186,32 @@ def test_analysis_summary_cache(tmp_path):
     ap.write_text(json.dumps(ana2) + " ")
     os.utime(ap, (time.time() + 5, time.time() + 5))
     assert analysis_summary(ap, ana2)["spans"][7][2] == 2
+
+
+def test_match_metrics_t_range(tmp_path):
+    """구간 한정: 앞 경기 혼입 컷 (pano_5316 사례)."""
+    import pystitch.core.metrics as M
+    from pystitch.core import field as F
+    orig = F.pano_to_field
+    F.pano_to_field = lambda c, pts: np.asarray(pts, float)
+    try:
+        ana = {"frames": list(range(0, 600, 3)), "fps": 30.0,
+               "balls": [], "players": []}
+        for f in ana["frames"]:
+            t = f / 30.0
+            if t < 10:                    # "앞 경기": 팀0 만 소유
+                ana["balls"].append([10.0, 5.0, 1.0])
+            else:                         # "본 경기": 팀1 만 소유
+                ana["balls"].append([-20.0, -8.0, 1.0])
+            ana["players"].append([[10.0, 5.0, 2.0, 2.0, 7],
+                                   [-20.0, -8.0, 2.0, 2.0, 22]])
+        roles = {7: 0, 22: 1}
+        full = M.match_metrics(ana, object(), roles.get, lambda t: t)
+        cut = M.match_metrics(ana, object(), roles.get, lambda t: t,
+                              t_range=(10.0, 20.0))
+        assert full["summary"]["team0_s"] > 0
+        assert cut["summary"]["team0_s"] == 0        # 앞 경기 제외됨
+        assert cut["summary"]["share1"] == 1.0
+        assert cut["n_samples"] < full["n_samples"]
+    finally:
+        F.pano_to_field = orig
