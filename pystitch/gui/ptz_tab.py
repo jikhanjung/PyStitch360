@@ -2608,6 +2608,14 @@ class PtzTab(QWidget):
             self.cap = cap
             self.pane.reset_view()            # 새 영상 = 전체 보기 (줌/팬 리셋)
             self.pano_path = Path(path)
+            # 파노라마(.pystitch.json 동반) 아니면 회전 카메라(AX700 등)로
+            # 본다 — 필드 캘리브레이션이 프레임 간 랜드마크 이송 + 원근
+            # 모델을 쓴다 (P06-3 GUI 통합).
+            self._is_rotcam = not self.pano_path.with_suffix(
+                ".pystitch.json").exists()
+            self._Hcache = {}                 # (src,dst) → 이송 호모그래피
+            self._graycache = {}              # frame → det_w 그레이
+            self._lm_transferred = {}         # 현재 프레임 이송 랜드마크
             self._remember_dir(str(self.pano_path.parent))
             self.fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
             self.trackbar.fps = self.fps
@@ -3561,6 +3569,9 @@ class PtzTab(QWidget):
             self.mc.update(f / self.fps, playing=False)
             self.mc.primary_tick(frame)
         self._update_titles()
+        if getattr(self, "_is_rotcam", False) and self.field_points:
+            with self._wait():            # 랜드마크 이송(호모그래피)은 무거움
+                self._rc_transfer_landmarks()
         self._redraw()
 
     def _redraw(self):
@@ -3796,18 +3807,27 @@ class PtzTab(QWidget):
             for lx, ly in self.line_points:      # 흰 선 검출 샘플 (녹색 점)
                 cv2.circle(frame, (int(lx * sc), int(ly * sc)),
                            max(2, int(5 * sc)), (0, 255, 0), -1)
+            rotcam = getattr(self, "_is_rotcam", False)
             for k, pt in self.field_points.items():
-                q = (int(pt[0] * sc), int(pt[1] * sc))
-                # 다른 프레임에서 찍은 점은 회색 — 팬 카메라에선 지금
-                # 화면의 그 위치에 있지 않다 (rotcam 이송으로 합쳐짐)
                 kf = self.field_point_frames.get(k)
-                stale = kf is not None and abs(kf - f) > self.fps
-                col = (150, 150, 150) if stale else (255, 255, 0)
+                # 회전 카메라: 찍은 프레임과 다르면 현재 프레임으로 이송한
+                # 위치에 그린다 (팬 따라 이동). 이송 실패는 회색 원위치.
+                tp = self._lm_transferred.get(k) if rotcam else None
+                transferred = tp is not None and kf is not None and int(kf) != int(f)
+                px = tp if tp is not None else pt
+                q = (int(px[0] * sc), int(px[1] * sc))
+                if rotcam:
+                    lost = kf is not None and int(kf) != int(f) and tp is None
+                    col = (150, 150, 150) if lost else (255, 255, 0)
+                    tag = LANDMARK_TAGS[k] + ("~" if transferred else "")
+                else:
+                    stale = kf is not None and abs(kf - f) > self.fps
+                    col = (150, 150, 150) if stale else (255, 255, 0)
+                    tag = LANDMARK_TAGS[k] + (f"@{kf}" if stale else "")
                 cv2.drawMarker(frame, q, col,
                                cv2.MARKER_TILTED_CROSS,
                                max(14, int(36 * sc)), max(2, int(6 * sc)))
-                cv2.putText(frame, LANDMARK_TAGS[k]
-                            + (f"@{kf}" if stale else ""),
+                cv2.putText(frame, tag,
                             (q[0] + 12, q[1] - 12), cv2.FONT_HERSHEY_SIMPLEX,
                             max(0.5, 1.0 * sc), col,
                             max(1, int(3 * sc)))
@@ -5976,14 +5996,83 @@ class PtzTab(QWidget):
         self._redraw()
         self.log(f"[field] 흰 선 샘플 {n}개 제거 — 랜드마크만으로 재피팅")
 
+    def _refit_field_rotcam(self):
+        """회전 카메라 필드 캘리브레이션 — 여러 프레임의 랜드마크를 기준
+        프레임으로 이송해 합치고 원근 모델(rotcam) 피팅 (P06-3).
+
+        위치를 아는 랜드마크만 사용(선 위 점 제외). 이 캘리브레이션은
+        이 영상 자체 좌표계 — 다른 영상과의 정렬(same/opposite side)은
+        별도 단계(P06 대칭 판별)."""
+        from ..core.field import LINE_LANDMARKS, VLINE_LANDMARKS, \
+            landmark_positions
+        from ..core.rotcam import calibrate_reference, transfer_points
+        pos = landmark_positions(self.field_size[0], self.field_size[1])
+        usable = [(k, self.field_points[k], self.field_point_frames.get(k))
+                  for k in self.field_points
+                  if k not in LINE_LANDMARKS and k not in VLINE_LANDMARKS
+                  and k in pos]
+        self._rc_calib = None
+        if len(usable) < 4:
+            return
+        # 기준 프레임 = 랜드마크 최빈 프레임 (이송 비용 최소)
+        rec = [f for _k, _p, f in usable if f is not None]
+        ref = int(max(set(rec), key=rec.count)) if rec else \
+            int(self.slider.value())
+        px, fld, skipped = [], [], 0
+        for k, p, f in usable:
+            src = int(f) if f is not None else ref
+            if src != ref:
+                H = self._rc_H(src, ref)
+                if H is None:
+                    skipped += 1
+                    continue
+                p = [float(v) for v in transfer_points(H, [p])[0]]
+            px.append(p)
+            fld.append([float(pos[k][0]), float(pos[k][1])])
+        if len(px) < 4:
+            self._rc_skip = skipped
+            return
+        cal = calibrate_reference(px, fld, (self.pano_w, self.pano_h))
+        if cal is not None:
+            cal["ref_frame"] = ref
+            self._rc_calib = cal
+            self._rc_skip = skipped
+
+    def _field_status(self):
+        pass
+
     def _refit_field(self, log_result=False):
         self._field_calib = None
+        if getattr(self, "_is_rotcam", False):
+            self._refit_field_rotcam()
+            return self._field_status()
         if self.pano_w and len(self.field_points) >= 4:
             self._field_calib = fit_field_calibration(
                 self.field_points, self.pano_w, self.pano_h,
                 length=self.field_size[0], width=self.field_size[1],
                 line_points=self.line_points)
-        c = self._field_calib
+        if getattr(self, "_is_rotcam", False):
+            rc = getattr(self, "_rc_calib", None)
+            npos = sum(1 for k in self.field_points
+                       if k not in ("sideline_near_l", "sideline_near_r",
+                                    "center_near"))
+            if rc is not None:
+                cp = rc["cam_pos"]
+                sk = getattr(self, "_rc_skip", 0)
+                msg = (f"회전 카메라 캘리브레이션 OK — f {rc['f']:.0f}px, "
+                       f"설치 ({cp[0]:+.0f},{cp[1]:+.0f},{cp[2]:.1f})m, "
+                       f"잔차 {rc['rms_px']:.1f}px"
+                       + (f", 이송실패 {sk}개" if sk else ""))
+            elif npos >= 4:
+                msg = ("회전 캘리브레이션 실패 — 프레임 간 이송 실패 "
+                       "(랜드마크 프레임들이 특징 매칭 안 됨) 또는 배치 확인")
+            else:
+                msg = (f"{npos}점 찍음 — 위치 랜드마크 4개부터 풀림. "
+                       "팬 카메라라 여러 프레임에 나눠 찍어도 됨 "
+                       "(프레임 간 자동 이송)")
+            c = None
+        else:
+            c = self._field_calib
         if c is not None:
             tilt = (f", 기울기 {np.degrees(c['pitch']):+.1f}°/"
                     f"{np.degrees(c['roll']):+.1f}°"
@@ -5992,10 +6081,10 @@ class PtzTab(QWidget):
                    f"{c['rms']:.1f}px (랜드마크는 워프로 고정), 높이 "
                    f"{c['h']:.1f}m, 터치라인 {-(c['ey'] + c['width']/2):.1f}m"
                    + tilt)
-        elif len(self.field_points) >= 4:
+        elif not getattr(self, "_is_rotcam", False) and len(self.field_points) >= 4:
             msg = ("캘리브레이션 실패 — 점 위치 확인 "
                    "(위치 랜드마크 3개 이상 필요, 사이드라인 점은 보조)")
-        else:
+        elif not getattr(self, "_is_rotcam", False):
             msg = (f"{len(self.field_points)}점 찍음 — 위치 랜드마크 4개"
                    "(또는 3개+사이드라인 2점)부터 풀림, ★ 먼쪽 코너부터")
         if self.btn_field_pick.isChecked():
@@ -6045,6 +6134,63 @@ class PtzTab(QWidget):
             d = np.hypot(gp[0][0], gp[0][1])
             h, span = 4.0, np.tan(np.deg2rad(10.0)) - np.tan(np.deg2rad(-38.0))
         return 1.8 / max(d, 1.0) / span * (self.pano_h - 1)
+
+    _RC_DETW = 1600
+
+    def _rc_gray(self, f):
+        """프레임 f 의 det_w 그레이 (캐시) — 호모그래피 매칭용."""
+        g = self._graycache.get(f)
+        if g is None:
+            fr = self._native_frame(f)
+            if fr is None:
+                return None
+            sc = self._RC_DETW / fr.shape[1] if fr.shape[1] > self._RC_DETW else 1.0
+            if sc < 1.0:
+                fr = cv2.resize(fr, (self._RC_DETW, int(fr.shape[0] * sc)),
+                                interpolation=cv2.INTER_AREA)
+            g = (cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY), sc)
+            self._graycache[f] = g
+        return g
+
+    def _rc_H(self, src, dst):
+        """src → dst 픽셀 이송 호모그래피 (원본 좌표계, 캐시).
+        순수 회전이라 시차 없이 정확. 실패 시 None."""
+        if src == dst:
+            return np.eye(3)
+        key = (int(src), int(dst))
+        if key in self._Hcache:
+            return self._Hcache[key]
+        from ..core.rotcam import match_frames
+        ga, gb = self._rc_gray(src), self._rc_gray(dst)
+        H = None
+        if ga is not None and gb is not None:
+            pa, pb = match_frames(ga[0], gb[0])
+            if len(pa) >= 25:
+                Hs, mask = cv2.findHomography(pa, pb, cv2.RANSAC, 3.0)
+                if Hs is not None and mask is not None and mask.sum() >= 25:
+                    S = np.diag([ga[1], ga[1], 1.0])
+                    T = np.diag([gb[1], gb[1], 1.0])
+                    H = np.linalg.inv(T) @ Hs @ S   # det_w → 원본 좌표
+        self._Hcache[key] = H
+        return H
+
+    def _rc_transfer_landmarks(self):
+        """찍은 랜드마크를 현재 프레임으로 이송 → _lm_transferred.
+        회전 카메라에서 팬을 따라 랜드마크가 움직이도록 (사용자 요청)."""
+        self._lm_transferred = {}
+        if not getattr(self, "_is_rotcam", False):
+            return
+        cur = int(getattr(self, "_cur_frame_idx", self.slider.value()))
+        for k, pt in self.field_points.items():
+            src = self.field_point_frames.get(k)
+            if src is None or int(src) == cur:
+                self._lm_transferred[k] = (pt[0], pt[1])
+                continue
+            from ..core.rotcam import transfer_points
+            H = self._rc_H(src, cur)
+            if H is not None:
+                q = transfer_points(H, [pt])[0]
+                self._lm_transferred[k] = (float(q[0]), float(q[1]))
 
     def _native_frame(self, f):
         """프레임 f 의 원본 해상도 이미지 (프록시 표시 중이면 원본을 읽음)."""
