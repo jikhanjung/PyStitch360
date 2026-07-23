@@ -118,6 +118,9 @@ class TimelineView(QWidget):
         except (TypeError, ValueError):
             self.collapsed = set()
         self._apply_height()
+        from PyQt6.QtWidgets import QSizePolicy
+        self.setSizePolicy(QSizePolicy.Policy.Expanding,
+                           QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
         self.setToolTip("레이블 쪽에서 레인 경계 드래그 = 높이 조절 "
                         "(Shift+드래그 = 전체 비례)")
@@ -341,8 +344,23 @@ class TimelineView(QWidget):
 
     COLLAPSED_H = 12
 
+    def _hscale(self):
+        """레인 비례 배율 — 위젯 높이를 항상 꽉 채운다 (사용자 요청).
+
+        lane_h 는 비율로 취급: 접힌 레인(고정 12px)을 뺀 나머지 공간을
+        lane_h 비례로 나눈다. 패널을 키우면 레인이 같이 커진다.
+        """
+        fixed = sum(self.COLLAPSED_H for i in range(len(self.lane_h))
+                    if i in self.collapsed)
+        flex = sum(h for i, h in enumerate(self.lane_h)
+                   if i not in self.collapsed)
+        avail = self.height() - self.RULER - fixed
+        return max(avail, 1) / flex if flex > 0 else 1.0
+
     def _eff_h(self, i):
-        return self.COLLAPSED_H if i in self.collapsed else self.lane_h[i]
+        if i in self.collapsed:
+            return self.COLLAPSED_H
+        return self.lane_h[i] * self._hscale()
 
     def toggle_collapse(self, lane):
         if lane in self.collapsed:
@@ -355,12 +373,15 @@ class TimelineView(QWidget):
         self.update()
 
     def _apply_height(self):
-        self.setFixedHeight(self.RULER + sum(self._eff_h(i)
-                                             for i in range(len(self.lane_h))))
+        # 꽉 채움 모드: 최소 높이만 보장, 실제 높이는 레이아웃이 준다
+        self.setMinimumHeight(self.RULER
+                              + 10 * max(len(self.lane_h), 1))
+        self.updateGeometry()
+        self.update()
 
     def _lane_rect(self, lane):
         y = self.RULER + sum(self._eff_h(i) for i in range(lane))
-        return y, self._eff_h(lane)
+        return int(y), int(self._eff_h(lane))
 
     def _lane_at(self, y):
         acc = self.RULER
@@ -1914,7 +1935,7 @@ class PtzTab(QWidget):
         self.slider.valueChanged.connect(self._on_slider)
         bar_col = QVBoxLayout()
         bar_col.setSpacing(1)
-        bar_col.addWidget(self.trackbar)
+        bar_col.addWidget(self.trackbar, 1)   # 남는 세로 = 타임라인이 채움
         # 줌인 시 가로 스크롤바 (전체 보기에선 숨김)
         self.tl_scroll = QScrollBar(Qt.Orientation.Horizontal)
         self.tl_scroll.setMaximumHeight(12)
