@@ -4206,24 +4206,26 @@ class PtzTab(QWidget):
             self._redraw()
 
     def _link_done(self, linked):
-        self._linked = linked
-        tb = linked.pop("top_black", None)
-        if tb is not None:
-            self._top_black = int(tb)
-            self.log(f"[plan] 상단 검은 경계 실측: {tb}px"
-                     + ("" if tb else " — 상단 클램프 해제"))
-        self._teams = linked.pop("teams", {}) or {}
-        if self.roles and self.analysis is not None:
-            self._teams = classify_teams(self.analysis, roles=self.roles,
-                                         feats=self._team_feats())
-        n_team = sum(1 for v in self._teams.values() if v < 2)
-        self.log(f"[ptz] 트랙 연결 완료: {len(linked['tracks'])}개"
-                 + (f", 팀 분류 선수 ID {n_team}개" if self._teams else
-                    " (팀 분류: ID 포함 재분석 필요)"))
-        self._refresh_team_label(log_colors=True)
-        self._refresh_player_list()
-        self._recompute_tracks()
-        self._plan_dirty()
+        # 레인 계산(트랙 요약·목록·트랙바)은 여기서 — 커서 표시 대상
+        with self._wait():
+            self._linked = linked
+            tb = linked.pop("top_black", None)
+            if tb is not None:
+                self._top_black = int(tb)
+                self.log(f"[plan] 상단 검은 경계 실측: {tb}px"
+                         + ("" if tb else " — 상단 클램프 해제"))
+            self._teams = linked.pop("teams", {}) or {}
+            if self.roles and self.analysis is not None:
+                self._teams = classify_teams(self.analysis, roles=self.roles,
+                                             feats=self._team_feats())
+            n_team = sum(1 for v in self._teams.values() if v < 2)
+            self.log(f"[ptz] 트랙 연결 완료: {len(linked['tracks'])}개"
+                     + (f", 팀 분류 선수 ID {n_team}개" if self._teams else
+                        " (팀 분류: ID 포함 재분석 필요)"))
+            self._refresh_team_label(log_colors=True)
+            self._refresh_player_list()
+            self._recompute_tracks()
+            self._plan_dirty()
 
     # ------------------------------------------------------ 선수(역할) 검수
     def _player_cache(self):
