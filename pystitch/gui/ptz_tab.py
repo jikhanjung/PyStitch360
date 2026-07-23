@@ -18,7 +18,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtWidgets import QApplication, QCheckBox
 from PyQt6.QtGui import (
-    QColor, QCursor, QIcon, QKeySequence, QPainter, QPixmap, QShortcut,
+    QColor, QCursor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut,
 )
 from PyQt6.QtWidgets import (
     QColorDialog, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
