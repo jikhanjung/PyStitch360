@@ -2208,46 +2208,47 @@ class PtzTab(QWidget):
         어느 쪽이든 그 영상의 사이드카 일체(분석·타임라인·캘리브레이션)
         가 컨텍스트가 되고, 다른 멤버들은 활성 기준 상대 시계로 앵글.
         """
-        from ..core.match import half_cameras, relative_clock
-        from .multicam import MulticamViewer
-        half = max(0, min(half, len(doc["halves"]) - 1))
-        h = doc["halves"][half]
-        cams = half_cameras(h)
-        cam = max(0, min(cam, len(cams) - 1))
-        target = cams[cam]["video"]
-        self._opening_match = True
-        try:
-            self.open_path(target, quiet=quiet)
-        finally:
-            self._opening_match = False
-        if self.pano_path is None \
-                or str(self.pano_path) != str(Path(target)):
-            return                            # 열기 실패
-        self.match, self.match_half, self.match_cam = doc, half, cam
-        if path is not None:
-            self.match_path = path
-        if self.mc is None:
-            self.mc = MulticamViewer(self.pane, self._pane_split, self.log)
-        others = []
-        for j, c in enumerate(cams):
-            if j == cam:
-                continue
-            others.append({"video": c["video"],
-                           "clock": relative_clock(cams, cam, j),
-                           "cam": j})
-        self.mc.set_half(others, redraw=self._redraw)
-        self._rebuild_mc_bar()
-        self._set_angle_lanes()
-        self._sync_match_teams(quiet=quiet)
-        if seek_s is not None:
-            self.slider.setValue(
-                int(max(0, min(seek_s * self.fps, self.total - 1))))
-        if not quiet:
-            names = " / ".join(f"{j + 1} {Path(c['video']).stem}"
-                               for j, c in enumerate(cams))
-            self.log(f"[match] {doc.get('title') or '경기'} — {h['label']} "
-                     f"[활성: {Path(target).stem}]  카메라: {names} "
-                     "(전환 모드 숫자키 = 컨텍스트 전환)")
+        with self._wait():
+            from ..core.match import half_cameras, relative_clock
+            from .multicam import MulticamViewer
+            half = max(0, min(half, len(doc["halves"]) - 1))
+            h = doc["halves"][half]
+            cams = half_cameras(h)
+            cam = max(0, min(cam, len(cams) - 1))
+            target = cams[cam]["video"]
+            self._opening_match = True
+            try:
+                self.open_path(target, quiet=quiet)
+            finally:
+                self._opening_match = False
+            if self.pano_path is None \
+                    or str(self.pano_path) != str(Path(target)):
+                return                            # 열기 실패
+            self.match, self.match_half, self.match_cam = doc, half, cam
+            if path is not None:
+                self.match_path = path
+            if self.mc is None:
+                self.mc = MulticamViewer(self.pane, self._pane_split, self.log)
+            others = []
+            for j, c in enumerate(cams):
+                if j == cam:
+                    continue
+                others.append({"video": c["video"],
+                               "clock": relative_clock(cams, cam, j),
+                               "cam": j})
+            self.mc.set_half(others, redraw=self._redraw)
+            self._rebuild_mc_bar()
+            self._set_angle_lanes()
+            self._sync_match_teams(quiet=quiet)
+            if seek_s is not None:
+                self.slider.setValue(
+                    int(max(0, min(seek_s * self.fps, self.total - 1))))
+            if not quiet:
+                names = " / ".join(f"{j + 1} {Path(c['video']).stem}"
+                                   for j, c in enumerate(cams))
+                self.log(f"[match] {doc.get('title') or '경기'} — {h['label']} "
+                         f"[활성: {Path(target).stem}]  카메라: {names} "
+                         "(전환 모드 숫자키 = 컨텍스트 전환)")
 
     def _update_titles(self):
         """페인 좌상단 영상 제목 + 현 시점 매칭 앵글 유무 (P07)."""
@@ -2552,67 +2553,68 @@ class PtzTab(QWidget):
 
     def open_path(self, path: str, quiet: bool = False):
         """파노라마 열기 (프로젝트 복원 경로 포함). 분석/키프레임 사이드카 자동 로드."""
-        if not self._opening_match and self.match is not None:
-            # 단독 파노라마 열기 = 멀티캠 경기 컨텍스트 해제
-            self.match = None
-            if self.mc is not None:
-                self.mc.set_half([])
-            self._rebuild_mc_bar()
-            self.trackbar.set_angles([])
-        if not Path(path).exists():
-            from ..core.project import _cross_platform_candidates
-            for cand in _cross_platform_candidates(path):
-                if Path(cand).exists():
-                    path = cand
-                    break
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            if not quiet:
-                QMessageBox.warning(self, "열기 실패", path)
-            else:
-                self.log(f"[ptz] 파노라마 없음 — 건너뜀: {path}")
-            return
-        if self.cap is not None:
-            self.cap.release()
-        if self._native_cap is not None:
-            self._native_cap.release()
-            self._native_cap = None
-        self.cap = cap
-        self.pane.reset_view()            # 새 영상 = 전체 보기 (줌/팬 리셋)
-        self.pano_path = Path(path)
-        self._remember_dir(str(self.pano_path.parent))
-        self.fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        self.trackbar.fps = self.fps
-        self.total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.pano_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.pano_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.lbl_file.setText(f"{self.pano_path.name} — {self.pano_w}x{self.pano_h}, "
-                              f"{self.total/self.fps/60:.1f}분")
-        with self._busy(f"호각 트랙 읽기"):
-            try:
-                from ..core.audio import load_whistle_track, \
-                    whistle_prominence
-                tr, ev = load_whistle_track(self.pano_path)
-                if tr is not None:
-                    self.trackbar.set_whistle(tr["hop_s"],
-                                              whistle_prominence(tr), ev)
-                    self.log(f"[ptz] 호각 트랙 로드: 이벤트 {len(ev)}개")
-            except Exception as e:  # noqa: BLE001
-                self.log(f"[ptz] 호각 트랙 무시: {e}")
-        self.slider.setEnabled(True)
-        self.slider.setRange(0, max(0, self.total - 1))
-        self.slider.setValue(0)
-        self._use_display_source()
-        self.btn_analyze.setEnabled(ptz_available())
-        if not ptz_available():
-            self.btn_analyze.setToolTip("ultralytics 미설치 (pip install ultralytics)")
-        self.analysis = None
-        self._load_sidecar()
-        with self._busy("목록/이벤트 표시 갱신"):
-            self._apply_team_names()
-            self._refresh_events()
-            self._show_frame()
-        self._update_export_enabled()
+        with self._wait():
+            if not self._opening_match and self.match is not None:
+                # 단독 파노라마 열기 = 멀티캠 경기 컨텍스트 해제
+                self.match = None
+                if self.mc is not None:
+                    self.mc.set_half([])
+                self._rebuild_mc_bar()
+                self.trackbar.set_angles([])
+            if not Path(path).exists():
+                from ..core.project import _cross_platform_candidates
+                for cand in _cross_platform_candidates(path):
+                    if Path(cand).exists():
+                        path = cand
+                        break
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                if not quiet:
+                    QMessageBox.warning(self, "열기 실패", path)
+                else:
+                    self.log(f"[ptz] 파노라마 없음 — 건너뜀: {path}")
+                return
+            if self.cap is not None:
+                self.cap.release()
+            if self._native_cap is not None:
+                self._native_cap.release()
+                self._native_cap = None
+            self.cap = cap
+            self.pane.reset_view()            # 새 영상 = 전체 보기 (줌/팬 리셋)
+            self.pano_path = Path(path)
+            self._remember_dir(str(self.pano_path.parent))
+            self.fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            self.trackbar.fps = self.fps
+            self.total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            self.pano_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self.pano_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self.lbl_file.setText(f"{self.pano_path.name} — {self.pano_w}x{self.pano_h}, "
+                                  f"{self.total/self.fps/60:.1f}분")
+            with self._busy(f"호각 트랙 읽기"):
+                try:
+                    from ..core.audio import load_whistle_track, \
+                        whistle_prominence
+                    tr, ev = load_whistle_track(self.pano_path)
+                    if tr is not None:
+                        self.trackbar.set_whistle(tr["hop_s"],
+                                                  whistle_prominence(tr), ev)
+                        self.log(f"[ptz] 호각 트랙 로드: 이벤트 {len(ev)}개")
+                except Exception as e:  # noqa: BLE001
+                    self.log(f"[ptz] 호각 트랙 무시: {e}")
+            self.slider.setEnabled(True)
+            self.slider.setRange(0, max(0, self.total - 1))
+            self.slider.setValue(0)
+            self._use_display_source()
+            self.btn_analyze.setEnabled(ptz_available())
+            if not ptz_available():
+                self.btn_analyze.setToolTip("ultralytics 미설치 (pip install ultralytics)")
+            self.analysis = None
+            self._load_sidecar()
+            with self._busy("목록/이벤트 표시 갱신"):
+                self._apply_team_names()
+                self._refresh_events()
+                self._show_frame()
+            self._update_export_enabled()
 
     def _refresh_events(self):
         """자동(킥오프)·사용자 이벤트 + 하이라이트(.events.json) → 타임라인."""
@@ -2967,6 +2969,17 @@ class PtzTab(QWidget):
         m, s = divmod(rem, 60)
         return (f"{int(h)}:{int(m):02d}:{s:04.1f}" if tenth
                 else f"{int(h)}:{int(m):02d}:{int(s):02d}")
+
+    @contextmanager
+    def _wait(self):
+        """웨이트 커서만 (로그 없이) — 파일 열기 전체 흐름 감싸기용.
+        Qt 오버라이드 커서는 스택이라 _busy 와 중첩해도 안전."""
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
+        try:
+            yield
+        finally:
+            QApplication.restoreOverrideCursor()
 
     @contextmanager
     def _busy(self, msg):

@@ -131,12 +131,20 @@ class PitchWatchWindow(QMainWindow):
             self.open_match(path)
 
     def open_match(self, path, half=0):
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtWidgets import QApplication
         from pystitch.core.match import load_match
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
         try:
             doc = load_match(path)
         except (OSError, ValueError) as e:
+            QApplication.restoreOverrideCursor()
             self.ptz.log(f"[match] 열기 실패: {e}")
             return
+        finally:
+            # open_match(ptz) 가 자체 커서를 관리 — 여기선 로드 구간만
+            QApplication.restoreOverrideCursor()
         self._match_path = str(path)
         self.ptz.open_match(doc, half=half, path=str(path))
         if self.ptz.match is None:
