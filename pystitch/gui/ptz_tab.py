@@ -264,7 +264,7 @@ class TimelineView(QWidget):
         self._clamp_view()
         self._emit_view()
 
-    def set_players(self, players, numbers=None):
+    def set_players(self, players, numbers=None, reps=None):
         """{tid: (f0, f1, role)} → 레인별 서브행 배치.
 
         번호가 부여된(=신원 확인된) 트랙릿은 **번호별 전용 행**으로 맨
@@ -275,35 +275,54 @@ class TimelineView(QWidget):
         numbers = {tid: 번호 문자열} (병합 대표 기준으로 풀어서 전달).
         """
         numbers = numbers or {}
+        reps = reps or {}
+        self._pnum = dict(numbers)
+        self._prep = dict(reps)
+        rep_of = lambda t: reps.get(t, t)
         by_lane: dict[int, list] = {}
         for tid, (f0, f1, role) in players.items():
             by_lane.setdefault(self._lane_of_role(role), []).append(
                 (f0, f1, tid, role))
         out = []
+        self._group_bands = []                 # [(lane, si, gf0, gf1, role)]
         self._lane_rows = {}
-        self._pnum = dict(numbers)
         for lane, items in by_lane.items():
-            def _numkey(n):
-                return (not n.isdigit(), int(n) if n.isdigit() else 0, n)
-            nums_here = sorted({numbers[t] for _f0, _f1, t, _r in items
-                                if numbers.get(t)}, key=_numkey)
-            row_of = {n: i for i, n in enumerate(nums_here)}
-            ends = []                          # 무번호 서브행별 끝 프레임
-            for f0, f1, tid, role in sorted(items):
-                n = numbers.get(tid)
-                if n is not None and n in row_of:
-                    si = row_of[n]
+            # 병합 그룹(rep) 단위 — 멤버는 한 행에 이어지고, 그룹 전체
+            # 범위에 반투명 밴드(사이 갭 시각화). 번호 그룹은 위로.
+            groups: dict = {}
+            for f0, f1, tid, role in items:
+                groups.setdefault(rep_of(tid), []).append((f0, f1, tid, role))
+            def _numkey(rep):
+                n = numbers.get(rep, "")
+                return (not n, not n.isdigit() if n else True,
+                        int(n) if n.isdigit() else 0)
+            numbered = [g for g in groups if numbers.get(g)]
+            unnumbered = [g for g in groups if not numbers.get(g)]
+            numbered.sort(key=_numkey)
+            row_of = {rep: i for i, rep in enumerate(numbered)}
+            ends = []                          # 무번호 그룹 그리디 배치
+            for rep in sorted(unnumbered,
+                              key=lambda r: min(m[0] for m in groups[r])):
+                g0 = min(m[0] for m in groups[rep])
+                g1 = max(m[1] for m in groups[rep])
+                for k, e in enumerate(ends):
+                    if e <= g0:
+                        ends[k] = g1
+                        row_of[rep] = len(numbered) + k
+                        break
                 else:
-                    for k, e in enumerate(ends):
-                        if e <= f0:
-                            ends[k] = f1
-                            si = len(nums_here) + k
-                            break
-                    else:
-                        si = len(nums_here) + len(ends)
-                        ends.append(f1)
-                out.append((tid, f0, f1, role, si))
-            self._lane_rows[lane] = max(1, len(nums_here) + len(ends))
+                    row_of[rep] = len(numbered) + len(ends)
+                    ends.append(g1)
+            for rep, members in groups.items():
+                si = row_of[rep]
+                for f0, f1, tid, role in members:
+                    out.append((tid, f0, f1, role, si))
+                if len(members) > 1:           # 병합 그룹 밴드
+                    g0 = min(m[0] for m in members)
+                    g1 = max(m[1] for m in members)
+                    self._group_bands.append((lane, si, g0, g1,
+                                              members[0][3]))
+            self._lane_rows[lane] = max(1, len(numbered) + len(ends))
         self._players = out
         self.update()
 
@@ -527,6 +546,18 @@ class TimelineView(QWidget):
         for pr in self.promotes:
             x = self._x(pr[0])
             p.fillRect(x - 1, y + 2, 3, lh - 4, QColor(200, 0, 255))
+        # 병합 그룹 밴드: 멤버 사이 갭을 반투명하게 (하나로 합쳐졌음 표시)
+        for lane, si, g0, g1, role in getattr(self, "_group_bands", []):
+            y, lh = self._lane_rect(lane)
+            fold = lane in self.collapsed
+            pitch = (lh - 4) / (1 if fold
+                                else max(self._lane_rows.get(lane, 3), 1))
+            ry = y + 2 + int((0 if fold else si) * pitch)
+            b, g, rr = self.role_palette.get(
+                role, TEAM_COLORS[min(role, len(TEAM_COLORS) - 1)])
+            x0_, x1_ = self._x(g0), self._x(g1)
+            p.fillRect(x0_, int(ry), max(2, x1_ - x0_),
+                       max(2, int(pitch) - 1), QColor(rr, g, b, 70))
         # 선수 레인: 팀/역할 색 바 — 서브행 수는 동시 트랙릿 수 (은폐 없음,
         # 접힌 레인은 얇은 한 줄로 겹쳐 그림)
         for tid, f0, f1, role, si in self._players:
@@ -791,9 +822,14 @@ class TimelineView(QWidget):
             elif x >= self.GUTTER:
                 hit = self._hit(x, y)
                 if hit and hit[0] == "player":
-                    num = getattr(self, "_pnum", {}).get(hit[1])
+                    tid = hit[1]
+                    rep = getattr(self, "_prep", {}).get(tid, tid)
+                    num = getattr(self, "_pnum", {}).get(rep)
+                    tip = f"#{tid}"
+                    if rep != tid:
+                        tip += f" (병합→#{rep})"
                     if num:
-                        tip = f"{num}번"
+                        tip += f"  {num}번"
             from PyQt6.QtWidgets import QToolTip
             if tip:
                 QToolTip.showText(ev.globalPosition().toPoint(), tip, self)
@@ -4806,8 +4842,9 @@ class PtzTab(QWidget):
         self.player_list.blockSignals(False)
         self.trackbar.set_players(
             {t: (spans[t][0], spans[t][1], self._role_of(t)) for t in spans},
-            numbers={t: self.player_nums[self._rep(t)] for t in spans
-                     if self._rep(t) in self.player_nums})
+            numbers={self._rep(t): self.player_nums[self._rep(t)]
+                     for t in spans if self._rep(t) in self.player_nums},
+            reps={t: self._rep(t) for t in spans})
 
     def _nearest_det_frame(self, tid, fclick=None):
         """트랙릿(대표 그룹)의 검출 중 fclick 에 가장 가까운 프레임.
