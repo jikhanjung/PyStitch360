@@ -122,8 +122,8 @@ class TimelineView(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding,
                            QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
-        self.setToolTip("레이블 쪽에서 레인 경계 드래그 = 높이 조절 "
-                        "(Shift+드래그 = 전체 비례)")
+        # 정적 툴팁 없음 — 트랙릿 번호 툴팁(동적)과 겹쳐 두 개 뜨던 문제.
+        # 레인 경계 조절 안내는 경계 위 호버에서만 동적으로 표시.
         self.total = 0
         self.fps = 30.0
         self.pos = 0
@@ -784,19 +784,20 @@ class TimelineView(QWidget):
                            and self._boundary_at(y) is not None))
             self.setCursor(Qt.CursorShape.SizeVerCursor if on_edge
                            else Qt.CursorShape.ArrowCursor)
-            # 번호 지정된 트랙릿 위 호버 → 툴팁으로 번호
+            # 동적 툴팁: 레인 경계=조절 안내 / 번호 트랙릿=번호 (택일)
             tip = ""
-            if not on_edge and x >= self.GUTTER:
+            if on_edge:
+                tip = "레인 경계 드래그 = 높이 조절 (Shift = 전체 비례)"
+            elif x >= self.GUTTER:
                 hit = self._hit(x, y)
                 if hit and hit[0] == "player":
                     num = getattr(self, "_pnum", {}).get(hit[1])
                     if num:
                         tip = f"{num}번"
+            from PyQt6.QtWidgets import QToolTip
             if tip:
-                from PyQt6.QtWidgets import QToolTip
                 QToolTip.showText(ev.globalPosition().toPoint(), tip, self)
             else:
-                from PyQt6.QtWidgets import QToolTip
                 QToolTip.hideText()
             return
         dx = x - self._press["x"]
