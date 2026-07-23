@@ -1092,12 +1092,14 @@ class ProxyWorker(QThread):
 class PtzPlayWorker(QThread):
     """파노라마 순차 재생 (자체 디코더) — 오버레이는 GUI 쪽 _redraw 가 담당."""
 
-    frame_ready = pyqtSignal(object, int)
+    frame_ready = pyqtSignal(object, int, float)   # (BGR, frame, disp_scale)
 
-    def __init__(self, path, start_frame, fps, display_fps=15.0):
+    def __init__(self, path, start_frame, fps, display_fps=15.0,
+                 disp_w=1600):
         super().__init__()
         self.path, self.start_frame = str(path), start_frame
         self.fps, self.display_fps = fps, display_fps
+        self.disp_w = int(disp_w)             # 재생 표시 폭 상한 (화질↓ 속도↑)
         self._stop = False
 
     def stop(self):
@@ -1116,7 +1118,13 @@ class PtzPlayWorker(QThread):
                 ok, frame = cap.read()
                 if not ok:
                     break
-                self.frame_ready.emit(frame, f)
+                sc = 1.0
+                if self.disp_w and frame.shape[1] > self.disp_w:
+                    sc = self.disp_w / frame.shape[1]
+                    frame = cv2.resize(
+                        frame, (self.disp_w, int(frame.shape[0] * sc)),
+                        interpolation=cv2.INTER_AREA)
+                self.frame_ready.emit(frame, f, sc)
                 shown += 1
                 lag = shown * step / self.fps - (time.perf_counter() - t0)
                 if lag > 0:
@@ -1668,6 +1676,7 @@ class PtzTab(QWidget):
         self._proxy_worker = None
         self.disp_path = None
         self.disp_scale = 1.0
+        self._play_scale = None
         self.plan = None
         self.plan_out = (1920, 1080)
         self.match: dict | None = None    # 멀티캠 경기 문서 (P07, match.json)
@@ -3068,9 +3077,18 @@ class PtzTab(QWidget):
             return
         if self.cap is None:
             return
-        w = PtzPlayWorker(self.disp_path or self.pano_path,
-                          self.slider.value(), self.fps,
-                          display_fps=30.0 if self.disp_scale < 1.0 else 15.0)
+        # 재생 표시 폭 상한 (QSettings ptz_play_w, 기본 1600) — 원본이 이미
+        # 작으면(프록시) 그대로. 화질을 약간 낮춰 재생 부하를 줄인다.
+        play_w = int(QSettings("PyStitch360", "PyStitch360")
+                     .value("ptz_play_w", 1600))
+        # 재생 소스: 프록시(.scrub.mp4)가 있으면 그것 (원본 5900px 디코드
+        # 회피). 없으면 원본을 읽으며 disp_w 로 온더플라이 축소.
+        proxy = self._proxy_path()
+        src = str(proxy) if proxy.exists() else (self.disp_path
+                                                 or self.pano_path)
+        w = PtzPlayWorker(src, self.slider.value(), self.fps,
+                          display_fps=30.0 if self.disp_scale < 1.0 else 20.0,
+                          disp_w=play_w)
         w.frame_ready.connect(self._play_frame)
         w.finished.connect(self._play_finished)
         self._play_worker = w
@@ -3086,14 +3104,20 @@ class PtzTab(QWidget):
             a.play()
         w.start()
 
+    def _restore_still(self):
+        self._play_scale = None
+        self._show_frame()                    # 원해상도 정지 프레임 재표시
+
     def _stop_play(self):
         if self._play_worker is not None and self._play_worker.isRunning():
             self._play_worker.stop()
         if self._audio:
             self._audio.pause()
 
-    def _play_frame(self, frame, f):
+    def _play_frame(self, frame, f, disp_scale=1.0):
         self._cur_frame, self._cur_frame_idx = frame, f
+        # 재생 중 표시 스케일 — _redraw 가 오버레이 좌표에 반영
+        self._play_scale = self.disp_scale * disp_scale
         if self.mc is not None:
             self.mc.update(f / self.fps, playing=True)
             self.mc.primary_tick(frame, playing=True)
@@ -3132,6 +3156,7 @@ class PtzTab(QWidget):
         self.btn_play.setText("▶")
         if self._audio:
             self._audio.pause()
+        self._restore_still()             # 정지 = 원해상도 정지 프레임
 
     def _current_sample(self):
         """현재 시각 근처(±0.5s)의 분석 샘플 인덱스."""
@@ -3551,7 +3576,10 @@ class PtzTab(QWidget):
             return
         frame = self._cur_frame.copy()
         f = self._cur_frame_idx
-        sc = self.disp_scale                 # 프록시 표시 시 좌표 축소
+        # 재생 중엔 다운스케일된 재생 프레임 → 그 스케일로 오버레이 좌표
+        sc = (self._play_scale if self._playing
+              and getattr(self, "_play_scale", None) is not None
+              else self.disp_scale)
         # 랜드마크 찍기 모드: 크롭 박스/공/키프레임/선수 오버레이 숨김 —
         # 경기장 선·마커만 보이게 해서 클릭 대상이 헷갈리지 않게 한다.
         picking = self.btn_field_pick.isChecked()

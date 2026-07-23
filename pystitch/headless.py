@@ -24,6 +24,7 @@ import json
 import os
 import re
 import sys
+import subprocess
 import time
 from pathlib import Path
 
@@ -379,6 +380,30 @@ def _stitch(pair, pano: Path, lens, lens_name, args):
                 [str(p) for p in right_chain], offset, t0, t1, str(pano),
                 codec=args.codec, crf=args.crf, feather_px=args.feather,
                 el0=el0, el1=el1, log=_log)
+    if not args.no_proxy:
+        _make_scrub_proxy(pano)
+
+
+def _make_scrub_proxy(pano: Path):
+    """스크럽/재생용 1600px 프록시 (.scrub.mp4) — GUI 가 있으면 자동 사용.
+    원본 5900px 디코드 부담 없이 재생·탐색이 가볍다."""
+    out = pano.with_suffix(".scrub.mp4")
+    if out.exists():
+        return
+    from .core.encoders import available_encoders, ffmpeg_bin
+    encs = available_encoders()
+    venc = (["-c:v", encs["NVENC (H.264)"], "-cq", "26"]
+            if "NVENC (H.264)" in encs
+            else ["-c:v", "libx264", "-preset", "veryfast", "-crf", "24"])
+    cmd = [ffmpeg_bin(), "-y", "-v", "error", "-i", str(pano),
+           "-vf", "scale=1600:-2", "-g", "15", "-an"] + venc + [str(out)]
+    t0 = time.perf_counter()
+    r = subprocess.run(cmd)
+    if r.returncode == 0:
+        _log(f"[proxy] 스크럽 프록시 생성: {out.name} "
+             f"({time.perf_counter()-t0:.0f}s)")
+    else:
+        _log(f"[proxy] 프록시 생성 실패 (건너뜀)")
 
 
 def _analyze(pano: Path, args):
@@ -582,6 +607,8 @@ def main(argv=None) -> int:
     ap.add_argument("--min-votes", type=int, default=3)
     ap.add_argument("--cpu", action="store_true", help="OCR 에서 GPU 미사용")
     ap.add_argument("--no-ocr", action="store_true")
+    ap.add_argument("--no-proxy", action="store_true",
+                    help="스크럽/재생 프록시(.scrub.mp4) 생성 안 함")
     ap.add_argument("--force", action="store_true", help="기존 산출물 무시하고 재실행")
     args = ap.parse_args(argv)
 
