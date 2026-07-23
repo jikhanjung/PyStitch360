@@ -85,7 +85,7 @@ class TimelineView(QWidget):
     """
 
     seek = pyqtSignal(int)
-    pick = pyqtSignal(str, int)      # ("kf"|"ball"|"ignore"|"player", 키)
+    pick = pyqtSignal(str, int, int)  # (종류, 키, 클릭 프레임)
     angle_pick = pyqtSignal(int)     # 앵글 레인 클릭 (alt 인덱스) — 카메라 전환
     range_menu = pyqtSignal(int, object)   # 우클릭: (프레임, 전역 좌표)
     view_changed = pyqtSignal(float, float, int)   # (t0, 보이는 폭, total)
@@ -549,7 +549,7 @@ class TimelineView(QWidget):
                     p.drawText(QRect(r[0] + 3, r[1], r[2] - 4, bh),
                                Qt.AlignmentFlag.AlignVCenter, num)
             if self.selected == ("player", tid):
-                p.setPen(QColor(255, 255, 255))
+                p.setPen(QPen(QColor(255, 40, 40), 2))
                 p.drawRect(r[0] - 1, r[1] - 1, r[2] + 1, r[3] + 1)
         # 뜬 공 레인: 공중 구간 바 (하늘색, 정점 높이 라벨)
         if self.airborne and self.total > 1:
@@ -784,6 +784,20 @@ class TimelineView(QWidget):
                            and self._boundary_at(y) is not None))
             self.setCursor(Qt.CursorShape.SizeVerCursor if on_edge
                            else Qt.CursorShape.ArrowCursor)
+            # 번호 지정된 트랙릿 위 호버 → 툴팁으로 번호
+            tip = ""
+            if not on_edge and x >= self.GUTTER:
+                hit = self._hit(x, y)
+                if hit and hit[0] == "player":
+                    num = getattr(self, "_pnum", {}).get(hit[1])
+                    if num:
+                        tip = f"{num}번"
+            if tip:
+                from PyQt6.QtWidgets import QToolTip
+                QToolTip.showText(ev.globalPosition().toPoint(), tip, self)
+            else:
+                from PyQt6.QtWidgets import QToolTip
+                QToolTip.hideText()
             return
         dx = x - self._press["x"]
         if abs(dx) > 3:
@@ -806,7 +820,9 @@ class TimelineView(QWidget):
         if pr["hit"] is not None:
             self.selected = pr["hit"]
             self.update()
-            self.pick.emit(*pr["hit"])
+            fclick = int(min(max(self._f(int(ev.position().x())), 0),
+                             self.total - 1))
+            self.pick.emit(pr["hit"][0], pr["hit"][1], fclick)
         elif ev.position().x() >= self.GUTTER:
             self.seek.emit(int(min(max(self._f(int(ev.position().x())), 0),
                                    self.total - 1)))
@@ -3663,10 +3679,12 @@ class PtzTab(QWidget):
                                   max(1, int(2 * sc)))
                     if pid is not None and sel_rep is not None \
                             and pid >= 0 and self._rep(pid) == sel_rep:
-                        # 선택된 트랙릿(병합 그룹 포함): 얇은 흰 이중 테두리
+                        # 선택된 트랙릿(병합 그룹 포함): 빨간 박스 + 이중 테두리
+                        cv2.rectangle(frame, (x1, y1), (x2, y2),
+                                      (0, 0, 255), max(2, int(3 * sc)))
                         g = max(3, int(6 * sc))
                         cv2.rectangle(frame, (x1 - g, y1 - g),
-                                      (x2 + g, y2 + g), (255, 255, 255),
+                                      (x2 + g, y2 + g), (0, 0, 255),
                                       max(1, int(2 * sc)))
                     tag = ROLE_TAGS.get(team)
                     if team in (5, 6) and pid is not None:
@@ -4740,6 +4758,22 @@ class PtzTab(QWidget):
             numbers={t: self.player_nums[self._rep(t)] for t in spans
                      if self._rep(t) in self.player_nums})
 
+    def _nearest_det_frame(self, tid, fclick=None):
+        """트랙릿(대표 그룹)의 검출 중 fclick 에 가장 가까운 프레임.
+        fclick 없으면 트랙릿 시작."""
+        spans, _ = self._player_cache()
+        if fclick is None or self.analysis is None:
+            return int(spans[tid][0]) if tid in spans else self.slider.value()
+        grp = {t for t in spans if self._rep(t) == self._rep(tid)}
+        frames = self.analysis["frames"]
+        best, bd = int(spans.get(tid, [fclick])[0]), 1 << 62
+        for si, prow in enumerate(self.analysis["players"]):
+            if any(len(p) >= 5 and int(p[4]) in grp for p in prow):
+                d = abs(frames[si] - fclick)
+                if d < bd:
+                    best, bd = int(frames[si]), d
+        return best
+
     def _goto_player(self):
         row = self.player_list.currentRow()
         rows = getattr(self, "_player_rows", [])
@@ -5487,8 +5521,13 @@ class PtzTab(QWidget):
         self.tl_scroll.blockSignals(False)
         self.tl_scroll.show()
 
-    def _timeline_pick(self, kind, key):
-        """타임라인 바 클릭 → 해당 목록 선택(→ 프레임 이동)."""
+    def _timeline_pick(self, kind, key, fclick=None):
+        """타임라인 바 클릭 → 해당 목록 선택(→ 프레임 이동).
+
+        선수 트랙릿은 시작이 아니라 **클릭 지점 최근접 검출**로 이동 —
+        희소 트랙릿(검출 몇 개가 수십 분에 흩어짐)에서 시작으로 튀어
+        아무도 안 잡히던 문제 수정.
+        """
         if kind in ("kf", "ball"):
             want = ("kf" if kind == "kf" else "track", key)
             for row, e in enumerate(getattr(self, "_top", [])):
@@ -5502,13 +5541,14 @@ class PtzTab(QWidget):
                 self.kf_list.setCurrentRow(key)
                 self.slider.setValue(int(self.ignores[key][0]))
         elif kind == "player":
+            self.slider.setValue(self._nearest_det_frame(key, fclick))
+            self.trackbar.set_selection("player", key)
             rows = getattr(self, "_player_rows", [])
             if key in rows:
+                self.player_list.blockSignals(True)
                 self.player_list.setCurrentRow(rows.index(key))
-            else:
-                spans, _ = self._player_cache()
-                if key in spans:
-                    self.slider.setValue(int(spans[key][0]))
+                self.player_list.blockSignals(False)
+            self._redraw()
         elif kind == "event":
             evs = self.trackbar.events
             if 0 <= key < len(evs):
