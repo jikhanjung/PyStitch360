@@ -362,6 +362,29 @@ class TimelineView(QWidget):
             return self.COLLAPSED_H
         return self.lane_h[i] * self._hscale()
 
+    def solo_lane(self, lane):
+        """이 레인만 확대 — 나머지 전부 접기 (우클릭 메뉴).
+
+        이미 단독 상태면 전체 펼치기로 토글.
+        """
+        others = set(range(len(self.lane_h))) - {lane}
+        if self.collapsed == others:          # 이미 단독 → 복원
+            self.collapsed = set()
+        else:
+            self.collapsed = others
+        QSettings("PyStitch360", "PyStitch360").setValue(
+            "ptz_timeline_collapsed", [int(v) for v in self.collapsed])
+        self._apply_height()
+        self.update()
+
+    def expand_all(self):
+        if self.collapsed:
+            self.collapsed = set()
+            QSettings("PyStitch360", "PyStitch360").setValue(
+                "ptz_timeline_collapsed", [])
+            self._apply_height()
+            self.update()
+
     def toggle_collapse(self, lane):
         if lane in self.collapsed:
             self.collapsed.discard(lane)
@@ -5264,11 +5287,20 @@ class PtzTab(QWidget):
         if 0 <= lane < len(self.trackbar.LANES):
             name = self.trackbar.lanes[lane]
             folded = lane in self.trackbar.collapsed
+            solo = (self.trackbar.collapsed
+                    == set(range(len(self.trackbar.lane_h))) - {lane})
+            menu.addAction(("단독 확대 해제 (전체 펼치기)" if solo else
+                            f"\"{name}\" 만 확대 — 나머지 접기"),
+                           lambda _=False, ln=lane:
+                           self.trackbar.solo_lane(ln))
             menu.addAction(("펼치기: " if folded else "접기: ")
                            + f"\"{name}\" 레인"
                            + ("" if folded else " (얇은 한 줄로)"),
                            lambda _=False, ln=lane:
                            self.trackbar.toggle_collapse(ln))
+            if self.trackbar.collapsed and not solo:
+                menu.addAction("접힌 레인 모두 펼치기",
+                               self.trackbar.expand_all)
             menu.addSeparator()
         menu.addAction(f"내보내기 시작 지점 (I) — {self._hms(f/self.fps)}",
                        lambda: self._set_export_mark("in", f))
